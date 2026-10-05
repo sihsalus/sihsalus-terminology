@@ -1,7 +1,7 @@
 FROM python:3.12-slim-bookworm AS dependencies
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git gcc libpq-dev && rm -rf /var/lib/apt/lists/*
+    git gcc libc6-dev libpq-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY requirements*.txt ./
 ARG REQUIREMENTS_FILE=requirements-runtime.txt

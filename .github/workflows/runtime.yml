@@ -34,8 +34,8 @@ jobs:
           cache-dependency-path: apps/api/requirements-*.txt
       - run: python -m pip install -r requirements-dev.txt
       - run: python manage.py check
-      - run: python manage.py test core.common.test_optional_ai --verbosity 2
-      - run: pylint core/common/test_optional_ai.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py
+      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy --verbosity 2
+      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/services/storages/cloud/minio.py
 
   images:
     needs: api-checks
@@ -93,7 +93,7 @@ jobs:
           IMAGE: ghcr.io/sihsalus/terminology-${{ matrix.app }}@${{ steps.build.outputs.digest }}
         run: trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output security.json "$IMAGE"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
+        if: always() && steps.build.outcome == 'success'
         with:
           name: terminology-${{ matrix.app }}-${{ github.sha }}
           path: |

@@ -676,6 +676,7 @@ MINIO_ACCESS_KEY = os.environ.get('MINIO_ACCESS_KEY', '')
 MINIO_SECRET_KEY = os.environ.get('MINIO_SECRET_KEY', '')
 MINIO_BUCKET_NAME = os.environ.get('MINIO_BUCKET_NAME', '')
 MINIO_SECURE = os.environ.get('MINIO_SECURE') == 'TRUE'
+MINIO_EXTERNAL_SECURE = os.environ.get('MINIO_EXTERNAL_SECURE', str(MINIO_SECURE)).upper() == 'TRUE'
 
 # LM and Encoder settings
 NO_LM = os.environ.get('NO_LM') == 'TRUE'
