@@ -1,6 +1,7 @@
 from unittest.mock import Mock, ANY
 
 from django.contrib.auth.models import Group
+from django.test import override_settings
 from mock import patch
 from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import ErrorDetail
@@ -16,6 +17,7 @@ from core.users.models import UserProfile
 from core.users.tests.factories import UserProfileFactory
 
 
+@override_settings(ALLOW_SELF_REGISTRATION=True)
 class UserSignupVerificationViewTest(OCLAPITestCase):
     @patch('core.users.models.UserProfile.send_verification_email')
     def test_signup_unverified_to_verified(self, send_mail_mock):

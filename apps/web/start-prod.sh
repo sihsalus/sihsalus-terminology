@@ -8,6 +8,10 @@ ENV_FILE="/usr/share/nginx/html/env-config.js"
 rm -f ${ENV_FILE}
 touch ${ENV_FILE}
 
+if [[ "${ALLOW_SELF_REGISTRATION:-false}" == true ]]; then
+    echo 'var ALLOW_SELF_REGISTRATION = true;' >> ${ENV_FILE}
+fi
+
 if [[ ! -z "${API_URL}" ]]; then
     echo "var API_URL = \"${API_URL}\";" >> ${ENV_FILE}
 fi

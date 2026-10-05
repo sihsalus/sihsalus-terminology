@@ -922,13 +922,20 @@ export const consumeOAuthReturnTo = () => {
   return route
 }
 
+export const isSSOConfigured = () => Boolean(window.OIDC_RP_CLIENT_ID || process.env.OIDC_RP_CLIENT_ID)
+
+export const isSelfRegistrationEnabled = () => window.ALLOW_SELF_REGISTRATION === true
+
 export const getLoginURL = async returnTo => {
+  prepareOAuthReturnTo(returnTo)
+  if(!isSSOConfigured())
+    return `${window.location.origin}${window.location.pathname}#/signin`
+
   const oidClientID = window.OIDC_RP_CLIENT_ID || process.env.OIDC_RP_CLIENT_ID
   let redirectURL = window.LOGIN_REDIRECT_URL || process.env.LOGIN_REDIRECT_URL
 
   redirectURL = redirectURL.replace(/([^:]\/)\/+/g, "$1");
 
-  prepareOAuthReturnTo(returnTo)
   const codeChallenge = await preparePKCECodeChallenge()
   const state = prepareOAuthState()
   const nonce = generateSecureRandomString(32)

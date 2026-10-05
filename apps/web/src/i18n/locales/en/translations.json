@@ -212,6 +212,10 @@
     "max_pins_reached": "Maximum 4 items can be pinned"
   },
   "auth": {
+    "username": "Username",
+    "password": "Password",
+    "managed_accounts": "Use the account provided by your administrator.",
+    "local_sign_in_error": "Could not sign in. Check your credentials and try again; if it persists, contact your administrator.",
     "sign_in": "Sign in",
     "sign_out": "Sign out",
     "register": "Sign up",

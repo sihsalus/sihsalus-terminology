@@ -59,6 +59,8 @@ def get_set_from_env(name):
 
 
 REQUIRE_AUTHENTICATION = os.environ.get('REQUIRE_AUTHENTICATION', 'false').lower() in ['true', '1']
+# Private installations provision accounts through administrators instead of public signup.
+ALLOW_SELF_REGISTRATION = os.environ.get('ALLOW_SELF_REGISTRATION', 'false').lower() in ['true', '1']
 APPROVED_ANONYMOUS_CLIENTS = get_set_from_env('APPROVED_ANONYMOUS_CLIENTS')
 APPROVED_ANONYMOUS_API_KEYS = get_set_from_env('APPROVED_ANONYMOUS_API_KEYS')
 APPROVED_ANONYMOUS_IPS = get_set_from_env('APPROVED_ANONYMOUS_IPS')
@@ -215,7 +217,6 @@ REDOC_SETTINGS = {
 MIDDLEWARE = [
     'django.middleware.gzip.GZipMiddleware',
     'cid.middleware.CidMiddleware',
-    'core.middlewares.middlewares.CustomLoggerMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',

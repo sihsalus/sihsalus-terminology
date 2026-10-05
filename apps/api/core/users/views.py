@@ -310,6 +310,8 @@ class UserSignup(UserBaseView, mixins.CreateModelMixin):
 
     @staticmethod
     def get(request):
+        if not settings.ALLOW_SELF_REGISTRATION:
+            raise PermissionDenied('Self-registration is disabled. Contact your administrator.')
         if AuthService.is_sso_enabled():
             return redirect(
                 OpenIDAuthService.get_registration_redirect_url(
@@ -324,6 +326,8 @@ class UserSignup(UserBaseView, mixins.CreateModelMixin):
         return Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
     def post(self, request, *args, **kwargs):  # pylint: disable=unused-argument
+        if not settings.ALLOW_SELF_REGISTRATION:
+            raise PermissionDenied('Self-registration is disabled. Contact your administrator.')
         serializer = self.get_serializer(data={**request.data, 'verified': False})
         serializer.is_valid(raise_exception=True)
         self.perform_create(serializer)
