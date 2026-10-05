@@ -1,0 +1,4176 @@
+from unittest.mock import patch
+
+import factory
+
+from celery.states import PENDING
+from django.core.cache import cache
+from django.db.models import F
+from django.test import override_settings
+from mock import ANY
+
+from core.bundles.models import Bundle
+from core.sources.models import CloneLimitExceeded
+from core.collections.tests.factories import OrganizationCollectionFactory, ExpansionFactory
+from core.common.constants import ACCESS_TYPE_NONE, OPENMRS_VALIDATION_SCHEMA
+from core.common.tests import OCLAPITestCase
+from core.concepts.constants import CONCEPT_HARD_DELETE_REQUIRES_HEAD_ONLY
+from core.concepts.documents import ConceptDocument
+from core.concepts.models import Concept
+from core.concepts.tests.factories import ConceptFactory, ConceptNameFactory, ConceptDescriptionFactory
+from core.mappings.models import Mapping
+from core.mappings.tests.factories import MappingFactory
+from core.orgs.models import Organization
+from core.sources.tests.factories import OrganizationSourceFactory, UserSourceFactory
+from core.tasks.models import Task
+from core.users.models import UserProfile
+from core.users.tests.factories import UserProfileFactory
+
+
+class ConceptRetrieveUpdateDestroyViewTest(OCLAPITestCase):
+    def setUp(self):
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.source = OrganizationSourceFactory(organization=self.organization)
+        self.concept_payload = {
+            'datatype': 'Coded',
+            'concept_class': 'Procedure',
+            'extras': {'foo': 'bar'},
+            'descriptions': [{
+                'locale': 'en', 'locale_preferred': True, 'description': 'c1 desc', 'description_type': 'None'
+            }],
+            'external_id': '',
+            'id': 'c1',
+            'names': [{
+                'locale': 'en', 'locale_preferred': True, 'name': 'c1 name', 'name_type': 'Fully Specified'
+            }]
+        }
+
+    def test_get_200(self):
+        response = self.client.get(
+            self.source.concepts_url,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        ConceptFactory(parent=self.source)
+
+        response = self.client.get(
+            self.source.concepts_url,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_post_201(self):
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/"
+
+        response = self.client.post(
+            concepts_url,
+            self.concept_payload,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted([
+                'uuid',
+                'id',
+                'external_id',
+                'concept_class',
+                'datatype',
+                'url',
+                'retired',
+                'source',
+                'owner',
+                'owner_type',
+                'owner_url',
+                'display_name',
+                'display_locale',
+                'names',
+                'descriptions',
+                'created_on',
+                'updated_on',
+                'versions_url',
+                'version',
+                'extras',
+                'type',
+                'update_comment',
+                'retire_reason',
+                'version_url',
+                'updated_by',
+                'created_by',
+                'public_can_view',
+                'checksums',
+                'property',
+                'versioned_object_id',
+                'latest_source_version'
+            ])
+        )
+
+        concept = Concept.objects.first()
+        latest_version = Concept.objects.last()
+
+        self.assertFalse(latest_version.is_versioned_object)
+        self.assertTrue(latest_version.is_latest_version)
+
+        self.assertTrue(concept.is_versioned_object)
+        self.assertFalse(concept.is_latest_version)
+
+        self.assertEqual(concept.versions.count(), 1)
+        self.assertEqual(response.data['uuid'], str(concept.id))
+        self.assertEqual(response.data['datatype'], 'Coded')
+        self.assertEqual(response.data['concept_class'], 'Procedure')
+        self.assertEqual(response.data['url'], concept.uri)
+        self.assertFalse(response.data['retired'])
+        self.assertEqual(response.data['source'], self.source.mnemonic)
+        self.assertEqual(response.data['owner'], self.organization.mnemonic)
+        self.assertEqual(response.data['owner_type'], "Organization")
+        self.assertEqual(response.data['owner_url'], self.organization.uri)
+        self.assertEqual(response.data['display_name'], 'c1 name')
+        self.assertEqual(response.data['display_locale'], 'en')
+        self.assertEqual(response.data['versions_url'], concept.uri + 'versions/')
+        self.assertEqual(response.data['version'], str(concept.id))
+        self.assertEqual(response.data['extras'], {'foo': 'bar'})
+        self.assertEqual(response.data['type'], 'Concept')
+        self.assertEqual(response.data['version_url'], latest_version.uri)
+
+        response = self.client.post(
+            concepts_url,
+            self.concept_payload,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'__all__': ['Concept ID must be unique within a source.']})
+
+    def test_post_201_with_mappings(self):
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/"
+        random_concept = ConceptFactory()
+
+        mappings = [
+            # 1 to target concept that doesnt exists with __parent_concept as substitution
+            {
+                'from_concept': '__parent_concept',
+                'to_concept_url': '/orgs/random-org/sources/random-source/concepts/target-concept/',
+                'map_type': 'Same As'
+            },
+            # 2 to target concept that doesnt exists with parent concept as direct url
+            {
+                'from_concept_url': concepts_url + 'c1/',
+                'to_concept_url': '/orgs/random-org/sources/random-source/concepts/target-concept/',
+                'map_type': 'BROADER-THAN'
+            },
+            # 3 to target concept that exists
+            {
+                'from_concept_url': concepts_url + 'c1/',
+                'to_concept_url': random_concept.url,
+                'map_type': 'NARROWER-THAN'
+            },
+            # 4 self mapping without from_concept
+            {
+                'to_concept_url': concepts_url + 'c1/',
+                'map_type': 'Same As'
+            },
+        ]
+
+        response = self.client.post(
+            concepts_url,
+            {**self.concept_payload, 'mappings': mappings},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted([
+                'uuid',
+                'id',
+                'external_id',
+                'concept_class',
+                'datatype',
+                'url',
+                'retired',
+                'source',
+                'owner',
+                'owner_type',
+                'owner_url',
+                'display_name',
+                'display_locale',
+                'names',
+                'descriptions',
+                'created_on',
+                'updated_on',
+                'versions_url',
+                'version',
+                'extras',
+                'type',
+                'update_comment',
+                'retire_reason',
+                'version_url',
+                'updated_by',
+                'created_by',
+                'public_can_view',
+                'checksums',
+                'property',
+                'versioned_object_id',
+                'latest_source_version'
+            ])
+        )
+
+        concept = Concept.objects.filter(mnemonic='c1').first().versioned_object
+        latest_version = concept.get_latest_version()
+
+        self.assertFalse(latest_version.is_versioned_object)
+        self.assertTrue(latest_version.is_latest_version)
+
+        self.assertTrue(concept.is_versioned_object)
+        self.assertFalse(concept.is_latest_version)
+
+        self.assertEqual(concept.versions.count(), 1)
+        self.assertEqual(response.data['uuid'], str(concept.id))
+        self.assertEqual(response.data['datatype'], 'Coded')
+        self.assertEqual(response.data['concept_class'], 'Procedure')
+        self.assertEqual(response.data['url'], concept.uri)
+        self.assertFalse(response.data['retired'])
+        self.assertEqual(response.data['source'], self.source.mnemonic)
+        self.assertEqual(response.data['owner'], self.organization.mnemonic)
+        self.assertEqual(response.data['owner_type'], "Organization")
+        self.assertEqual(response.data['owner_url'], self.organization.uri)
+        self.assertEqual(response.data['display_name'], 'c1 name')
+        self.assertEqual(response.data['display_locale'], 'en')
+        self.assertEqual(response.data['versions_url'], concept.uri + 'versions/')
+        self.assertEqual(response.data['version'], str(concept.id))
+        self.assertEqual(response.data['extras'], {'foo': 'bar'})
+        self.assertEqual(response.data['type'], 'Concept')
+        self.assertEqual(response.data['version_url'], latest_version.uri)
+        self.assertEqual(latest_version.get_bidirectional_mappings().count(), 4)
+        self.assertEqual(concept.get_bidirectional_mappings().count(), 4)
+        self.assertEqual(concept.parent.get_mappings_queryset().count(), 4)
+        self.assertEqual(self.source.get_mappings_queryset().count(), 4)
+
+    def test_post_400_with_mappings_everything_or_nothing(self):
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/"
+        random_concept = ConceptFactory()
+
+        mappings = [
+            # 1 to target concept that doesnt exists with __parent_concept as substitution
+            {
+                'to_concept_url': '/orgs/random-org/sources/random-source/concepts/target-concept/',
+                'map_type': 'Same As'
+            },
+            # 2 to target concept that doesnt exists with parent concept as direct url -- must fail for duplicate
+            {
+                'from_concept_url': concepts_url + 'c1/',
+                'to_concept_url': '/orgs/random-org/sources/random-source/concepts/target-concept/',
+                'map_type': 'Same As'
+            },
+            # 3 to target concept that exists
+            {
+                'from_concept_url': concepts_url + 'c1/',
+                'to_concept_url': random_concept.url,
+                'map_type': 'NARROWER-THAN'
+            },
+            # 4 parent concept not involved - must pass and from_concept_url is ignored and set to parent concept url
+            {
+                'from_concept_url': concepts_url + 'c2/',
+                'to_concept_url': random_concept.url,
+                'map_type': 'Same-As'
+            },
+            # 5 parent concept not involved - must fail for parent concept not from concept
+            {
+                'from_concept_url': random_concept.url,
+                'to_concept_url': concepts_url + 'c1/',
+                'map_type': 'Same-As'
+            },
+        ]
+
+        response = self.client.post(
+            concepts_url,
+            {**self.concept_payload, 'mappings': mappings},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data,
+            {
+                'mappings': [
+                    {
+                        **mappings[1],
+                        'errors': {
+                            '__all__': ['Parent, map_type, from_concept, to_source, to_concept_code must be unique.']
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertFalse(Concept.objects.filter(mnemonic='c1').exists())
+        self.assertFalse(self.source.get_concepts_queryset().exists())
+        self.assertFalse(self.source.get_mappings_queryset().exists())
+        self.assertEqual(Mapping.objects.count(), 0)
+
+    def test_post_400(self):
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/"
+
+        response = self.client.post(
+            concepts_url,
+            {**self.concept_payload.copy(), 'datatype': ''},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertListEqual(
+            list(response.data.keys()),
+            ['datatype']
+        )
+
+    def test_put_200(self):  # pylint: disable=too-many-statements
+        concept = ConceptFactory(parent=self.source)
+        self.assertEqual(concept.versions.count(), 1)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.put(
+            concepts_url,
+            {**self.concept_payload, 'datatype': 'None', 'update_comment': 'Updated datatype'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted(['uuid',
+                    'id',
+                    'external_id',
+                    'concept_class',
+                    'datatype',
+                    'url',
+                    'retired',
+                    'source',
+                    'owner',
+                    'owner_type',
+                    'owner_url',
+                    'display_name',
+                    'display_locale',
+                    'names',
+                    'descriptions',
+                    'created_on',
+                    'updated_on',
+                    'versions_url',
+                    'version',
+                    'extras',
+                    'type',
+                    'update_comment',
+                    'retire_reason',
+                    'version_url',
+                    'updated_by',
+                    'created_by',
+                    'public_can_view',
+                    'checksums',
+                    'property',
+                    'latest_source_version',
+                    'versioned_object_id'])
+        )
+
+        version = Concept.objects.last()
+        concept.refresh_from_db()
+
+        self.assertFalse(version.is_versioned_object)
+        self.assertTrue(version.is_latest_version)
+        self.assertEqual(version.versions.count(), 2)
+        self.assertEqual(response.data['uuid'], str(version.id))
+        self.assertEqual(response.data['datatype'], 'None')
+        self.assertEqual(response.data['update_comment'], 'Updated datatype')
+        self.assertEqual(response.data['concept_class'], 'Procedure')
+        self.assertEqual(response.data['url'], concept.uri)
+        self.assertEqual(response.data['url'], version.versioned_object.uri)
+        self.assertEqual(response.data['version_url'], version.uri)
+        self.assertFalse(response.data['retired'])
+        self.assertEqual(response.data['source'], self.source.mnemonic)
+        self.assertEqual(response.data['owner'], self.organization.mnemonic)
+        self.assertEqual(response.data['owner_type'], "Organization")
+        self.assertEqual(response.data['owner_url'], self.organization.uri)
+        self.assertEqual(response.data['display_name'], 'c1 name')
+        self.assertEqual(response.data['display_locale'], 'en')
+        self.assertEqual(response.data['versions_url'], concept.uri + 'versions/')
+        self.assertEqual(response.data['version'], str(version.id))
+        self.assertEqual(response.data['extras'], {'foo': 'bar'})
+        self.assertEqual(response.data['type'], 'Concept')
+        self.assertEqual(response.data['version_url'], version.uri)
+        self.assertTrue(concept.is_versioned_object)
+        self.assertEqual(concept.datatype, "None")
+
+        response = self.client.put(
+            concepts_url,
+            {**self.concept_payload, 'datatype': 'None', 'update_comment': 'Updated Nothing'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 208)
+        self.assertEqual(
+            response.data,
+            {
+                '__all__': ['No changes detected. Standard checksum is same as last version.']
+            }
+        )
+
+        response = self.client.put(
+            concepts_url,
+            {'datatype': 'N/A', 'update_comment': 'Updated datatype only'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'names': ['A concept must have at least one name']})
+
+        response = self.client.patch(
+            concepts_url,
+            {'datatype': 'N/A', 'update_comment': 'Updated datatype only'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted(['uuid',
+                    'id',
+                    'external_id',
+                    'concept_class',
+                    'datatype',
+                    'url',
+                    'retired',
+                    'source',
+                    'owner',
+                    'owner_type',
+                    'owner_url',
+                    'display_name',
+                    'display_locale',
+                    'names',
+                    'descriptions',
+                    'created_on',
+                    'updated_on',
+                    'versions_url',
+                    'version',
+                    'extras',
+                    'type',
+                    'update_comment',
+                    'retire_reason',
+                    'version_url',
+                    'updated_by',
+                    'created_by',
+                    'public_can_view',
+                    'checksums',
+                    'property',
+                    'latest_source_version',
+                    'versioned_object_id'])
+        )
+        version = Concept.objects.last()
+        prev_version = version.prev_version
+        concept.refresh_from_db()
+
+        self.assertFalse(version.is_versioned_object)
+        self.assertTrue(version.is_latest_version)
+        self.assertEqual(version.versions.count(), 3)
+        self.assertEqual(response.data['uuid'], str(version.id))
+        self.assertEqual(response.data['datatype'], 'N/A')
+        self.assertEqual(response.data['update_comment'], 'Updated datatype only')
+        self.assertEqual(response.data['concept_class'], prev_version.concept_class)
+        self.assertEqual(response.data['url'], concept.uri)
+        self.assertEqual(response.data['url'], version.versioned_object.uri)
+        self.assertEqual(response.data['version_url'], version.uri)
+        self.assertFalse(response.data['retired'])
+        self.assertEqual(response.data['source'], self.source.mnemonic)
+        self.assertEqual(response.data['owner'], self.organization.mnemonic)
+        self.assertEqual(response.data['owner_type'], "Organization")
+        self.assertEqual(response.data['owner_url'], self.organization.uri)
+        self.assertEqual(response.data['display_name'], prev_version.display_name)
+        self.assertEqual(concept.datatype, "N/A")
+
+    def test_put_200_with_mappings(self):  # pylint: disable=too-many-statements
+        concept = ConceptFactory(parent=self.source, datatype="N/A")
+        self.assertEqual(concept.versions.count(), 1)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+        random_concept = ConceptFactory()
+
+        mappings = [
+            {
+                'from_concept': '__parent_concept',
+                'to_concept_url': '/orgs/random-org/sources/random-source/concepts/target-concept/',
+                'map_type': 'Same As'
+            },
+            {
+                'from_concept_url': concepts_url,
+                'to_concept_url': '/orgs/random-org/sources/random-source/concepts/target-concept/',
+                'map_type': 'BROADER-THAN'
+            },
+            {
+                'from_concept_url': concepts_url,
+                'to_concept_url': random_concept.url,
+                'map_type': 'NARROWER-THAN'
+            },
+            {
+                'to_concept_url': concepts_url,
+                'map_type': 'Same As'
+            },
+        ]
+
+        response = self.client.put(
+            concepts_url,
+            {
+                **self.concept_payload,
+                'datatype': 'None', 'update_comment': 'Updated datatype', 'mappings': mappings
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted(['uuid',
+                    'id',
+                    'external_id',
+                    'concept_class',
+                    'datatype',
+                    'url',
+                    'retired',
+                    'source',
+                    'owner',
+                    'owner_type',
+                    'owner_url',
+                    'display_name',
+                    'display_locale',
+                    'names',
+                    'descriptions',
+                    'created_on',
+                    'updated_on',
+                    'versions_url',
+                    'version',
+                    'extras',
+                    'type',
+                    'update_comment',
+                    'retire_reason',
+                    'version_url',
+                    'updated_by',
+                    'created_by',
+                    'public_can_view',
+                    'checksums',
+                    'property',
+                    'latest_source_version',
+                    'versioned_object_id'])
+        )
+        concept.refresh_from_db()
+        latest_version = concept.get_latest_version()
+        self.assertEqual(concept.datatype, 'None')
+        self.assertEqual(latest_version.datatype, 'None')
+        self.assertEqual(latest_version.prev_version.datatype, 'N/A')
+        self.assertEqual(latest_version.get_bidirectional_mappings().count(), 4)
+        self.assertEqual(concept.get_bidirectional_mappings().count(), 4)
+        self.assertEqual(concept.parent.get_mappings_queryset().count(), 4)
+        self.assertEqual(self.source.get_mappings_queryset().count(), 4)
+
+    def test_put_200_with_mappings_upsert_and_delete(self):
+        concept = ConceptFactory(parent=self.source)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+        update_target = ConceptFactory(parent=self.source)
+        update_target_new = ConceptFactory(parent=self.source)
+        delete_target = ConceptFactory(parent=self.source)
+        new_target = ConceptFactory(parent=self.source)
+
+        mapping_to_update = MappingFactory(
+            parent=self.source, from_concept=concept, to_concept=update_target, map_type='Same As'
+        ).versioned_object
+        mapping_to_delete = MappingFactory(
+            parent=self.source, from_concept=concept, to_concept=delete_target, map_type='BROADER-THAN'
+        ).versioned_object
+
+        response = self.client.put(
+            concepts_url,
+            {
+                **self.concept_payload,
+                'datatype': 'None',
+                'update_comment': 'Updated concept with mapping operations',
+                'mappings': [
+                    {
+                        'id': mapping_to_update.mnemonic,
+                        'map_type': 'NARROWER-THAN',
+                        'update_comment': 'updated map type',
+                        'to_concept_url': update_target_new.url
+                    },
+                    {
+                        'to_concept_url': new_target.url,
+                        'map_type': 'Same As'
+                    },
+                    {
+                        'id': mapping_to_delete.mnemonic,
+                        'action': '__delete',
+                        'update_comment': 'Deleted from concept update'
+                    }
+                ]
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        mapping_to_update.refresh_from_db()
+        mapping_to_delete.refresh_from_db()
+        concept.refresh_from_db()
+        self.assertEqual(mapping_to_update.map_type, 'NARROWER-THAN')
+        self.assertEqual(mapping_to_update.to_concept_id, update_target_new.id)
+        self.assertEqual(mapping_to_update.versions.count(), 2)
+        self.assertTrue(mapping_to_delete.retired)
+        self.assertTrue(mapping_to_delete.get_latest_version().retired)
+        self.assertFalse(mapping_to_delete.get_latest_version().prev_version.retired)
+        self.assertEqual(mapping_to_delete.versions.count(), 2)
+        self.assertTrue(
+            concept.get_unidirectional_mappings().filter(
+                to_concept_id=new_target.id,
+                map_type='Same As',
+                retired=False
+            ).exists()
+        )
+        self.assertEqual(concept.get_unidirectional_mappings().filter(retired=False).count(), 2)
+
+    def test_patch_200_with_mappings_only_upsert_and_delete(self):
+        concept = ConceptFactory(
+            parent=self.source,
+            names=[ConceptNameFactory.build(locale='en', locale_preferred=True)]
+        )
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+        update_target = ConceptFactory(parent=self.source)
+        update_target_new = ConceptFactory(parent=self.source)
+        delete_target = ConceptFactory(parent=self.source)
+        new_target = ConceptFactory(parent=self.source)
+
+        mapping_to_update = MappingFactory(
+            parent=self.source, from_concept=concept, to_concept=update_target, map_type='Same As'
+        ).versioned_object
+        mapping_to_delete = MappingFactory(
+            parent=self.source, from_concept=concept, to_concept=delete_target, map_type='BROADER-THAN'
+        ).versioned_object
+
+        initial_versions_count = concept.versions.count()
+
+        response = self.client.patch(
+            concepts_url,
+            {
+                'mappings': [
+                    {
+                        'id': mapping_to_update.mnemonic,
+                        'map_type': 'NARROWER-THAN',
+                        'update_comment': 'updated map type',
+                        'to_concept_url': update_target_new.url
+                    },
+                    {
+                        'to_concept_url': new_target.url,
+                        'map_type': 'Same As'
+                    },
+                    {
+                        'id': mapping_to_delete.mnemonic,
+                        'action': '__delete',
+                        'update_comment': 'Deleted from concept patch'
+                    }
+                ]
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        mapping_to_update.refresh_from_db()
+        mapping_to_delete.refresh_from_db()
+        concept.refresh_from_db()
+
+        self.assertEqual(mapping_to_update.map_type, 'NARROWER-THAN')
+        self.assertEqual(mapping_to_update.to_concept_id, update_target_new.id)
+        self.assertEqual(mapping_to_update.versions.count(), 2)
+        self.assertTrue(mapping_to_delete.retired)
+        self.assertEqual(concept.versions.count(), initial_versions_count + 1)
+        self.assertTrue(
+            concept.get_unidirectional_mappings().filter(
+                to_concept_id=new_target.id,
+                map_type='Same As',
+                retired=False
+            ).exists()
+        )
+        self.assertEqual(concept.get_unidirectional_mappings().filter(retired=False).count(), 2)
+
+    def test_put_400_with_mappings_everything_or_nothing(self):
+        concept = ConceptFactory(parent=self.source)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+        existing_target = ConceptFactory(parent=self.source)
+        new_target = ConceptFactory(parent=self.source)
+        existing_mapping = MappingFactory(
+            parent=self.source, from_concept=concept, to_concept=existing_target, map_type='Same As'
+        ).versioned_object
+
+        initial_versions_count = concept.versions.count()
+        initial_datatype = concept.datatype
+        initial_active_mappings_count = concept.get_bidirectional_mappings().filter(retired=False).count()
+
+        response = self.client.put(
+            concepts_url,
+            {
+                **self.concept_payload,
+                'datatype': 'None',
+                'update_comment': 'Should fail and rollback all',
+                'mappings': [
+                    {
+                        'id': existing_mapping.mnemonic,
+                        'to_concept_url': new_target.url,
+                        'map_type': 'NARROWER-THAN'
+                    },
+                    {
+                        'action': '__delete'
+                    }
+                ]
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('mappings', response.data)
+
+        concept.refresh_from_db()
+        existing_mapping.refresh_from_db()
+        self.assertEqual(concept.versions.count(), initial_versions_count)
+        self.assertEqual(concept.datatype, initial_datatype)
+        self.assertEqual(existing_mapping.to_concept_id, existing_target.id)
+        self.assertEqual(existing_mapping.map_type, 'Same As')
+        self.assertFalse(existing_mapping.retired)
+        self.assertEqual(
+            concept.get_bidirectional_mappings().filter(retired=False).count(),
+            initial_active_mappings_count
+        )
+
+    def test_put_200_openmrs_schema(self):  # pylint: disable=too-many-statements
+        self.create_lookup_concept_classes()
+        source = OrganizationSourceFactory(custom_validation_schema=OPENMRS_VALIDATION_SCHEMA)
+        name = ConceptNameFactory.build(locale='fr')
+        concept = ConceptFactory(parent=source, names=[name])
+        self.assertEqual(concept.versions.count(), 1)
+        response = self.client.put(
+            concept.uri,
+            {**self.concept_payload, 'datatype': 'None', 'update_comment': 'Updated datatype'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted(['uuid',
+                    'id',
+                    'external_id',
+                    'concept_class',
+                    'datatype',
+                    'url',
+                    'retired',
+                    'source',
+                    'owner',
+                    'owner_type',
+                    'owner_url',
+                    'display_name',
+                    'display_locale',
+                    'names',
+                    'descriptions',
+                    'created_on',
+                    'updated_on',
+                    'versions_url',
+                    'version',
+                    'extras',
+                    'type',
+                    'update_comment',
+                    'retire_reason',
+                    'version_url',
+                    'updated_by',
+                    'created_by',
+                    'public_can_view',
+                    'checksums',
+                    'property',
+                    'latest_source_version',
+                    'versioned_object_id'])
+        )
+
+        names = response.data['names']
+
+        version = Concept.objects.last()
+        concept.refresh_from_db()
+
+        self.assertFalse(version.is_versioned_object)
+        self.assertTrue(version.is_latest_version)
+        self.assertEqual(version.versions.count(), 2)
+        self.assertEqual(response.data['uuid'], str(version.id))
+        self.assertEqual(response.data['datatype'], 'None')
+        self.assertEqual(response.data['update_comment'], 'Updated datatype')
+        self.assertEqual(response.data['concept_class'], 'Procedure')
+        self.assertEqual(response.data['url'], concept.uri)
+        self.assertEqual(response.data['url'], version.versioned_object.uri)
+        self.assertEqual(response.data['version_url'], version.uri)
+        self.assertFalse(response.data['retired'])
+        self.assertEqual(response.data['source'], source.mnemonic)
+        self.assertEqual(response.data['owner'], source.organization.mnemonic)
+        self.assertEqual(response.data['owner_type'], "Organization")
+        self.assertEqual(response.data['owner_url'], source.organization.uri)
+        self.assertEqual(response.data['display_name'], 'c1 name')
+        self.assertEqual(response.data['display_locale'], 'en')
+        self.assertEqual(response.data['versions_url'], concept.uri + 'versions/')
+        self.assertEqual(response.data['version'], str(version.id))
+        self.assertEqual(response.data['extras'], {'foo': 'bar'})
+        self.assertEqual(response.data['type'], 'Concept')
+        self.assertEqual(response.data['version_url'], version.uri)
+        self.assertTrue(concept.is_versioned_object)
+        self.assertEqual(concept.datatype, "None")
+
+        # same names in update
+        names[0]['uuid'] = str(name.id)
+        [name.pop('type', None) for name in names]  # pylint: disable=expression-not-assigned
+        response = self.client.put(
+            concept.uri,
+            {**self.concept_payload, 'names': names, 'datatype': 'Numeric', 'update_comment': 'Updated datatype'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        concept.refresh_from_db()
+        self.assertEqual(concept.datatype, "Numeric")
+        self.assertEqual(concept.names.count(), 1)
+
+        latest_version = concept.get_latest_version()
+        prev_version = latest_version.prev_version
+        self.assertEqual(latest_version.names.count(), 1)
+        self.assertEqual(prev_version.names.count(), 1)
+        self.assertEqual(prev_version.names.first().name, latest_version.names.first().name)
+        self.assertEqual(prev_version.names.first().locale, latest_version.names.first().locale)
+
+    def test_put_400(self):
+        concept = ConceptFactory(parent=self.source)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.put(
+            concepts_url,
+            {**self.concept_payload, 'concept_class': '', 'update_comment': 'Updated concept_class'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(list(response.data.keys()), ['concept_class'])
+
+    # `parent_concept_urls` is only serialized on reads when asked for, so GETs below carry the
+    # query param. Writes must not need it - the payload alone has to drive the hierarchy.
+    PARENT_CONCEPT_URLS_PARAM = '?includeParentConceptURLs=true'
+
+    def _concept_with_parent(self, mnemonic='child'):
+        """Create a child concept under a parent the way the model supports it."""
+        parent_concept = ConceptFactory(
+            parent=self.source, names=[ConceptNameFactory.build(locale='en', locale_preferred=True)])
+        child_concept = Concept.persist_new({
+            **factory.build(dict, FACTORY_CLASS=ConceptFactory), 'mnemonic': mnemonic,
+            'parent': self.source,
+            'names': [ConceptNameFactory.build(locale='en', locale_preferred=True)],
+            'parent_concept_urls': [parent_concept.uri]
+        }, self.user)
+        self.assertEqual(child_concept.errors, {})
+        self.assertEqual(child_concept.parent_concept_urls, [parent_concept.uri])
+        return parent_concept, child_concept
+
+    def test_post_201_with_parent_concept_urls(self):
+        parent_concept = ConceptFactory(parent=self.source)
+        another_parent_concept = ConceptFactory(parent=self.source)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/"
+        expected_parents = sorted([parent_concept.uri, another_parent_concept.uri])
+
+        response = self.client.post(
+            concepts_url,
+            {**self.concept_payload, 'parent_concept_urls': [parent_concept.uri, another_parent_concept.uri]},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertNotIn('parent_concept_urls', response.data)
+
+        concept = Concept.objects.filter(mnemonic='c1', id=F('versioned_object_id')).first()
+        self.assertEqual(sorted(concept.parent_concept_urls), expected_parents)
+        self.assertEqual(sorted(concept.get_latest_version().parent_concept_urls), expected_parents)
+
+        response = self.client.get(
+            concept.uri + self.PARENT_CONCEPT_URLS_PARAM,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(sorted(response.data['parent_concept_urls']), expected_parents)
+
+    def test_post_201_without_parent_concept_urls(self):
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/"
+
+        response = self.client.post(
+            concepts_url,
+            self.concept_payload,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        concept = Concept.objects.filter(mnemonic='c1', id=F('versioned_object_id')).first()
+        self.assertEqual(concept.parent_concept_urls, [])
+
+    def test_put_200_with_parent_concept_urls(self):
+        _, concept = self._concept_with_parent()
+        new_parent_concept = ConceptFactory(parent=self.source)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.put(
+            concepts_url,
+            {
+                **self.concept_payload,
+                'id': concept.mnemonic,
+                'update_comment': 'Updated parents',
+                'parent_concept_urls': [new_parent_concept.uri]
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+        concept.refresh_from_db()
+        self.assertEqual(concept.parent_concept_urls, [new_parent_concept.uri])
+        self.assertEqual(concept.get_latest_version().parent_concept_urls, [new_parent_concept.uri])
+
+    def test_put_200_removes_parent_concept_urls(self):
+        _, concept = self._concept_with_parent()
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.put(
+            concepts_url,
+            {
+                **self.concept_payload,
+                'id': concept.mnemonic,
+                'update_comment': 'Removed parents',
+                'parent_concept_urls': []
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+        concept.refresh_from_db()
+        self.assertEqual(concept.parent_concept_urls, [])
+        self.assertEqual(concept.get_latest_version().parent_concept_urls, [])
+
+    def test_put_200_keeps_parent_concept_urls_when_omitted(self):
+        parent_concept, concept = self._concept_with_parent()
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.put(
+            concepts_url,
+            {
+                **self.concept_payload,
+                'id': concept.mnemonic,
+                'datatype': 'None',
+                'update_comment': 'Updated datatype'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+        concept.refresh_from_db()
+        self.assertEqual(concept.datatype, 'None')
+        self.assertEqual(concept.parent_concept_urls, [parent_concept.uri])
+        self.assertEqual(concept.get_latest_version().parent_concept_urls, [parent_concept.uri])
+
+    def test_patch_200_with_parent_concept_urls(self):
+        _, concept = self._concept_with_parent()
+        new_parent_concept = ConceptFactory(parent=self.source)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.patch(
+            concepts_url,
+            {'parent_concept_urls': [new_parent_concept.uri], 'update_comment': 'Updated parents'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+        concept.refresh_from_db()
+        self.assertEqual(concept.parent_concept_urls, [new_parent_concept.uri])
+        self.assertEqual(concept.get_latest_version().parent_concept_urls, [new_parent_concept.uri])
+
+    def test_patch_200_removes_parent_concept_urls(self):
+        _, concept = self._concept_with_parent()
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.patch(
+            concepts_url,
+            {'parent_concept_urls': [], 'update_comment': 'Removed parents'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+        concept.refresh_from_db()
+        self.assertEqual(concept.parent_concept_urls, [])
+        self.assertEqual(concept.get_latest_version().parent_concept_urls, [])
+
+    def test_patch_200_keeps_parent_concept_urls_when_omitted(self):
+        parent_concept, concept = self._concept_with_parent()
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.patch(
+            concepts_url,
+            {'datatype': 'None', 'update_comment': 'Updated datatype'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+        concept.refresh_from_db()
+        self.assertEqual(concept.datatype, 'None')
+        self.assertEqual(concept.parent_concept_urls, [parent_concept.uri])
+        self.assertEqual(concept.get_latest_version().parent_concept_urls, [parent_concept.uri])
+
+    def test_put_404(self):
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/foobar/"
+
+        response = self.client.put(
+            concepts_url,
+            {**self.concept_payload, 'concept_class': '', 'update_comment': 'Updated concept_class'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_delete_204(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.delete(
+            concepts_url,
+            {
+                'retire_reason': "Deprecated 5/1/2026, replaced by more granular MySource:A1b2C3",
+                'comment': 'Retired'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+
+        concept.refresh_from_db()
+
+        self.assertEqual(concept.versions.count(), 2)
+        latest = concept.versions.order_by('-created_at').first()
+        self.assertTrue(latest.retired)
+        self.assertTrue(concept.retired)
+        self.assertTrue(latest.retire_reason, "Deprecated 5/1/2026, replaced by more granular MySource:A1b2C3")
+        self.assertTrue(latest.comment, 'Retired')
+
+    def test_delete_204_without_retire_reason(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.delete(
+            concepts_url,
+            {'update_comment': 'Retired'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+
+        concept.refresh_from_db()
+
+        self.assertEqual(concept.versions.count(), 2)
+        latest_version = concept.versions.order_by('-created_at').first()
+        self.assertTrue(latest_version.retired)
+        self.assertTrue(concept.retired)
+        self.assertEqual(latest_version.retire_reason, None)
+        self.assertEqual(latest_version.comment, 'Retired')
+
+    def test_delete_204_without_payload(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.delete(
+            concepts_url,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+
+        concept.refresh_from_db()
+
+        self.assertEqual(concept.versions.count(), 2)
+        latest_version = concept.versions.order_by('-created_at').first()
+        self.assertTrue(latest_version.retired)
+        self.assertTrue(concept.retired)
+        self.assertEqual(latest_version.retire_reason, None)
+        self.assertEqual(latest_version.comment, 'Concept was retired')
+
+    def test_retire_update_and_unretire_preserves_version_metadata(self):  # pylint: disable=too-many-statements
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names)
+        retire_reason = "Deprecated 5/1/2026, replaced by more granular MySource:A1b2C3"
+        retire_comment = 'Retired for replacement'
+        retired_update_comment = 'Updated while retired'
+        unretire_comment = 'Reactivated for reuse'
+
+        response = self.client.delete(
+            concept.uri,
+            {'retire_reason': retire_reason, 'update_comment': retire_comment},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+
+        concept.refresh_from_db()
+        retired_version = concept.get_latest_version()
+        initial_version = retired_version.prev_version
+
+        self.assertTrue(retired_version.retired)
+        self.assertTrue(concept.retired)
+        self.assertEqual(retired_version.retire_reason, retire_reason)
+        self.assertEqual(concept.retire_reason, retire_reason)
+        self.assertEqual(retired_version.comment, retire_comment)
+        self.assertIsNone(initial_version.retire_reason)
+        self.assertIsNone(initial_version.comment)
+
+        response = self.client.patch(
+            concept.uri,
+            {'datatype': 'Text', 'update_comment': retired_update_comment},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        concept.refresh_from_db()
+        retired_updated_version = concept.get_latest_version()
+        retired_prev_version = retired_updated_version.prev_version
+
+        self.assertTrue(retired_updated_version.retired)
+        self.assertTrue(concept.retired)
+        self.assertEqual(retired_updated_version.retire_reason, retire_reason)
+        self.assertEqual(concept.retire_reason, retire_reason)
+        self.assertEqual(retired_updated_version.comment, retired_update_comment)
+        self.assertEqual(retired_prev_version.retire_reason, retire_reason)
+        self.assertEqual(retired_prev_version.comment, retire_comment)
+        self.assertIsNone(retired_prev_version.prev_version.retire_reason)
+        self.assertIsNone(retired_prev_version.prev_version.comment)
+
+        response = self.client.put(
+            concept.uri + 'reactivate/',
+            {'update_comment': unretire_comment},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+
+        concept.refresh_from_db()
+        unretired_version = concept.get_latest_version()
+        unretired_prev_version = unretired_version.prev_version
+
+        self.assertFalse(unretired_version.retired)
+        self.assertFalse(concept.retired)
+        self.assertEqual(unretired_version.retire_reason, retire_reason)
+        self.assertEqual(concept.retire_reason, retire_reason)
+        self.assertEqual(unretired_version.comment, unretire_comment)
+        self.assertTrue(unretired_prev_version.retired)
+        self.assertEqual(unretired_prev_version.retire_reason, retire_reason)
+        self.assertEqual(unretired_prev_version.comment, retired_update_comment)
+        self.assertTrue(unretired_prev_version.prev_version.retired)
+        self.assertEqual(unretired_prev_version.prev_version.retire_reason, retire_reason)
+        self.assertEqual(unretired_prev_version.prev_version.comment, retire_comment)
+        self.assertIsNone(unretired_prev_version.prev_version.prev_version.retire_reason)
+        self.assertIsNone(unretired_prev_version.prev_version.prev_version.comment)
+
+    def test_db_hard_delete_204(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.delete(
+            concepts_url + '?db=true&hardDelete=true',
+            {'update_comment': 'Deleting it'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept.id).exists())
+        self.assertFalse(Concept.objects.filter(mnemonic=concept.mnemonic).exists())
+
+    def test_hard_delete_204(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.delete(
+            concepts_url + '?hardDelete=true',
+            {'update_comment': 'Deleting it'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept.id).exists())
+        self.assertFalse(Concept.objects.filter(mnemonic=concept.mnemonic).exists())
+
+    @patch('core.concepts.views.delete_concept')
+    def test_async_hard_delete_204(self, delete_concept_task_mock):
+        delete_concept_task_mock.__name__ = 'delete_concept'
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.delete(
+            concepts_url + '?async=true&hardDelete=true',
+            {'update_comment': 'Deleting it'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        delete_concept_task_mock.apply_async.assert_called_once_with((concept.id,), queue='default', task_id=ANY)
+
+    def test_delete_404(self):
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/foobar/"
+
+        response = self.client.delete(
+            concepts_url,
+            {'update_comment': 'Deleting it'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_delete_400(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names, retired=True)
+        concepts_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/"
+
+        response = self.client.delete(
+            concepts_url + '?includeRetired=true',
+            {'update_comment': 'Deleting it'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'__all__': 'Concept is already retired'})
+
+    def test_extras_get_200(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names, extras={'foo': 'bar'})
+        extras_url = f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}" \
+            f"/concepts/{concept.mnemonic}/extras/"
+
+        response = self.client.get(
+            extras_url,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'foo': 'bar'})
+
+    def test_extra_get_200(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names, extras={'foo': 'bar', 'tao': 'ching'})
+
+        def extra_url(extra):
+            return f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}" \
+                f"/concepts/{concept.mnemonic}/extras/{extra}/"
+
+        response = self.client.get(
+            extra_url('tao'),
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'tao': 'ching'})
+
+        response = self.client.get(
+            extra_url('foo'),
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'foo': 'bar'})
+
+        response = self.client.get(
+            extra_url('bar'),
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data, {'detail': 'Not found.'})
+
+    def test_extra_put_200(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names, extras={'foo': 'bar', 'tao': 'ching'})
+
+        def extra_url(extra):
+            return f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}" \
+                f"/concepts/{concept.mnemonic}/extras/{extra}/"
+
+        response = self.client.put(
+            extra_url('tao'),
+            {'tao': 'te-ching'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        concept.refresh_from_db()
+        self.assertTrue(concept.extras['tao'] == response.data['tao'] == 'te-ching')
+        self.assertEqual(concept.versions.count(), 2)
+
+        latest_version = concept.versions.order_by('-created_at').first()
+        self.assertEqual(latest_version.extras, {'foo': 'bar', 'tao': 'te-ching'})
+        self.assertEqual(latest_version.comment, 'Updated extras: tao=te-ching.')
+
+    def test_extra_put_400(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names, extras={'foo': 'bar', 'tao': 'ching'})
+
+        def extra_url(extra):
+            return f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}" \
+                f"/concepts/{concept.mnemonic}/extras/{extra}/"
+
+        response = self.client.put(
+            extra_url('tao'),
+            {'tao': None},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, ['Must specify tao param in body.'])
+        concept.refresh_from_db()
+        self.assertEqual(concept.extras, {'foo': 'bar', 'tao': 'ching'})
+
+    def test_extra_delete_204(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names, extras={'foo': 'bar', 'tao': 'ching'})
+        self.assertEqual(concept.versions.count(), 1)
+
+        def extra_url(extra):
+            return f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}" \
+                f"/concepts/{concept.mnemonic}/extras/{extra}/"
+
+        response = self.client.delete(
+            extra_url('tao'),
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+
+        concept.refresh_from_db()
+        self.assertFalse('tao' in concept.extras)
+        self.assertEqual(concept.versions.count(), 2)
+
+        latest_version = concept.get_latest_version()
+        self.assertEqual(latest_version.extras, {'foo': 'bar'})
+        self.assertEqual(latest_version.comment, 'Deleted extra tao.')
+
+    def test_extra_delete_404(self):
+        names = [ConceptNameFactory.build()]
+        concept = ConceptFactory(parent=self.source, names=names, extras={'foo': 'bar', 'tao': 'ching'})
+
+        def extra_url(extra):
+            return f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}" \
+                f"/concepts/{concept.mnemonic}/extras/{extra}/"
+
+        response = self.client.delete(
+            extra_url('bar'),
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_names_get_200(self):
+        name = ConceptNameFactory.build()
+        concept = ConceptFactory(parent=self.source, names=[name])
+
+        response = self.client.get(
+            f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/names/",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            dict(response.data[0]),
+            {
+                "uuid": str(name.id),
+                "external_id": None,
+                "type": 'ConceptName',
+                "locale": name.locale,
+                "locale_preferred": False,
+                "name": name.name,
+                "name_type": "FULLY_SPECIFIED",
+                "retired": False,
+                "retire_reason": None,
+            }
+        )
+
+    def test_names_post_201(self):
+        name = ConceptNameFactory.build()
+        concept = ConceptFactory(parent=self.source, names=[name])
+
+        response = self.client.post(
+            f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/names/",
+            {
+                "type": 'ConceptName',
+                "locale": 'en',
+                "locale_preferred": False,
+                "name": 'foo',
+                "name_type": "Fully Specified"
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            response.data,
+            {
+                "uuid": ANY,
+                "external_id": None,
+                "type": 'ConceptName',
+                "locale": 'en',
+                "locale_preferred": False,
+                "name": 'foo',
+                "name_type": "Fully Specified",
+                "retired": False,
+                "retire_reason": None,
+            }
+        )
+        self.assertEqual(concept.names.count(), 2)
+
+    def test_names_post_400(self):
+        name = ConceptNameFactory.build()
+        concept = ConceptFactory(parent=self.source, names=[name])
+
+        response = self.client.post(
+            f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/concepts/{concept.mnemonic}/names/",
+            {
+                "type": 'ConceptName',
+                "name": name.name,
+                "name_type": "Fully Specified"
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(list(response.data.keys()), ['locale'])
+
+    def test_name_delete_204(self):
+        name1 = ConceptNameFactory.build()
+        name2 = ConceptNameFactory.build()
+        concept = ConceptFactory(parent=self.source, names=[name1, name2])
+        response = self.client.delete(
+            f"/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}"
+            f"/concepts/{concept.mnemonic}/names/{name2.id}/",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(concept.versions.count(), 2)
+        self.assertEqual(concept.names.count(), 2)
+        self.assertEqual(concept.active_names.count(), 1)
+        self.assertEqual(concept.active_names.first().name, name1.name)
+        self.assertEqual(concept.retired_names.count(), 1)
+        self.assertEqual(concept.retired_names.first().name, name2.name)
+
+        latest_version = concept.get_latest_version()
+        self.assertEqual(latest_version.names.count(), 2)
+        self.assertEqual(latest_version.active_names.count(), 1)
+        self.assertEqual(latest_version.retired_names.count(), 1)
+        self.assertEqual(latest_version.active_names.first().name, name1.name)
+        self.assertEqual(latest_version.retired_names.first().name, name2.name)
+        self.assertEqual(latest_version.comment, f'Retired {name2.name} in names.')
+
+        prev_latest = concept.get_latest_version().prev_version
+        self.assertEqual(prev_latest.active_names.count(), 2)
+        self.assertEqual(prev_latest.retired_names.count(), 0)
+        self.assertEqual(
+            sorted(prev_latest.names.values_list('name', flat=True)), sorted([name1.name, name2.name]))
+
+    def test_get_200_with_response_modes(self):
+        ConceptFactory(parent=self.source, mnemonic='conceptA')
+        response = self.client.get(
+            "/concepts/",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            sorted(response.data[0].keys()),
+            sorted(['uuid', 'id', 'external_id', 'concept_class', 'datatype', 'url', 'retired', 'source',
+                    'owner', 'owner_type', 'owner_url', 'display_name', 'display_locale', 'version', 'update_comment',
+                    'locale', 'version_created_by', 'version_created_on', 'is_latest_version', 'latest_source_version',
+                    'versions_url', 'version_url', 'type', 'versioned_object_id',
+                    'version_updated_on', 'version_updated_by', 'checksums', 'property', 'retire_reason'])
+        )
+
+        response = self.client.get(
+            "/concepts/?verbose=true",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            sorted(response.data[0].keys()),
+            sorted(['uuid', 'id', 'external_id', 'concept_class', 'datatype', 'url', 'retired', 'source',
+                    'owner', 'owner_type', 'owner_url', 'display_name', 'display_locale', 'names', 'descriptions',
+                    'created_on', 'updated_on', 'versions_url', 'version', 'extras', 'type', 'latest_source_version',
+                    'update_comment', 'version_url', 'updated_by', 'created_by',
+                    'public_can_view', 'versioned_object_id', 'checksums', 'property', 'retire_reason'])
+        )
+
+        response = self.client.get(
+            "/concepts/?brief=true",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            sorted(response.data[0].keys()),
+            sorted(['uuid', 'id', 'url', 'version_url', 'type', 'retired', 'checksums', 'display_name'])
+        )
+
+    def test_get_200_with_mappings(self):
+        concept1 = ConceptFactory(parent=self.source, mnemonic='conceptA')
+        concept2 = ConceptFactory(parent=self.source, mnemonic='conceptB')
+        mapping = MappingFactory(
+            parent=self.source, from_concept=concept2.get_latest_version(), to_concept=concept1.get_latest_version()
+        )
+
+        response = self.client.get(
+            "/concepts/",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            [response.data[0]['id'], response.data[1]['id']],
+            [concept2.mnemonic, concept1.mnemonic]
+        )
+        self.assertEqual(response['num_found'], '2')
+        self.assertEqual(response['num_returned'], '2')
+        self.assertFalse(response.has_header('previous'))
+        self.assertFalse(response.has_header('next'))
+
+        response = self.client.get(
+            "/concepts/?limit=1&verbose=true&includeMappings=true",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], concept2.mnemonic)
+        self.assertEqual(len(response.data[0]['mappings']), 1)
+        self.assertEqual(response.data[0]['mappings'][0]['uuid'], str(mapping.id))
+        self.assertEqual(response['num_found'], '2')
+        self.assertEqual(response['num_returned'], '1')
+        self.assertTrue('/concepts/?limit=1&verbose=true&includeMappings=true&page=2' in response['next'])
+        self.assertFalse(response.has_header('previous'))
+
+        response = self.client.get(
+            "/concepts/?page=2&limit=1&verbose=true&includeInverseMappings=true",
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], concept1.mnemonic)
+        self.assertEqual(response['num_found'], '2')
+        self.assertEqual(response['num_returned'], '1')
+        self.assertEqual(len(response.data[0]['mappings']), 1)
+        self.assertEqual(response.data[0]['mappings'][0]['uuid'], str(mapping.id))
+        self.assertTrue('/concepts/?page=1&limit=1&verbose=true&includeInverseMappings=true' in response['previous'])
+        self.assertFalse(response.has_header('next'))
+
+
+class ConceptHeadOnlyHardDeleteTest(OCLAPITestCase):
+    def _create_private_user_source_concept(self):
+        owner = UserProfileFactory()
+        source = UserSourceFactory(user=owner, public_access=ACCESS_TYPE_NONE)
+        concept = ConceptFactory(
+            parent=source,
+            names=[ConceptNameFactory.build(name='Head-only concept')],
+            descriptions=[ConceptDescriptionFactory.build(name='Head-only description')],
+        )
+        return owner, source, concept
+
+    @staticmethod
+    def _create_source_version(source, concept, *, released):
+        source_version = OrganizationSourceFactory(
+            organization=source.organization,
+            mnemonic=source.mnemonic,
+            version='released-v1' if released else 'draft-v1',
+            released=released,
+        )
+        source_version.concepts.add(concept.get_latest_version())
+        return source_version
+
+    def test_user_source_owner_can_hard_delete_head_only_concept(self):
+        owner, source, concept = self._create_private_user_source_concept()
+        source.update_concepts_count(sync=True)
+        self.assertEqual(source.active_concepts, 1)
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + owner.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(parent_id=source.id, mnemonic=concept.mnemonic).exists())
+        source.refresh_from_db()
+        self.assertEqual(source.active_concepts, 0)
+
+    def test_organization_member_can_hard_delete_head_only_concept(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept.id).exists())
+
+    def test_outsider_cannot_hard_delete_from_public_source(self):
+        source = OrganizationSourceFactory()
+        user = UserProfileFactory()
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_same_mnemonic_in_versioned_different_source_does_not_block_delete(self):
+        source = OrganizationSourceFactory()
+        other_source = OrganizationSourceFactory()
+        user = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source, mnemonic='shared-id')
+        other_concept = ConceptFactory(parent=other_source, mnemonic='shared-id')
+        self._create_source_version(other_source, other_concept, released=True)
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept.id).exists())
+        self.assertTrue(Concept.objects.filter(id=other_concept.id).exists())
+
+    def test_hard_delete_removes_all_head_only_concept_versions(self):
+        source = OrganizationSourceFactory()
+        user = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(
+            parent=source,
+            names=[ConceptNameFactory.build(name='Edited HEAD-only concept')],
+        )
+
+        for index in range(4):
+            response = self.client.patch(
+                concept.uri,
+                {'extras': {'edit': index}},
+                HTTP_AUTHORIZATION='Token ' + user.get_token(),
+                format='json',
+            )
+            self.assertEqual(response.status_code, 200, response.data)
+
+        concept_versions = Concept.objects.filter(
+            parent_id=source.id,
+            versioned_object_id=concept.id,
+        )
+        self.assertEqual(concept_versions.count(), 6)
+        self.assertFalse(concept.belongs_to_non_head_source_version())
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(
+            parent_id=source.id,
+            versioned_object_id=concept.id,
+        ).exists())
+
+    def test_user_without_write_access_cannot_hard_delete(self):
+        _, _, concept = self._create_private_user_source_concept()
+        user = UserProfileFactory()
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_anonymous_user_cannot_hard_delete_from_public_edit_source(self):
+        source = OrganizationSourceFactory()
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(concept.uri + '?hardDelete=true')
+
+        self.assertEqual(response.status_code, 401)
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_editor_cannot_hard_delete_concept_in_released_source_version(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+        self._create_source_version(source, concept, released=True)
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data, {'detail': CONCEPT_HARD_DELETE_REQUIRES_HEAD_ONLY})
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_editor_cannot_hard_delete_concept_in_draft_source_version(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+        self._create_source_version(source, concept, released=False)
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data, {'detail': CONCEPT_HARD_DELETE_REQUIRES_HEAD_ONLY})
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_editor_cannot_hard_delete_while_source_version_seed_is_pending(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+        source_version = OrganizationSourceFactory(
+            organization=source.organization,
+            mnemonic=source.mnemonic,
+            version='pending-v1',
+        )
+        Task.new(
+            user=member,
+            name='seed_children_to_new_version',
+            args=('source', source_version.id, True, False),
+            state=PENDING,
+        )
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data, {'detail': CONCEPT_HARD_DELETE_REQUIRES_HEAD_ONLY})
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_pending_seed_does_not_block_concept_created_after_source_version(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        source_version = OrganizationSourceFactory(
+            organization=source.organization,
+            mnemonic=source.mnemonic,
+            version='pending-v1',
+        )
+        Task.new(
+            user=member,
+            name='seed_children_to_new_version',
+            args=('source', source_version.id, True, False),
+            state=PENDING,
+        )
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept.id).exists())
+
+    def test_historical_concept_version_in_release_blocks_hard_delete(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(
+            parent=source,
+            names=[ConceptNameFactory.build(name='Historically released concept')],
+        )
+        released_version = self._create_source_version(source, concept, released=True)
+        released_concept_version_id = concept.get_latest_version().id
+
+        update_response = self.client.patch(
+            concept.uri,
+            {'datatype': 'Text'},
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+            format='json',
+        )
+        self.assertEqual(update_response.status_code, 200, update_response.data)
+        self.assertNotEqual(concept.get_latest_version().id, released_concept_version_id)
+        self.assertTrue(released_version.concepts.filter(id=released_concept_version_id).exists())
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_blocked_hard_delete_preserves_related_data(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(
+            parent=source,
+            names=[ConceptNameFactory.build(name='Published concept')],
+            descriptions=[ConceptDescriptionFactory.build(name='Published description')],
+        )
+        target = ConceptFactory(parent=source)
+        mapping = MappingFactory(
+            parent=source,
+            from_concept=concept.get_latest_version(),
+            to_concept=target.get_latest_version(),
+        )
+        source_version = self._create_source_version(source, concept, released=True)
+        concept_ids = list(Concept.objects.filter(
+            parent_id=source.id,
+            versioned_object_id=concept.id,
+        ).values_list('id', flat=True))
+        counts_before = {
+            'concepts': Concept.objects.filter(id__in=concept_ids).count(),
+            'names': sum(Concept.objects.get(id=cid).names.count() for cid in concept_ids),
+            'descriptions': sum(Concept.objects.get(id=cid).descriptions.count() for cid in concept_ids),
+            'source_associations': Concept.sources.through.objects.filter(concept_id__in=concept_ids).count(),
+            'mappings': Mapping.objects.filter(id=mapping.id).count(),
+        }
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            {
+                'concepts': Concept.objects.filter(id__in=concept_ids).count(),
+                'names': sum(Concept.objects.get(id=cid).names.count() for cid in concept_ids),
+                'descriptions': sum(Concept.objects.get(id=cid).descriptions.count() for cid in concept_ids),
+                'source_associations': Concept.sources.through.objects.filter(concept_id__in=concept_ids).count(),
+                'mappings': Mapping.objects.filter(id=mapping.id).count(),
+            },
+            counts_before,
+        )
+        self.assertTrue(source_version.concepts.filter(id__in=concept_ids).exists())
+
+    def test_admin_can_hard_delete_concept_in_released_source_version(self):
+        source = OrganizationSourceFactory()
+        concept = ConceptFactory(parent=source)
+        self._create_source_version(source, concept, released=True)
+        admin = UserProfile.objects.get(username='ocladmin')
+
+        response = self.client.delete(
+            concept.uri + '?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + admin.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept.id).exists())
+
+    @patch('core.concepts.views.delete_concept')
+    def test_editor_can_async_hard_delete_head_only_concept(self, delete_concept_task_mock):
+        delete_concept_task_mock.__name__ = 'delete_concept'
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri + '?async=true&hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        delete_concept_task_mock.apply_async.assert_called_once_with(
+            (concept.id,), queue='default', task_id=ANY)
+
+    @patch('core.concepts.views.delete_concept')
+    def test_editor_cannot_async_hard_delete_concept_in_released_source_version(self, delete_concept_task_mock):
+        delete_concept_task_mock.__name__ = 'delete_concept'
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+        self._create_source_version(source, concept, released=True)
+
+        response = self.client.delete(
+            concept.uri + '?async=true&hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data, {'detail': CONCEPT_HARD_DELETE_REQUIRES_HEAD_ONLY})
+        delete_concept_task_mock.apply_async.assert_not_called()
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_anonymous_user_cannot_async_hard_delete(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(concept.uri + '?async=true&hardDelete=true')
+
+        self.assertEqual(response.status_code, 401)
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_non_member_editor_cannot_use_db_hard_delete(self):
+        source = OrganizationSourceFactory()  # public edit access
+        user = UserProfileFactory()
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri + '?db=true&hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    @patch('core.concepts.views.delete_concept')
+    def test_non_member_editor_cannot_use_async_hard_delete(self, delete_concept_task_mock):
+        delete_concept_task_mock.__name__ = 'delete_concept'
+        source = OrganizationSourceFactory()  # public edit access
+        user = UserProfileFactory()
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri + '?async=true&hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        delete_concept_task_mock.apply_async.assert_not_called()
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_org_member_can_db_hard_delete_head_only_concept(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri + '?db=true&hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept.id).exists())
+
+    def test_org_member_cannot_db_hard_delete_concept_in_released_source_version(self):
+        source = OrganizationSourceFactory(public_access=ACCESS_TYPE_NONE)
+        member = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+        self._create_source_version(source, concept, released=True)
+
+        response = self.client.delete(
+            concept.uri + '?db=true&hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + member.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data, {'detail': CONCEPT_HARD_DELETE_REQUIRES_HEAD_ONLY})
+        self.assertTrue(Concept.objects.filter(id=concept.id).exists())
+
+    def test_editor_cannot_hard_delete_individual_concept_version(self):
+        source = OrganizationSourceFactory()
+        user = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+        concept_version = concept.get_latest_version()
+
+        response = self.client.delete(
+            f'{concept.uri}{concept_version.version}/?hardDelete=true',
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Concept.objects.filter(id=concept_version.id).exists())
+
+    def test_regular_delete_still_retires_for_editor(self):
+        source = OrganizationSourceFactory()
+        user = UserProfileFactory(organizations=[source.organization])
+        concept = ConceptFactory(parent=source)
+
+        response = self.client.delete(
+            concept.uri,
+            {'comment': 'Retired instead of deleted'},
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 204)
+        concept.refresh_from_db()
+        self.assertTrue(concept.retired)
+        self.assertEqual(concept.get_latest_version().comment, 'Retired instead of deleted')
+
+
+class ConceptVersionRetrieveViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = UserProfileFactory()
+        self.token = self.user.get_token()
+        self.source = UserSourceFactory(user=self.user)
+        self.concept = ConceptFactory(parent=self.source)
+
+    def test_get_200(self):
+        latest_version = self.concept.get_latest_version()
+
+        response = self.client.get(self.concept.url + f'{latest_version.id}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['is_latest_version'], True)
+        self.assertEqual(response.data['version_url'], latest_version.uri)
+        self.assertEqual(response.data['versioned_object_id'], self.concept.id)
+
+    def test_get_404(self):
+        response = self.client.get(self.concept.url + 'unknown/')
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_soft_delete_204(self):
+        admin_token = UserProfile.objects.get(username='ocladmin').get_token()
+        concept_v1 = ConceptFactory(
+            parent=self.source, version='v1', mnemonic=self.concept.mnemonic
+        )
+
+        response = self.client.delete(
+            self.concept.url + f'{concept_v1.version}/',
+            HTTP_AUTHORIZATION=f'Token {admin_token}',
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertTrue(Concept.objects.filter(id=concept_v1.id).exists())
+        concept_v1.refresh_from_db()
+        self.assertFalse(concept_v1.is_active)
+
+    def test_hard_delete_204(self):
+        admin_token = UserProfile.objects.get(username='ocladmin').get_token()
+        concept_v1 = ConceptFactory(
+            parent=self.source, version='v1', mnemonic=self.concept.mnemonic
+        )
+
+        response = self.client.delete(
+            f'{self.concept.url}{concept_v1.version}/?hardDelete=true',
+            HTTP_AUTHORIZATION=f'Token {admin_token}',
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Concept.objects.filter(id=concept_v1.id).exists())
+
+
+class ConceptExtrasViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.extras = {'foo': 'bar', 'tao': 'ching'}
+        self.concept = ConceptFactory(extras=self.extras)
+        self.user = UserProfileFactory(organizations=[self.concept.parent.organization])
+        self.token = self.user.get_token()
+
+    def test_get_200(self):
+        response = self.client.get(self.concept.uri + 'extras/', format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, self.extras)
+
+
+class ConceptExtraRetrieveUpdateDestroyViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.extras = {'foo': 'bar', 'tao': 'ching'}
+        self.concept = ConceptFactory(extras=self.extras, names=[ConceptNameFactory.build()])
+        self.user = UserProfileFactory(organizations=[self.concept.parent.organization])
+        self.token = self.user.get_token()
+
+    def test_get_200(self):
+        response = self.client.get(self.concept.uri + 'extras/foo/', format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'foo': 'bar'})
+
+    def test_get_404(self):
+        response = self.client.get(self.concept.uri + 'extras/bar/', format='json')
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_put_200(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().extras, self.extras)
+        self.assertEqual(self.concept.extras, self.extras)
+
+        response = self.client.put(
+            self.concept.uri + 'extras/foo/',
+            {'foo': 'foobar'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'foo': 'foobar'})
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().extras, {'foo': 'foobar', 'tao': 'ching'})
+        self.concept.refresh_from_db()
+        self.assertEqual(self.concept.extras, {'foo': 'foobar', 'tao': 'ching'})
+
+    def test_put_400(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().extras, self.extras)
+        self.assertEqual(self.concept.extras, self.extras)
+
+        response = self.client.put(
+            self.concept.uri + 'extras/foo/',
+            {'tao': 'foobar'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, ['Must specify foo param in body.'])
+        self.assertEqual(self.concept.versions.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().extras, self.extras)
+        self.concept.refresh_from_db()
+        self.assertEqual(self.concept.extras, self.extras)
+
+    def test_delete_204(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().extras, self.extras)
+        self.assertEqual(self.concept.extras, self.extras)
+
+        response = self.client.delete(
+            self.concept.uri + 'extras/foo/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().extras, {'tao': 'ching'})
+        self.assertEqual(self.concept.versions.first().extras, {'foo': 'bar', 'tao': 'ching'})
+        self.concept.refresh_from_db()
+        self.assertEqual(self.concept.extras, {'tao': 'ching'})
+
+
+class ConceptVersionsViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.concept = ConceptFactory(names=[ConceptNameFactory.build()])
+        self.user = UserProfileFactory(organizations=[self.concept.parent.organization])
+        self.token = self.user.get_token()
+
+    def test_get_200(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        response = self.client.get(self.concept.versions_url)
+
+        self.assertEqual(response.status_code, 200)
+        versions = response.data
+        self.assertEqual(len(versions), 1)
+        version = versions[0]
+        latest_version = self.concept.get_latest_version()
+        self.assertEqual(version['uuid'], str(latest_version.id))
+        self.assertEqual(version['id'], self.concept.mnemonic)
+        self.assertEqual(version['url'], self.concept.uri)
+        self.assertEqual(version['version_url'], latest_version.uri)
+        self.assertTrue(version['is_latest_version'])
+        self.assertIsNone(version['previous_version_url'])
+
+        response = self.client.put(
+            self.concept.uri,
+            {'names': [{
+                'locale': 'ab', 'locale_preferred': True, 'name': 'c1 name', 'name_type': 'Fully Specified'
+            }], 'datatype': 'foobar', 'update_comment': 'Updated datatype'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.concept.versions.count(), 2)
+
+        response = self.client.get(self.concept.versions_url)
+
+        self.assertEqual(response.status_code, 200)
+        versions = response.data
+        self.assertEqual(len(versions), 2)
+
+        prev_latest_version = [v for v in versions if v['uuid'] == version['uuid']][0]
+        new_latest_version = [v for v in versions if v['uuid'] != version['uuid']][0]
+        latest_version = self.concept.get_latest_version()
+
+        self.assertEqual(new_latest_version['version_url'], latest_version.uri)
+        self.assertEqual(str(latest_version.id), str(new_latest_version['uuid']))
+        self.assertEqual(prev_latest_version['uuid'], version['uuid'])
+        self.assertEqual(new_latest_version['previous_version_url'], prev_latest_version['version_url'])
+        self.assertEqual(new_latest_version['previous_version_url'], version['version_url'])
+        self.assertIsNone(prev_latest_version['previous_version_url'])
+        self.assertFalse(prev_latest_version['is_latest_version'])
+        self.assertTrue(new_latest_version['is_latest_version'])
+        self.assertEqual(new_latest_version['datatype'], 'foobar')
+        self.assertEqual(prev_latest_version['datatype'], 'None')
+
+
+class ConceptMappingsViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.concept = ConceptFactory(names=[ConceptNameFactory.build()])
+
+    def test_get_200_for_concept(self):
+        mappings_url = self.concept.uri + 'mappings/'
+        response = self.client.get(mappings_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        direct_mapping = MappingFactory(parent=self.concept.parent, from_concept=self.concept)
+        indirect_mapping = MappingFactory(parent=self.concept.parent, to_concept=self.concept)
+
+        response = self.client.get(mappings_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['uuid'], str(direct_mapping.id))
+
+        response = self.client.get(mappings_url + '?includeInverseMappings=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted([mapping['uuid'] for mapping in response.data]),
+            sorted([str(direct_mapping.id), str(indirect_mapping.id)])
+        )
+
+    def test_get_200_for_concept_version(self):
+        concept_latest_version = self.concept.get_latest_version()
+
+        mappings_url = concept_latest_version.uri + 'mappings/'
+        response = self.client.get(mappings_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        direct_mapping = MappingFactory(parent=self.concept.parent, from_concept=concept_latest_version)
+        indirect_mapping = MappingFactory(parent=self.concept.parent, to_concept=concept_latest_version)
+
+        response = self.client.get(mappings_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['uuid'], str(direct_mapping.id))
+
+        response = self.client.get(mappings_url + '?includeInverseMappings=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted([mapping['uuid'] for mapping in response.data]),
+            sorted([str(direct_mapping.id), str(indirect_mapping.id)])
+        )
+
+
+class ConceptCascadeViewTest(OCLAPITestCase):
+    def test_get_200_for_source_version(self):  # pylint: disable=too-many-statements
+        source1 = OrganizationSourceFactory()
+        source2 = OrganizationSourceFactory()
+        concept1 = ConceptFactory(parent=source1)
+        concept2 = ConceptFactory(parent=source1)
+        concept3 = ConceptFactory(parent=source2)
+        mapping1 = MappingFactory(from_concept=concept1, to_concept=concept2, parent=source1, map_type='map_type1')
+        mapping2 = MappingFactory(from_concept=concept2, to_concept=concept1, parent=source1, map_type='map_type1')
+        mapping3 = MappingFactory(from_concept=concept2, to_concept=concept3, parent=source1, map_type='map_type1')
+        mapping4 = MappingFactory(from_concept=concept1, to_concept=concept3, parent=source1, map_type='map_type2')
+        mapping6 = MappingFactory(from_concept=concept3, to_concept=concept1, parent=source2, map_type='map_type2')
+
+        response = self.client.get(concept1.uri + '$cascade/?method=sourceMappings&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 3)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                mapping1.uri,
+                mapping4.uri,
+            ])
+        )
+
+        response = self.client.get(concept1.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 4)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                mapping1.uri,
+                mapping4.uri,
+            ])
+        )
+
+        response = self.client.get(concept1.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=*')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 6)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                mapping1.uri,
+                mapping2.uri,
+                mapping3.uri,
+                mapping4.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept1.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=1&returnMapTypes=false')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept1.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=1&'
+                           'cascadeMappings=false&cascadeHierarchy=false')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept1.uri +
+            '$cascade/?method=sourceToConcepts&mapTypes=map_type1&cascadeLevels=1&returnMapTypes=map_type1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 3)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                mapping1.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept1.uri +
+            '$cascade/?method=sourceToConcepts&excludeMapTypes=map_type1&cascadeLevels=1&returnMapTypes=map_type2')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                mapping4.uri,
+            ])
+        )
+
+        response = self.client.get(concept2.uri + '$cascade/?method=sourceMappings&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 3)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept2.uri,
+                mapping2.uri,
+                mapping3.uri,
+            ])
+        )
+
+        response = self.client.get(concept2.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 4)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept2.uri,
+                concept1.uri,
+                mapping2.uri,
+                mapping3.uri,
+            ])
+        )
+
+        response = self.client.get(concept3.uri + '$cascade/?method=sourceMappings&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+                mapping6.uri,
+            ])
+        )
+
+        response = self.client.get(concept3.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+                mapping6.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept3.uri + '$cascade/?method=sourceToConcepts&mapTypes=foobar&cascadeLevels=1&returnMapTypes=foobar')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+            ])
+        )
+
+        # bundle response
+        response = self.client.get(concept3.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resourceType'], 'Bundle')
+        self.assertEqual(response.data['total'], 2)
+        self.assertEqual(len(response.data['entry']), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+                mapping6.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept3.uri + '$cascade/?method=sourceToConcepts&mapTypes=foobar&cascadeLevels=1&returnMapTypes=foobar')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resourceType'], 'Bundle')
+        self.assertEqual(response.data['total'], 1)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+            ])
+        )
+
+        # hierarchy response
+        response = self.client.get(concept1.uri + '$cascade/?view=hierarchy&returnMapTypes=false')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resourceType'], 'Bundle')
+
+        entry = response.data['entry']
+        self.assertCountEqual(
+            list(entry.keys()),
+            ['id', 'type', 'url', 'version_url', 'terminal', 'entries', 'display_name', 'retired', 'checksums',
+             'concept_class', 'datatype']
+        )
+        self.assertEqual(entry['id'], concept1.mnemonic)
+        self.assertEqual(entry['type'], 'Concept')
+        self.assertEqual(len(entry['entries']), 1)
+        self.assertEqual(entry['entries'][0]['url'], concept2.url)
+
+        # reverse ($cascade up)
+        response = self.client.get(concept3.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=*&reverse=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+            ])
+        )
+
+        # reverse ($cascade up)
+        response = self.client.get(concept2.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=*&reverse=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 4)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                mapping1.uri,
+                mapping2.uri,
+            ])
+        )
+
+        # reverse ($cascade up)
+        response = self.client.get(concept1.uri + '$cascade/?method=sourceToConcepts&cascadeLevels=*&reverse=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 4)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                mapping1.uri,
+                mapping2.uri,
+            ])
+        )
+
+        # reverse hierarchy response
+        response = self.client.get(concept2.uri + '$cascade/?view=hierarchy&reverse=true&returnMapTypes=false')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resourceType'], 'Bundle')
+
+        entry = response.data['entry']
+        self.assertCountEqual(
+            list(entry.keys()),
+            ['id', 'type', 'url', 'version_url', 'terminal', 'entries', 'display_name', 'retired', 'checksums',
+             'concept_class', 'datatype']
+        )
+        self.assertEqual(entry['id'], concept2.mnemonic)
+        self.assertEqual(entry['type'], 'Concept')
+        self.assertEqual(len(entry['entries']), 1)
+        self.assertEqual(entry['entries'][0]['url'], concept1.url)
+
+        # cascade 0
+        response = self.client.get(concept3.uri + '$cascade/?cascadeLevels=0')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resourceType'], 'Bundle')
+        self.assertEqual(response.data['total'], 1)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+            ])
+        )
+
+        # $cascade 0 - reverse ($cascade up)
+        response = self.client.get(concept1.uri + '$cascade/?cascadeLevels=0&reverse=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+            ])
+        )
+
+        # $cascade 0 - hierarchy response
+        response = self.client.get(concept1.uri + '$cascade/?view=hierarchy&cascadeLevels=0')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resourceType'], 'Bundle')
+
+        entry = response.data['entry']
+        self.assertCountEqual(
+            list(entry.keys()),
+            ['id', 'type', 'url', 'version_url', 'terminal', 'entries', 'display_name', 'retired', 'checksums',
+             'concept_class', 'datatype']
+        )
+        self.assertEqual(entry['id'], concept1.mnemonic)
+        self.assertEqual(entry['type'], 'Concept')
+        self.assertEqual(len(entry['entries']), 0)
+
+        # $cascade 0 - reverse hierarchy response
+        response = self.client.get(concept2.uri + '$cascade/?view=hierarchy&reverse=true&cascadeLevels=0')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resourceType'], 'Bundle')
+
+        entry = response.data['entry']
+        self.assertCountEqual(
+            list(entry.keys()),
+            ['id', 'type', 'url', 'version_url', 'terminal', 'entries', 'display_name', 'retired', 'checksums',
+             'concept_class', 'datatype']
+        )
+        self.assertEqual(entry['id'], concept2.mnemonic)
+        self.assertEqual(entry['type'], 'Concept')
+        self.assertEqual(len(entry['entries']), 0)
+
+        # $cascade all forward with omitIfExistsIn
+        collection = OrganizationCollectionFactory()
+        expansion = ExpansionFactory(collection_version=collection)
+        collection.expansion_uri = expansion.uri
+        collection.save()
+        expansion.concepts.add(concept2.get_latest_version())
+        expansion.concepts.add(concept3)
+        expansion.mappings.add(mapping2)
+        expansion.mappings.add(mapping6)
+
+        response = self.client.get(
+            concept1.uri + '$cascade/?omitIfExistsIn=' + collection.uri
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 3)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                mapping1.uri,
+                mapping4.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept1.uri + '$cascade/?view=hierarchy&omitIfExistsIn=' + collection.uri
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['entry']['url'], concept1.uri)
+        self.assertEqual(len(response.data['entry']['entries']), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']['entries']]),
+            sorted([
+                mapping1.uri,
+                mapping4.uri,
+            ])
+        )
+
+        response = self.client.get(
+            concept1.uri + '$cascade/?includeSelf=false&includeRetired=true&omitIfExistsIn=' + collection.uri
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 3)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                mapping1.uri,
+                mapping4.uri,
+            ])
+        )
+
+    def test_get_200_for_collection_version(self):  # pylint: disable=too-many-locals,too-many-statements
+        source1 = OrganizationSourceFactory()
+        source2 = OrganizationSourceFactory()
+        concept1 = ConceptFactory(parent=source1)
+        concept2 = ConceptFactory(parent=source1)
+        concept3 = ConceptFactory(parent=source2)
+        mapping1 = MappingFactory(from_concept=concept1, to_concept=concept2, parent=source1, map_type='map_type1')
+        mapping2 = MappingFactory(from_concept=concept2, to_concept=concept1, parent=source1, map_type='map_type1')
+        mapping3 = MappingFactory(from_concept=concept2, to_concept=concept3, parent=source1, map_type='map_type1')
+        mapping4 = MappingFactory(from_concept=concept1, to_concept=concept3, parent=source1, map_type='map_type2')
+        mapping5 = MappingFactory(from_concept=concept3, to_concept=concept1, parent=source2, map_type='map_type2')
+
+        collection1 = OrganizationCollectionFactory()
+        expansion1 = ExpansionFactory(collection_version=collection1)
+        collection2 = OrganizationCollectionFactory()
+        expansion2 = ExpansionFactory(collection_version=collection2)
+        expansion1.concepts.set([concept1, concept3])
+        expansion1.mappings.set([mapping1, mapping4, mapping5])
+        expansion2.concepts.set([concept1, concept2, concept3])
+        expansion2.mappings.set([mapping1, mapping2, mapping3, mapping4, mapping5])
+
+        response = self.client.get(
+            collection1.uri + 'HEAD/concepts/' + concept1.mnemonic + '/$cascade/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([concept1.uri])
+        )
+
+        collection1.expansion_uri = expansion1.uri
+        collection1.save()
+
+        response = self.client.get(
+            collection1.uri + 'HEAD/concepts/' + concept1.mnemonic + '/$cascade/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 5)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept3.uri,
+                mapping1.uri,
+                mapping4.uri,
+                mapping5.uri
+            ])
+        )
+
+        response = self.client.get(
+            collection1.uri + 'HEAD/concepts/' + concept1.mnemonic + '/$cascade/?cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 4)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept3.uri,
+                mapping1.uri,
+                mapping4.uri,
+            ])
+        )
+
+        response = self.client.get(
+            collection1.uri + 'HEAD/concepts/' + concept2.mnemonic + '/$cascade/')
+
+        self.assertEqual(response.status_code, 404)
+
+        response = self.client.get(
+            collection1.uri + 'HEAD/concepts/' + concept3.mnemonic + '/$cascade/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 5)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+                concept1.uri,
+                mapping1.uri,
+                mapping4.uri,
+                mapping5.uri
+            ])
+        )
+
+        response = self.client.get(
+            collection1.uri + 'HEAD/concepts/' + concept3.mnemonic +
+            '/$cascade/?mapTypes=map_type1&returnMapTypes=map_type1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 1)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+            ])
+        )
+
+        response = self.client.get(
+            collection1.uri + 'HEAD/concepts/' + concept3.mnemonic + '/$cascade/?cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 3)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept3.uri,
+                concept1.uri,
+                mapping5.uri
+            ])
+        )
+
+        collection2.expansion_uri = expansion2.uri
+        collection2.save()
+
+        response = self.client.get(
+            collection2.uri + 'HEAD/concepts/' + concept1.mnemonic + '/$cascade/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 8)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                concept3.uri,
+                mapping1.uri,
+                mapping2.uri,
+                mapping3.uri,
+                mapping4.uri,
+                mapping5.uri,
+            ])
+        )
+
+        response = self.client.get(
+            collection2.uri +
+            'HEAD/concepts/' +
+            concept2.mnemonic +
+            '/$cascade/?excludeMapTypes=map_type2&returnMapTypes=map_type1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 6)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                concept3.uri,
+                mapping1.uri,
+                mapping2.uri,
+                mapping3.uri,
+            ])
+        )
+
+        response = self.client.get(
+            collection2.uri + 'HEAD/concepts/' + concept2.mnemonic + '/$cascade/?reverse=true&cascadeLevels=1')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 3)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                mapping1.uri,
+            ])
+        )
+
+        response = self.client.get(
+            collection2.uri + 'HEAD/concepts/' + concept2.mnemonic + '/$cascade/?reverse=true&cascadeLevels=2')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['entry']), 6)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data['entry']]),
+            sorted([
+                concept1.uri,
+                concept2.uri,
+                concept3.uri,
+                mapping1.uri,
+                mapping2.uri,
+                mapping5.uri,
+            ])
+        )
+
+
+class ConceptListViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.patch_concept_es_mapping_for_ci()
+        self.source = OrganizationSourceFactory(mnemonic='MySource')
+        self.source_v1 = OrganizationSourceFactory(
+            version='v1', mnemonic='MySource', organization=self.source.parent,
+            released=True
+        )
+        self.concept1 = ConceptFactory(
+            mnemonic='MyConcept1', parent=self.source, concept_class='classA', extras={'foo': 'bar'}
+        )
+        self.concept2 = ConceptFactory(
+            mnemonic='MyConcept2', parent=self.source, concept_class='classB', extras={'bar': 'foo'}
+        )
+        self.source.concepts.add(self.concept1.get_latest_version())
+        self.source.concepts.add(self.concept2.get_latest_version())
+        self.source_v1.concepts.add(self.concept2.get_latest_version())
+        ConceptDocument().update(self.source.concepts_set.all())  # needed for parallel test execution
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.random_user = UserProfileFactory()
+
+    def test_search(self):  # pylint: disable=too-many-statements
+        ConceptDocument().update(self.source.concepts_set.all())
+
+        response = self.client.get(self.source.concepts_url + '?q=MyConcept2')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+        self.assertEqual(response.data[0]['uuid'], str(self.concept2.get_latest_version().id))
+        self.assertEqual(response.data[0]['versioned_object_id'], self.concept2.id)
+
+        response = self.client.get(self.source.concepts_url + '?q=MyConcept1')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept1')
+
+        response = self.client.get(self.source.concepts_url + '?q=MyConcept1&exact_match=on')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept1')
+
+        response = self.client.get(self.source.concepts_url + '?q=MyConcept&conceptClass=classA')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept1')
+
+        response = self.client.get(self.source.concepts_url + '?q=MyConcept1&conceptClass=classB')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        response = self.client.get(self.source.concepts_url + '?conceptClass=classA')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept1')
+
+        response = self.client.get(self.source.concepts_url + '?extras.foo=bar')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept1')
+
+        response = self.client.get(self.source.concepts_url + '?extras.exists=bar')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+
+        response = self.client.get(
+            self.source.concepts_url + '?q=MyConcept&extras.exact.foo=bar&includeSearchMeta=true')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept1')
+        self.assertEqual(
+            response.data[0]['search_meta']['search_highlight'],
+            {
+                'extras.foo': ['<em>bar</em>'],
+                'id': ['<em>MyConcept1</em>']
+            }
+        )
+
+        response = self.client.get(
+            self.source.uri + 'v1/concepts/?q=MyConcept&sortAsc=last_update',
+            HTTP_AUTHORIZATION='Token ' + self.random_user.get_token(),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+
+        response = self.client.get(
+            self.source.concepts_url + '?q=MyConcept&searchStatsOnly=true',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data,
+            [
+                {
+                    'name': 'high',
+                    'threshold': ANY,
+                    'confidence': ANY,
+                    'total': ANY
+                },
+                {
+                    'name': 'medium',
+                    'threshold': ANY,
+                    'confidence': ANY,
+                    'total': 0
+                },
+                {
+                    'name': 'low',
+                    'threshold': 0.01,
+                    'confidence': '<50.0%',
+                    'total': 0
+                }
+            ]
+        )
+        self.assertTrue(response.data[0]['total'] >= 2)
+
+        response = self.client.get(
+            self.source.concepts_url + '?q=MyConcept',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+
+    def test_search_with_latest_released_repo_search(self):  # pylint: disable=too-many-statements
+        ConceptDocument().update(self.source.concepts_set.all())
+
+        response = self.client.get(
+            f'/concepts/?q=MyConcept&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+        self.assertEqual(response.data[0]['uuid'], str(self.concept2.get_latest_version().id))
+        self.assertEqual(response.data[0]['versioned_object_id'], self.concept2.id)
+
+        response = self.client.get(
+            f'/concepts/?q=MyConcept1&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        response = self.client.get(
+            f'/concepts/?q=MyConcept&conceptClass=classA&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        response = self.client.get(
+            f'/concepts/?q=MyConcept2&conceptClass=classB&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+        self.assertEqual(response.data[0]['uuid'], str(self.concept2.get_latest_version().id))
+        self.assertEqual(response.data[0]['versioned_object_id'], self.concept2.id)
+
+        response = self.client.get(
+            f'/concepts/?conceptClass=classA&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        response = self.client.get(
+            f'/concepts/?extras.foo=bar&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        response = self.client.get(
+            f'/concepts/?extras.exists=bar&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+
+        response = self.client.get(
+            self.source.concepts_url + '?q=MyConcept&extras.exact.bar=foo&includeSearchMeta=true',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+        self.assertEqual(
+            response.data[0]['search_meta']['search_highlight'],
+            {'extras.bar': ['<em>foo</em>'], 'id': ['<em>MyConcept2</em>']}
+        )
+
+        response = self.client.get(
+            self.source.uri + 'v1/concepts/?q=MyConcept&sortAsc=last_update',
+            HTTP_AUTHORIZATION='Token ' + self.random_user.get_token(),
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], 'MyConcept2')
+
+        response = self.client.get(
+            self.source.concepts_url + '?q=MyConcept&searchStatsOnly=true',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data,
+            [
+                {'name': 'high', 'threshold': ANY, 'confidence': ANY, 'total': ANY},
+                {'name': 'medium', 'threshold': ANY, 'confidence': ANY, 'total': 0},
+                {'name': 'low', 'threshold': 0.01, 'confidence': '<50.0%', 'total': 0}
+            ]
+        )
+        self.assertTrue(response.data[0]['total'] >= 1)
+
+        response = self.client.get(
+            self.source.concepts_url + '?q=MyConcept',  # assumes HEAD
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted([data['id'] for data in response.data]),
+            sorted(['MyConcept1', 'MyConcept2'])
+        )
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/concepts/?q=MyConcept',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted([data['id'] for data in response.data]),
+            sorted(['MyConcept1', 'MyConcept2'])
+        )
+
+        response = self.client.get(
+            self.source.uri + 'v1/concepts/?q=MyConcept',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+
+    def test_facets(self):
+        ConceptDocument().update(self.source.concepts_set.all())
+
+        response = self.client.get(
+            self.source.concepts_url + '?facetsOnly=true'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.data.keys()), ['facets'])
+        class_a_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classA'][0]
+        self.assertEqual(class_a_facet[0], 'classA')
+        self.assertTrue(class_a_facet[1] >= 1)
+        self.assertFalse(class_a_facet[2])
+
+        class_b_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classB'][0]
+        self.assertEqual(class_b_facet[0], 'classB')
+        self.assertTrue(class_b_facet[1] >= 1)
+        self.assertFalse(class_b_facet[2])
+
+    def test_facets_with_latest_released_repo_search(self):
+        ConceptDocument().update(self.source.concepts_set.all())
+
+        response = self.client.get(
+            f'/concepts/?facetsOnly=true&owner={self.source.parent.mnemonic}&ownerType=Organization',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.data.keys()), ['facets'])
+
+        class_b_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classB'][0]
+        self.assertEqual(class_b_facet[0], 'classB')
+        self.assertTrue(class_b_facet[1] >= 1)
+        self.assertFalse(class_b_facet[2])
+        self.assertEqual([x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classA'], [])
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/concepts/?facetsOnly=true',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.data.keys()), ['facets'])
+
+        class_a_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classA'][0]
+        self.assertEqual(class_a_facet[0], 'classA')
+        self.assertTrue(class_a_facet[1] >= 1)
+        self.assertFalse(class_a_facet[2])
+
+        class_b_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classB'][0]
+        self.assertEqual(class_b_facet[0], 'classB')
+        self.assertTrue(class_b_facet[1] >= 1)
+        self.assertFalse(class_b_facet[2])
+
+        response = self.client.get(
+            self.source.concepts_url + '?facetsOnly=true',  # assumes HEAD
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.data.keys()), ['facets'])
+
+        class_b_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classB'][0]
+        class_a_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classA'][0]
+        self.assertEqual(class_b_facet[0], 'classB')
+        self.assertTrue(class_b_facet[1] >= 1)
+        self.assertFalse(class_b_facet[2])
+        self.assertEqual(class_a_facet[0], 'classA')
+        self.assertTrue(class_a_facet[1] >= 1)
+        self.assertFalse(class_a_facet[2])
+
+        response = self.client.get(
+            self.source.uri + 'v1/concepts/?facetsOnly=true',
+            HTTP_INCLUDESEARCHLATEST=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(response.data.keys()), ['facets'])
+
+        class_b_facet = [x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classB'][0]
+        self.assertEqual(class_b_facet[0], 'classB')
+        self.assertTrue(class_b_facet[1] >= 1)
+        self.assertFalse(class_b_facet[2])
+        self.assertEqual([x for x in response.data['facets']['fields']['conceptClass'] if x[0] == 'classA'], [])
+
+
+@override_settings(CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}})
+class ConceptListCacheTest(OCLAPITestCase):
+    """
+    Only a default (unsearched/unfiltered) listing of a non-HEAD repo version is cached -- a version is
+    frozen in time so anything is safe to cache, but caching is kept narrow on purpose (fast landing page,
+    bounded redis footprint). See ListWithHeadersMixin.__can_cache and
+    BaseAPIView.is_repo_version_children_request_without_any_search.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.patch_concept_es_mapping_for_ci()
+        self.source = OrganizationSourceFactory(mnemonic='MySource')
+        self.org = self.source.parent.mnemonic
+        self.source_v1 = OrganizationSourceFactory(
+            version='v1', mnemonic='MySource', organization=self.source.parent, released=True
+        )
+        self.concept = ConceptFactory(mnemonic='MyConcept1', parent=self.source)
+        self.source.concepts.add(self.concept.get_latest_version())
+        self.source_v1.concepts.add(self.concept.get_latest_version())
+        ConceptDocument().update(self.source.concepts_set.all())
+        cache.clear()
+
+    def test_head_version_concepts_are_not_cached(self):
+        body_key, headers_key = self.source.get_concepts_cache_keys()
+
+        response = self.client.get(f'/orgs/{self.org}/sources/MySource/HEAD/concepts/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertIsNone(cache.get(body_key))
+        self.assertIsNone(cache.get(headers_key))
+
+    def test_implicit_head_concepts_are_not_cached(self):
+        body_key, headers_key = self.source.get_concepts_cache_keys()
+
+        response = self.client.get(f'/orgs/{self.org}/sources/MySource/concepts/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertIsNone(cache.get(body_key))
+        self.assertIsNone(cache.get(headers_key))
+
+    def test_repo_version_concepts_are_cached(self):
+        body_key, headers_key = self.source_v1.get_concepts_cache_keys()
+        self.assertIsNone(cache.get(body_key))
+
+        response = self.client.get(f'/orgs/{self.org}/sources/MySource/v1/concepts/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(len(cache.get(body_key)), 1)
+        self.assertEqual(cache.get(body_key)[0]['id'], 'MyConcept1')
+        self.assertIsNotNone(cache.get(headers_key))
+
+    def test_repo_version_concepts_are_served_from_cache(self):
+        url = f'/orgs/{self.org}/sources/MySource/v1/concepts/'
+        body_key, _ = self.source_v1.get_concepts_cache_keys()
+
+        self.assertEqual(self.client.get(url).status_code, 200)
+
+        cache.set(body_key, [{'id': 'FromCache'}])
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [{'id': 'FromCache'}])
+
+    def test_repo_version_concepts_facets_are_cached(self):
+        body_key, _ = self.source_v1.get_concepts_cache_keys()
+        facets_key = body_key + '?facetsOnly=true'
+
+        response = self.client.get(f'/orgs/{self.org}/sources/MySource/v1/concepts/?facetsOnly=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('facets', response.data)
+        self.assertEqual(cache.get(facets_key), response.data)
+        self.assertIsNone(cache.get(body_key))  # facets do not collide with the plain listing
+
+    def test_repo_version_concepts_facets_are_served_from_cache(self):
+        url = f'/orgs/{self.org}/sources/MySource/v1/concepts/?facetsOnly=true'
+        body_key, _ = self.source_v1.get_concepts_cache_keys()
+
+        self.assertEqual(self.client.get(url).status_code, 200)
+
+        cache.set(body_key + '?facetsOnly=true', {'facets': {'fields': {'fromCache': []}}})
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'facets': {'fields': {'fromCache': []}}})
+
+    def test_head_version_concepts_facets_are_not_cached(self):
+        body_key, _ = self.source.get_concepts_cache_keys()
+
+        response = self.client.get(f'/orgs/{self.org}/sources/MySource/concepts/?facetsOnly=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('facets', response.data)
+        self.assertIsNone(cache.get(body_key + '?facetsOnly=true'))
+
+    def test_repo_version_concepts_with_search_are_not_cached(self):
+        body_key, headers_key = self.source_v1.get_concepts_cache_keys()
+
+        response = self.client.get(f'/orgs/{self.org}/sources/MySource/v1/concepts/?q=123')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+        self.assertIsNone(cache.get(body_key))
+        self.assertIsNone(cache.get(headers_key))
+        self.assertIsNone(cache.get(body_key + '?q=123'))
+
+
+class ConceptPropertyFilterViewTest(OCLAPITestCase):
+    """
+    Property filtering must follow the type declared on the source. A property declared boolean
+    reaches Elasticsearch as `boolean` when extras hold `false` and as `long` when they hold `0`,
+    and neither has a `.keyword` sub-field -- see OpenConceptLab/ocl_issues#2692.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.patch_concept_es_mapping_for_ci()
+        self.source = OrganizationSourceFactory(mnemonic='PropSource')
+        self.source.properties = [
+            {'code': 'pt_bool', 'type': 'boolean'},
+            {'code': 'pt_intbool', 'type': 'boolean'},
+            {'code': 'pt_boolstr', 'type': 'boolean'},
+            {'code': 'pt_str', 'type': 'string'},
+            {'code': 'PtMixedCase', 'type': 'string'},
+        ]
+        self.source.filters = [
+            {'code': 'pt_bool', 'operator': '='},
+            {'code': 'pt_intbool', 'operator': '='},
+            {'code': 'pt_boolstr', 'operator': '='},
+            {'code': 'pt_str', 'operator': '='},
+            {'code': 'PtMixedCase', 'operator': '='},
+        ]
+        self.source.save()
+
+        self.false_concept = ConceptFactory(mnemonic='BoolFalse', parent=self.source, extras={'pt_bool': False})
+        self.true_concept = ConceptFactory(mnemonic='BoolTrue', parent=self.source, extras={'pt_bool': True})
+        self.zero_concept = ConceptFactory(mnemonic='IntZero', parent=self.source, extras={'pt_intbool': 0})
+        self.one_concept = ConceptFactory(mnemonic='IntOne', parent=self.source, extras={'pt_intbool': 1})
+        self.boolstr_false_concept = ConceptFactory(
+            mnemonic='BoolStrFalse', parent=self.source, extras={'pt_boolstr': 'false'})
+        self.boolstr_true_concept = ConceptFactory(
+            mnemonic='BoolStrTrue', parent=self.source, extras={'pt_boolstr': 'true'})
+        self.str_concept = ConceptFactory(mnemonic='StrFalse', parent=self.source, extras={'pt_str': 'false'})
+        self.str_prefix_concept = ConceptFactory(
+            mnemonic='StrPrefix', parent=self.source, extras={'pt_str': 'abcdef'})
+        self.mixed_case_a_concept = ConceptFactory(
+            mnemonic='MixedA', parent=self.source, extras={'PtMixedCase': 'alpha'})
+        self.mixed_case_b_concept = ConceptFactory(
+            mnemonic='MixedB', parent=self.source, extras={'PtMixedCase': 'beta'})
+        self.bare_concept = ConceptFactory(mnemonic='NoProperty', parent=self.source, extras={})
+        for concept in (
+                self.false_concept, self.true_concept, self.zero_concept,
+                self.one_concept, self.boolstr_false_concept, self.boolstr_true_concept,
+                self.str_concept, self.str_prefix_concept,
+                self.mixed_case_a_concept, self.mixed_case_b_concept, self.bare_concept
+        ):
+            self.source.concepts.add(concept.get_latest_version())
+        ConceptDocument().update(self.source.concepts_set.all())
+
+    def get_ids(self, query):
+        response = self.client.get(self.source.concepts_url + query)
+        self.assertEqual(response.status_code, 200)
+        return sorted(data['id'] for data in response.data)
+
+    def get_ordered_ids(self, query):
+        response = self.client.get(self.source.concepts_url + query)
+        self.assertEqual(response.status_code, 200)
+        return [data['id'] for data in response.data]
+
+    def test_boolean_property_value_match(self):
+        self.assertEqual(self.get_ids('?properties__pt_bool=false'), ['BoolFalse'])
+        self.assertEqual(self.get_ids('?properties__pt_bool=0'), ['BoolFalse'])
+        self.assertEqual(self.get_ids('?properties__pt_bool=true'), ['BoolTrue'])
+        self.assertEqual(self.get_ids('?properties__pt_bool=1'), ['BoolTrue'])
+
+    def test_boolean_property_negation_includes_concepts_without_the_attribute(self):
+        self.assertEqual(
+            self.get_ids('?properties__pt_bool=!false'),
+            ['BoolStrFalse', 'BoolStrTrue', 'BoolTrue', 'IntOne', 'IntZero', 'MixedA', 'MixedB',
+             'NoProperty', 'StrFalse', 'StrPrefix']
+        )
+
+    def test_boolean_property_empty_value_returns_concepts_without_the_attribute(self):
+        self.assertEqual(
+            self.get_ids('?properties__pt_bool='),
+            ['BoolStrFalse', 'BoolStrTrue', 'IntOne', 'IntZero', 'MixedA', 'MixedB', 'NoProperty',
+             'StrFalse', 'StrPrefix']
+        )
+
+    def test_boolean_property_unparseable_value_does_not_error(self):
+        self.assertEqual(self.get_ids('?properties__pt_bool=abc'), [])
+
+    def test_boolean_property_facet_buckets(self):
+        response = self.client.get(self.source.concepts_url + '?facetsOnly=true')
+
+        self.assertEqual(response.status_code, 200)
+        buckets = sorted(response.data['facets']['fields']['properties__pt_bool'], key=lambda bucket: bucket[0])
+        self.assertEqual([bucket[0] for bucket in buckets], ['false', 'true'])
+        self.assertTrue(all(bucket[1] >= 1 for bucket in buckets))
+
+    def test_integer_valued_boolean_property_value_match(self):
+        self.assertEqual(self.get_ids('?properties__pt_intbool=false'), ['IntZero'])
+        self.assertEqual(self.get_ids('?properties__pt_intbool=0'), ['IntZero'])
+        self.assertEqual(self.get_ids('?properties__pt_intbool=true'), ['IntOne'])
+        self.assertEqual(self.get_ids('?properties__pt_intbool=1'), ['IntOne'])
+
+    def test_integer_valued_boolean_property_negation(self):
+        self.assertEqual(
+            self.get_ids('?properties__pt_intbool=!false'),
+            ['BoolFalse', 'BoolStrFalse', 'BoolStrTrue', 'BoolTrue', 'IntOne', 'MixedA', 'MixedB',
+             'NoProperty', 'StrFalse', 'StrPrefix']
+        )
+
+    def test_integer_valued_boolean_property_does_not_error(self):
+        """The declared type says boolean but the field is mapped long -- must degrade, not 400."""
+        response = self.client.get(self.source.concepts_url + '?properties__pt_intbool=abc')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
+    def test_integer_valued_boolean_property_facet_buckets(self):
+        response = self.client.get(self.source.concepts_url + '?facetsOnly=true')
+
+        self.assertEqual(response.status_code, 200)
+        buckets = sorted(response.data['facets']['fields']['properties__pt_intbool'], key=lambda bucket: bucket[0])
+        self.assertEqual([bucket[0] for bucket in buckets], ['false', 'true'])
+        self.assertTrue(all(bucket[1] >= 1 for bucket in buckets))
+
+    def test_string_property_is_unchanged(self):
+        self.assertEqual(self.get_ids('?properties__pt_str=false'), ['StrFalse'])
+        self.assertEqual(
+            self.get_ids('?properties__pt_str=!false'),
+            ['BoolFalse', 'BoolStrFalse', 'BoolStrTrue', 'BoolTrue', 'IntOne', 'IntZero', 'MixedA',
+             'MixedB', 'NoProperty', 'StrPrefix']
+        )
+
+        response = self.client.get(self.source.concepts_url + '?facetsOnly=true')
+
+        self.assertEqual(response.status_code, 200)
+        buckets = sorted(response.data['facets']['fields']['properties__pt_str'], key=lambda bucket: bucket[0])
+        self.assertEqual([bucket[0] for bucket in buckets], ['abcdef', 'false'])
+        self.assertTrue(all(bucket[1] >= 1 for bucket in buckets))
+
+    def test_string_valued_boolean_property_value_match(self):
+        """
+        A boolean-declared property whose concepts store the literal string 'true'/'false'
+        (rather than a JSON boolean or 0/1) is mapped by Elasticsearch as `text`. See
+        OpenConceptLab/ocl_issues#2699.
+        """
+        self.assertEqual(self.get_ids('?properties__pt_boolstr=false'), ['BoolStrFalse'])
+        self.assertEqual(self.get_ids('?properties__pt_boolstr=0'), ['BoolStrFalse'])
+        self.assertEqual(self.get_ids('?properties__pt_boolstr=true'), ['BoolStrTrue'])
+        self.assertEqual(self.get_ids('?properties__pt_boolstr=1'), ['BoolStrTrue'])
+
+    def test_string_valued_boolean_property_negation(self):
+        self.assertEqual(
+            self.get_ids('?properties__pt_boolstr=!false'),
+            ['BoolFalse', 'BoolStrTrue', 'BoolTrue', 'IntOne', 'IntZero', 'MixedA', 'MixedB',
+             'NoProperty', 'StrFalse', 'StrPrefix']
+        )
+
+    def test_string_valued_boolean_property_facet_buckets(self):
+        """
+        Regression test for OpenConceptLab/ocl_issues#2699: aggregating a boolean-declared
+        property mapped as `text` used to raise a 400 ('Fielddata is disabled on text fields')
+        because the facet aggregated the bare field instead of its `.keyword` sub-field.
+        """
+        response = self.client.get(self.source.concepts_url + '?facetsOnly=true')
+
+        self.assertEqual(response.status_code, 200)
+        buckets = sorted(response.data['facets']['fields']['properties__pt_boolstr'], key=lambda bucket: bucket[0])
+        self.assertEqual([bucket[0] for bucket in buckets], ['false', 'true'])
+        self.assertTrue(all(bucket[1] >= 1 for bucket in buckets))
+
+    def test_property_prefix_filter_matches_same_field_as_exact_filter(self):
+        """
+        Regression test for OpenConceptLab/ocl_issues#2693: the prefix branch of the property
+        filter queried `properties.<code>` (elasticsearch-dsl expands `properties__<code>` to
+        that dotted path), while the exact-match branch queries `properties.<code>.keyword`.
+        A prefix filter on a property therefore hit the wrong field.
+        """
+        self.assertEqual(self.get_ids('?properties__pt_str=fals*'), ['StrFalse'])
+
+    def test_property_prefix_filter_ticket_example(self):
+        """
+        The literal scenario from ocl_issues#2693's acceptance criteria: a string property
+        valued 'abcdef', queried as `?properties__<code>=abc*`. A trailing '*' is now treated as
+        a glob-style "starts with" match (converted to a `.*` regex suffix internally, with the
+        rest of the value escaped) rather than passed straight through as a raw Elasticsearch
+        regexp -- otherwise `abc*` would mean "a, b, then zero-or-more c's" under regexp's
+        full-string-anchored semantics, and would never match 'abcdef'.
+        """
+        self.assertEqual(self.get_ids('?properties__pt_str=abc*'), ['StrPrefix'])
+
+    def test_property_prefix_filter_on_non_string_property_does_not_error(self):
+        """
+        Before the fix, a prefix filter on a non-string property raised a 400 ('regexp' query
+        against a boolean/long field) because it targeted the raw field instead of `.keyword`.
+        """
+        response = self.client.get(self.source.concepts_url + '?properties__pt_bool=true*')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
+    def test_non_property_prefix_filter_uses_glob_semantics_too(self):
+        """
+        The trailing-'*' to '.*' conversion applies to every faceted field, not just properties:
+        `id` goes through the exact same regexp code path (via `additional_fields=['id', ...]`
+        in get_faceted_criterion) once Elasticsearch search is engaged, and was equally unable to
+        do a genuine "starts with" match before this fix (a raw regexp value of 'strpre*' does
+        not match 'strprefix' under Elasticsearch's full-string-anchored regexp semantics).
+
+        Two caveats, both out of scope for this fix and unrelated to the '*'-vs-'.*' bug:
+        - `retired=false` is added here only to force the ES search path -- a bare `?id=` filter
+          on a HEAD source's concept list doesn't reach get_faceted_criterion at all.
+        - `id` is an analyzed field indexed lowercase, and `regexp` queries are not run through
+          the field's analyzer, so the filter value must already be lowercase to match (hence
+          'strpre*', not 'StrPre*'). Properties don't have this problem since they filter against
+          the raw `.keyword` sub-field.
+        """
+        self.assertEqual(self.get_ids('?id=strpre*&retired=false'), ['StrPrefix'])
+
+    def test_sort_by_property_uses_keyword_field(self):
+        """
+        Regression test for OpenConceptLab/ocl_issues#2695: sorting by `properties.<code>` used
+        to return a 400 ('Fielddata is disabled on [properties.<code>]') because is_valid_sort
+        accepted any `properties.`-prefixed field and passed it straight to Elasticsearch,
+        without appending `.keyword` -- the only sortable variant, since a `properties.*` leaf
+        with no numeric/boolean value is mapped as `text`.
+        """
+        response = self.client.get(self.source.concepts_url + '?sort=properties.pt_str')
+        self.assertEqual(response.status_code, 200)
+
+        ordered = self.get_ordered_ids('?sort=properties.pt_str&limit=100')
+        relevant = [_id for _id in ordered if _id in ('StrFalse', 'StrPrefix')]
+        self.assertEqual(relevant, ['StrPrefix', 'StrFalse'])  # 'abcdef' < 'false'
+
+    def test_sort_by_property_explicit_keyword_is_unchanged(self):
+        response = self.client.get(self.source.concepts_url + '?sort=properties.pt_str.keyword')
+        self.assertEqual(response.status_code, 200)
+
+        ordered = self.get_ordered_ids('?sort=properties.pt_str.keyword&limit=100')
+        relevant = [_id for _id in ordered if _id in ('StrFalse', 'StrPrefix')]
+        self.assertEqual(relevant, ['StrPrefix', 'StrFalse'])
+
+    def test_sort_by_property_preserves_original_case(self):
+        """
+        The sort string used to be lowercased in full before use, so a mixed-case property code
+        like 'PtMixedCase' would be turned into 'properties.ptmixedcase' -- a field name that
+        doesn't exist, since Elasticsearch field names are case-sensitive and the actual indexed
+        field is 'properties.PtMixedCase'.
+        """
+        response = self.client.get(self.source.concepts_url + '?sort=properties.PtMixedCase')
+        self.assertEqual(response.status_code, 200)
+
+        ordered = self.get_ordered_ids('?sort=properties.PtMixedCase&limit=100')
+        relevant = [_id for _id in ordered if _id in ('MixedA', 'MixedB')]
+        self.assertEqual(relevant, ['MixedA', 'MixedB'])  # 'alpha' < 'beta'
+
+        ordered_desc = self.get_ordered_ids('?sort=-properties.PtMixedCase&limit=100')
+        relevant_desc = [_id for _id in ordered_desc if _id in ('MixedA', 'MixedB')]
+        self.assertEqual(relevant_desc, ['MixedB', 'MixedA'])
+
+    def test_sort_by_non_property_field_is_unchanged(self):
+        ordered = self.get_ordered_ids('?sort=id&limit=100')
+        relevant = [_id for _id in ordered if _id in ('BoolFalse', 'BoolTrue')]
+        self.assertEqual(relevant, ['BoolFalse', 'BoolTrue'])
+
+
+class ConceptNameRetrieveUpdateDestroyViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.name = ConceptNameFactory.build(locale='fr', name='froobar')
+        self.concept = ConceptFactory(names=[self.name])
+        self.name = self.concept.names.first()
+        self.token = self.concept.created_by.get_token()
+        self.url = f'{self.concept.url}names/{self.name.id}/'
+
+    def test_get_404(self):
+        response = self.client.get(
+            '/orgs/foo/sources/source/concepts/1234/names/1234/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 404)
+        response = self.client.get(
+            self.concept.url + 'names/1234/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_get_200(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        response = self.client.get(
+            self.url,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.name.id))
+        self.assertEqual(response.data['type'], 'ConceptName')
+        self.assertEqual(response.data['name'], 'froobar')
+        self.assertEqual(response.data['locale'], 'fr')
+
+    def test_put_200(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        response = self.client.put(
+            self.url,
+            {'name': 'brar'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().names.first().name, 'brar')
+        self.assertEqual(self.concept.get_latest_version().names.first().retired, False)
+        self.assertEqual(self.concept.get_latest_version().prev_version.names.first().name, 'froobar')
+        self.assertEqual(self.concept.get_latest_version().prev_version.names.first().retired, False)
+        self.assertEqual(self.concept.names.first().name, 'brar')
+        self.assertEqual(self.concept.names.first().retired, False)
+
+    def test_put_200_name_type(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        response = self.client.put(
+            self.url,
+            {'name_type': 'Fully Specified', 'name': 'brar'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['name'], 'brar')
+        self.assertEqual(response.data['name_type'], 'Fully Specified')
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().names.first().type, 'Fully Specified')
+        self.assertEqual(self.concept.names.first().type, 'Fully Specified')
+
+    def test_patch_200_name_type(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        response = self.client.patch(
+            self.url,
+            {'name_type': 'Short'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['name'], 'froobar')
+        self.assertEqual(response.data['name_type'], 'Short')
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().names.first().type, 'Short')
+        self.assertEqual(self.concept.names.first().type, 'Short')
+
+    def test_put_200_retired(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+        self.assertEqual(self.concept.names.count(), 1)
+        self.assertEqual(self.concept.active_names.count(), 1)
+
+        response = self.client.put(
+            self.url,
+            {'retired': True},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'names': ['A concept must have at least one name']})
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        name2 = ConceptNameFactory(locale='fr', name='retraité', concept=self.concept)
+        ConceptNameFactory(locale='fr', name='retraité', concept=self.concept.get_latest_version())
+        self.assertEqual(self.concept.names.count(), 2)
+        self.assertEqual(self.concept.active_names.count(), 2)
+
+        response = self.client.put(
+            self.concept.uri + f'names/{name2.id}/',
+            {'retired': True},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().active_names.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retired, False)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retire_reason, None)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().name, 'retraité')
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retired, True)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retire_reason, None)
+        self.assertEqual(self.concept.get_latest_version().prev_version.active_names.count(), 2)
+        self.assertEqual(self.concept.active_names.count(), 1)
+        self.assertEqual(self.concept.active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.retired_names.first().name, 'retraité')
+
+    def test_put_200_retired_with_reason(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+        self.assertEqual(self.concept.names.count(), 1)
+        self.assertEqual(self.concept.active_names.count(), 1)
+
+        response = self.client.put(
+            self.url,
+            {'retired': True, 'retire_reason': 'Not needed!'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'names': ['A concept must have at least one name']})
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        name2 = ConceptNameFactory(locale='fr', name='retraité', concept=self.concept)
+        ConceptNameFactory(locale='fr', name='retraité', concept=self.concept.get_latest_version())
+        self.assertEqual(self.concept.names.count(), 2)
+        self.assertEqual(self.concept.active_names.count(), 2)
+
+        response = self.client.put(
+            self.concept.uri + f'names/{name2.id}/',
+            {'retired': True, 'retire_reason': 'Not needed!'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().active_names.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retired, False)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retire_reason, None)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().name, 'retraité')
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retired, True)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retire_reason, 'Not needed!')
+        self.assertEqual(self.concept.get_latest_version().prev_version.active_names.count(), 2)
+        self.assertEqual(self.concept.active_names.count(), 1)
+        self.assertEqual(self.concept.active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.retired_names.first().name, 'retraité')
+
+    def test_put_retire_update_and_unretire_preserves_name_retire_reason(self):  # pylint: disable=too-many-statements
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        name2 = ConceptNameFactory(locale='fr', name='retraité', concept=self.concept)
+        ConceptNameFactory(locale='fr', name='retraité', concept=self.concept.get_latest_version())
+        retire_reason = 'Not needed!'
+
+        response = self.client.put(
+            self.concept.uri + f'names/{name2.id}/',
+            {'retired': True, 'retire_reason': retire_reason},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        latest_version = self.concept.get_latest_version()
+        retired_name = latest_version.retired_names.get(locale='fr')
+        prev_version = latest_version.prev_version
+        prev_active_name = prev_version.active_names.get(locale='fr', name='retraité')
+
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertTrue(retired_name.retired)
+        self.assertEqual(retired_name.retire_reason, retire_reason)
+        self.assertTrue(self.concept.retired_names.get(locale='fr').retired)
+        self.assertEqual(self.concept.retired_names.get(locale='fr').retire_reason, retire_reason)
+        self.assertFalse(prev_active_name.retired)
+        self.assertIsNone(prev_active_name.retire_reason)
+
+        response = self.client.patch(
+            self.concept.uri + f'names/{self.concept.retired_names.get(locale="fr").id}/',
+            {'name_type': 'Short'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        latest_version = self.concept.get_latest_version()
+        updated_retired_name = latest_version.retired_names.get(locale='fr')
+        retired_prev_version = latest_version.prev_version
+        retired_prev_name = retired_prev_version.retired_names.get(locale='fr')
+        original_prev_name = retired_prev_version.prev_version.active_names.get(locale='fr', name='retraité')
+
+        self.assertEqual(self.concept.versions.count(), 3)
+        self.assertTrue(updated_retired_name.retired)
+        self.assertEqual(updated_retired_name.retire_reason, retire_reason)
+        self.assertEqual(updated_retired_name.type, 'Short')
+        self.assertTrue(self.concept.retired_names.get(locale='fr').retired)
+        self.assertEqual(self.concept.retired_names.get(locale='fr').retire_reason, retire_reason)
+        self.assertEqual(self.concept.retired_names.get(locale='fr').type, 'Short')
+        self.assertTrue(retired_prev_name.retired)
+        self.assertEqual(retired_prev_name.retire_reason, retire_reason)
+        self.assertIsNone(original_prev_name.retire_reason)
+        self.assertFalse(original_prev_name.retired)
+
+        response = self.client.patch(
+            self.concept.uri + f'names/{self.concept.retired_names.get(locale="fr").id}/',
+            {'retired': False},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        latest_version = self.concept.get_latest_version()
+        unretired_name = latest_version.active_names.get(locale='fr', name='retraité')
+        unretired_prev_version = latest_version.prev_version
+        unretired_prev_name = unretired_prev_version.retired_names.get(locale='fr')
+        original_prev_name = unretired_prev_version.prev_version.retired_names.get(locale='fr')
+
+        self.assertEqual(self.concept.versions.count(), 4)
+        self.assertFalse(unretired_name.retired)
+        self.assertEqual(unretired_name.retire_reason, 'Not needed!')
+        self.assertEqual(unretired_name.type, 'Short')
+        self.assertFalse(self.concept.active_names.get(locale='fr', name='retraité').retired)
+        self.assertEqual(self.concept.active_names.get(locale='fr', name='retraité').retire_reason, 'Not needed!')
+        self.assertEqual(self.concept.active_names.get(locale='fr', name='retraité').type, 'Short')
+        self.assertTrue(unretired_prev_name.retired)
+        self.assertEqual(unretired_prev_name.retire_reason, retire_reason)
+        self.assertTrue(original_prev_name.retired)
+        self.assertEqual(original_prev_name.retire_reason, retire_reason)
+
+    def test_delete_204(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        response = self.client.delete(
+            self.url,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'names': ['A concept must have at least one name']})
+
+        name2 = ConceptNameFactory(locale='fr', name='retraité', concept=self.concept)
+        ConceptNameFactory(locale='fr', name='retraité', concept=self.concept.get_latest_version())
+        self.assertEqual(self.concept.names.count(), 2)
+
+        response = self.client.delete(
+            self.concept.uri + f'names/{name2.id}/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+        self.assertEqual(response.status_code, 204)
+
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().active_names.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retired, False)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retire_reason, None)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().name, 'retraité')
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retired, True)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retire_reason, None)
+        self.assertEqual(self.concept.get_latest_version().prev_version.active_names.count(), 2)
+        self.assertEqual(self.concept.active_names.count(), 1)
+        self.assertEqual(self.concept.active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.retired_names.first().name, 'retraité')
+
+    def test_delete_204_with_retire_reason(self):
+        self.assertEqual(self.concept.versions.count(), 1)
+
+        response = self.client.delete(
+            self.url,
+            {'retire_reason': 'Not needed!'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'names': ['A concept must have at least one name']})
+
+        name2 = ConceptNameFactory(locale='fr', name='retraité', concept=self.concept)
+        ConceptNameFactory(locale='fr', name='retraité', concept=self.concept.get_latest_version())
+        self.assertEqual(self.concept.names.count(), 2)
+
+        response = self.client.delete(
+            self.concept.uri + f'names/{name2.id}/',
+            {'retire_reason': 'Not needed!'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+
+        )
+        self.assertEqual(response.status_code, 204)
+
+        self.assertEqual(self.concept.versions.count(), 2)
+        self.assertEqual(self.concept.get_latest_version().active_names.count(), 1)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retired, False)
+        self.assertEqual(self.concept.get_latest_version().active_names.first().retire_reason, None)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().name, 'retraité')
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retired, True)
+        self.assertEqual(self.concept.get_latest_version().retired_names.first().retire_reason, 'Not needed!')
+        self.assertEqual(self.concept.get_latest_version().prev_version.active_names.count(), 2)
+        self.assertEqual(self.concept.active_names.count(), 1)
+        self.assertEqual(self.concept.active_names.first().name, 'froobar')
+        self.assertEqual(self.concept.retired_names.first().name, 'retraité')
+
+
+class ConceptReactivateViewTest(OCLAPITestCase):
+    def test_put(self):
+        name = ConceptNameFactory.build()
+        concept = ConceptFactory(retired=True, names=[name])
+        self.assertTrue(concept.retired)
+        self.assertTrue(concept.get_latest_version().retired)
+        token = concept.created_by.get_token()
+
+        response = self.client.put(
+            concept.url + 'reactivate/',
+            HTTP_AUTHORIZATION='Token ' + token,
+        )
+
+        self.assertEqual(response.status_code, 204)
+        concept.refresh_from_db()
+        self.assertFalse(concept.retired)
+        self.assertFalse(concept.get_latest_version().retired)
+        self.assertTrue(concept.get_latest_version().prev_version.retired)
+
+        response = self.client.put(
+            concept.url + 'reactivate/',
+            HTTP_AUTHORIZATION='Token ' + token,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'__all__': 'Concept is already not retired'})
+
+
+class ConceptParentsViewTest(OCLAPITestCase):
+    def test_get_200(self):
+        parent_concept1 = ConceptFactory()
+        parent_concept2 = ConceptFactory()
+        child_concept = ConceptFactory()
+        child_concept.parent_concepts.set([parent_concept1, parent_concept2])
+
+        response = self.client.get(child_concept.url + 'parents/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data]),
+            [parent_concept1.uri, parent_concept2.uri]
+        )
+
+        response = self.client.get(parent_concept1.url + 'parents/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+
+class ConceptChildrenViewTest(OCLAPITestCase):
+    def test_get_200(self):
+        parent_concept = ConceptFactory()
+        child_concept1 = ConceptFactory()
+        child_concept2 = ConceptFactory()
+        child_concept1.parent_concepts.set([parent_concept])
+        child_concept2.parent_concepts.set([parent_concept])
+
+        response = self.client.get(parent_concept.url + 'children/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data]),
+            [child_concept1.uri, child_concept2.uri]
+        )
+
+        response = self.client.get(child_concept1.url + 'children/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+
+class ConceptCollectionMembershipViewTest(OCLAPITestCase):
+    def test_get_200(self):
+        parent = OrganizationSourceFactory()
+        concept1 = ConceptFactory(parent=parent)
+        concept2 = ConceptFactory()  # random owner/parent
+        collection1 = OrganizationCollectionFactory(organization=parent.organization)
+        expansion1 = ExpansionFactory(collection_version=collection1)
+        collection1.expansion_uri = expansion1.uri
+        collection1.save()
+        collection2 = OrganizationCollectionFactory(organization=parent.organization)
+        expansion2 = ExpansionFactory(collection_version=collection2)
+        collection2.expansion_uri = expansion2.uri
+        collection2.save()
+        collection3 = OrganizationCollectionFactory()  # random owner/parent
+        expansion3 = ExpansionFactory(collection_version=collection3)
+        collection3.expansion_uri = expansion3.uri
+        collection3.save()
+        expansion1.concepts.add(concept1)
+        expansion2.concepts.add(concept1)
+        expansion3.concepts.add(concept1)
+        expansion1.concepts.add(concept2)
+        expansion2.concepts.add(concept2)
+        expansion3.concepts.add(concept2)
+
+        response = self.client.get(concept1.url + 'collection-versions/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual(
+            sorted([data['url'] for data in response.data]),
+            sorted([collection2.url, collection1.url])
+        )
+
+        response = self.client.get(concept2.url + 'collection-versions/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+
+class ConceptSummaryViewTest(OCLAPITestCase):
+    def test_get_200(self):
+        parent_concept = ConceptFactory(
+            names=[ConceptNameFactory.build(), ConceptNameFactory.build()])
+        child_concept = ConceptFactory(
+            names=[ConceptNameFactory.build(), ConceptNameFactory.build()],
+            descriptions=[ConceptDescriptionFactory.build()]
+        )
+        child_concept.parent_concepts.add(parent_concept)
+
+        response = self.client.get(parent_concept.url + 'summary/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(parent_concept.id))
+        self.assertEqual(response.data['id'], parent_concept.mnemonic)
+        self.assertEqual(response.data['descriptions'], 0)
+        self.assertEqual(response.data['names'], 2)
+        self.assertEqual(response.data['versions'], 1)
+        self.assertEqual(response.data['children'], 1)
+        self.assertEqual(response.data['parents'], 0)
+
+        response = self.client.get(child_concept.url + 'summary/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(child_concept.id))
+        self.assertEqual(response.data['id'], child_concept.mnemonic)
+        self.assertEqual(response.data['descriptions'], 1)
+        self.assertEqual(response.data['names'], 2)
+        self.assertEqual(response.data['versions'], 1)
+        self.assertEqual(response.data['children'], 0)
+        self.assertEqual(response.data['parents'], 1)
+
+
+class ConceptCloneViewTest(OCLAPITestCase):
+    def setUp(self):
+        self.concept = ConceptFactory()
+        self.clone_to_source = OrganizationSourceFactory()
+        self.user = UserProfileFactory(organizations=[self.clone_to_source.organization])
+        self.token = self.user.get_token()
+
+    @patch('core.concepts.views.Bundle.clone')
+    def test_post_over_limit_403(self, bundle_clone_mock):
+        bundle_clone_mock.side_effect = CloneLimitExceeded(100, 101)
+        response = self.client.post(
+            self.concept.uri + '$clone/',
+            {'source_uri': self.clone_to_source.uri, 'parameters': {'mapTypes': 'Q-AND-A'}},
+            HTTP_AUTHORIZATION=f"Token {self.token}", format='json')
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['error_code'], 'clone_resources_per_call_limit_reached')
+        self.assertEqual(response.data['limit'], 100)
+
+    @patch('core.concepts.views.Bundle.clone')
+    def test_post_ignores_budget_sent_in_parameters(self, bundle_clone_mock):
+        bundle_clone_mock.return_value = Bundle(
+            root=self.concept, repo_version=self.concept.parent, params={}, verbose=False)
+        self.client.post(
+            self.concept.uri + '$clone/',
+            {'source_uri': self.clone_to_source.uri, 'parameters': {'resource_budget': 999999}},
+            HTTP_AUTHORIZATION=f"Token {self.token}", format='json')
+        self.assertEqual(bundle_clone_mock.call_args[1]['resource_budget'], 100)
+
+    def test_post_bad_requests(self):
+        response = self.client.post(
+            self.concept.uri + '$clone/',
+            {'foo': 'bar'},
+            HTTP_AUTHORIZATION=f"Token {self.token}",
+            format='json'
+        )
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.post(
+            self.concept.uri + '$clone/',
+            {'source_uri': 'foobar'},
+            HTTP_AUTHORIZATION=f"Token {self.token}",
+            format='json'
+        )
+        self.assertEqual(response.status_code, 404)
+
+        self.clone_to_source.public_access = 'None'
+        self.clone_to_source.save()
+
+        response = self.client.post(
+            self.concept.uri + '$clone/',
+            {'source_uri': self.clone_to_source.uri},
+            HTTP_AUTHORIZATION=f"Token {UserProfileFactory().get_token()}",
+            format='json'
+        )
+        self.assertEqual(response.status_code, 403)
+
+    @patch('core.concepts.views.Bundle.clone')
+    def test_post_success(self, bundle_clone_mock):
+        parameters = {'mapTypes': 'Q-AND-A,CONCEPT-SET'}
+        bundle_clone_mock.return_value = Bundle(
+            root=self.concept, repo_version=self.concept.parent, params=parameters, verbose=False
+        )
+
+        response = self.client.post(
+            self.concept.uri + '$clone/',
+            {'source_uri': self.clone_to_source.uri, 'parameters': parameters},
+            HTTP_AUTHORIZATION=f"Token {self.token}",
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data,
+            {
+                'resourceType': 'Bundle',
+                'type': 'searchset',
+                'meta': ANY,
+                'total': None,
+                'entry': [],
+                'requested_url': None,
+                'repo_version_url': self.concept.parent.uri + 'HEAD/'
+            }
+        )
+        bundle_clone_mock.assert_called_once_with(
+            self.concept, self.concept.parent, self.clone_to_source, self.user, ANY, False,
+            resource_budget=100, **parameters  # no group: the preview per-call budget (ocl_online#230)
+        )

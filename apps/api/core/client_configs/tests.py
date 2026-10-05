@@ -1,0 +1,315 @@
+from django.core.exceptions import ValidationError
+
+from core.client_configs.models import ClientConfig
+from core.common.tests import OCLTestCase, OCLAPITestCase
+from core.orgs.tests.factories import OrganizationFactory
+from core.users.tests.factories import UserProfileFactory
+
+
+class ClientConfigTest(OCLTestCase):
+    def tearDown(self):
+        ClientConfig.objects.all().delete()
+        super().tearDown()
+
+    def test_is_home(self):
+        self.assertTrue(ClientConfig().is_home)
+        self.assertTrue(ClientConfig(type='home').is_home)
+        self.assertFalse(ClientConfig(type='blah').is_home)
+
+    def test_home_config_validation(self):
+        client_config = ClientConfig(config={})
+
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(
+            ex.exception.message_dict,
+            {
+                'config': ['This field cannot be blank.'],
+                'resource_type': ['This field cannot be null.'],
+                'resource_id': ['This field cannot be null.'],
+                'tabs': ['At least one tab config is mandatory.']
+            }
+        )
+
+        org = OrganizationFactory()
+        client_config.resource = org
+        client_config.config = {'foo': 'bar'}
+
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(ex.exception.message_dict, {'tabs': ['At least one tab config is mandatory.']})
+
+        client_config.config = {'tabs': 'foobar'}
+
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(ex.exception.message_dict, {'tabs': ['Tabs config must be a list.']})
+
+        client_config.config = {'tabs': ['foobar']}
+
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(ex.exception.message_dict, {'tabs': ['Invalid Tabs config.']})
+
+        client_config.config = {'tabs': [{'foo': 'bar'}]}
+
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(ex.exception.message_dict, {'tabs': ['Exactly one of the Tabs must be default.']})
+
+        client_config.config = {'tabs': [{'foo': 'bar', 'default': True}, {'foo': 'bar', 'default': True}]}
+
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(ex.exception.message_dict, {'tabs': ['Exactly one of the Tabs must be default.']})
+
+        client_config.config = {'tabs': [{'foo': 'bar', 'default': True}, {'foo': 'bar', 'default': False}]}
+        client_config.full_clean()
+
+        client_config.config = {
+            'tabs': [{
+                         'foo': 'bar',
+                         'default': True,
+                         'sortAsc': 'foo',
+                         'sortDesc': 'bar',
+                         'type': 'concepts'
+                     }, {
+                         'foo': 'bar',
+                         'default': False
+                     }]
+        }
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(
+            ex.exception.message_dict, {
+                'tabs': ['Sort either by asc (sortAsc) or desc (sortDesc) order.']
+            }
+        )
+
+        client_config.config = {
+            'tabs': [{
+                         'foo': 'bar',
+                         'default': True,
+                         'sortAsc': 'foo',
+                         'type': 'concepts'
+                     },
+                {
+                    'foo': 'bar',
+                    'default': False
+                }]
+        }
+        with self.assertRaises(ValidationError) as ex:
+            client_config.full_clean()
+
+        self.assertEqual(ex.exception.message_dict, {
+            'tabs': ['Unsupported sort attribute.']
+        })
+
+        client_config.config = {
+            'tabs': [
+                {'foo': 'bar', 'default': True, 'sortAsc': 'id_lowercase', 'type': 'concepts'},
+                {'foo': 'bar', 'default': False}
+            ]
+        }
+        client_config.full_clean()
+
+    def test_format_home_config_tabs(self):
+        client_config = ClientConfig(config={'tabs': [{'fields': []}]})
+        client_config.format_home_config_tabs()
+
+        self.assertEqual(client_config.config, {'tabs': [{'fields': []}]})
+
+        client_config.config['tabs'] = [{'fields': {'source_type': 'Source Type', 'extras.foo': "foobar"}}]
+        client_config.format_home_config_tabs()
+
+        self.assertEqual(
+            client_config.config['tabs'][0]['fields'],
+            [{'source_type': 'Source Type'}, {'extras.foo': 'foobar'}]
+        )
+
+        client_config.config['tabs'] = [{'fields': [{'source_type': 'Source Type'}, {'extras.foo': 'foobar'}]}]
+        client_config.format_home_config_tabs()
+
+        self.assertEqual(
+            client_config.config['tabs'][0]['fields'],
+            [{'source_type': 'Source Type'}, {'extras.foo': 'foobar'}]
+        )
+
+    def test_uri(self):
+        self.assertEqual(ClientConfig(id=1).uri, '/client-configs/1/')
+        self.assertEqual(ClientConfig(id=400).uri, '/client-configs/400/')
+
+    def test_siblings(self):
+        org = OrganizationFactory()
+        config1 = ClientConfig(name='first', resource=org, config={'tabs': [{'foo': 'bar', 'default': True}]})
+        config1.save()
+
+        self.assertEqual(config1.siblings.count(), 0)
+
+        config2 = ClientConfig(name='second', resource=org, config={'tabs': [{'foo': 'bar', 'default': True}]})
+        config2.save()
+
+        self.assertEqual(config1.siblings.count(), 1)
+        self.assertEqual(config1.siblings.first().id, config2.id)
+
+        self.assertEqual(config2.siblings.count(), 1)
+        self.assertEqual(config2.siblings.first().id, config1.id)
+
+
+class ClientConfigsViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.org = OrganizationFactory()
+        self.user = self.org.created_by
+        self.token = self.user.get_token()
+        self.dummy_config = {'tabs': [{'default': True}]}
+
+    def tearDown(self):
+        ClientConfig.objects.all().delete()
+        super().tearDown()
+
+    def test_post(self):
+        response = self.client.post(
+            self.org.url + 'client-configs/',
+            {},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data,
+            {'config': ['This field cannot be null.'], 'tabs': ['At least one tab config is mandatory.']}
+        )
+
+        response = self.client.post(
+            self.org.url + 'client-configs/',
+            {
+                'name': 'custom',
+                'config': self.dummy_config,
+                'is_default': True
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 201)
+        config1 = ClientConfig.objects.last()
+        self.assertEqual(config1.resource, self.org)
+        self.assertEqual(config1.name, 'custom')
+        self.assertEqual(config1.type, 'home')
+        self.assertEqual(config1.config, self.dummy_config)
+        self.assertEqual(config1.created_by, self.user)
+        self.assertEqual(config1.updated_by, self.user)
+        self.assertTrue(config1.is_default)
+
+        response = self.client.post(
+            self.org.url + 'client-configs/',
+            {
+                'name': 'custom1',
+                'config': self.dummy_config,
+                'is_default': True
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 201)
+        config2 = ClientConfig.objects.last()
+        config1.refresh_from_db()
+        self.assertTrue(config2.is_default)
+        self.assertFalse(config1.is_default)
+
+    def test_get(self):
+        response = self.client.get(
+            self.org.url + 'client-configs/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        config = ClientConfig(config=self.dummy_config, name='foobar', resource=self.org)
+        config.save()
+
+        response = self.client.get(
+            self.org.url + 'client-configs/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], config.id)
+
+
+class ClientConfigViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.org = OrganizationFactory()
+        self.user = self.org.created_by
+        self.token = self.user.get_token()
+        self.dummy_config = {'tabs': [{'default': True}]}
+        self.config = ClientConfig(config=self.dummy_config, name='foobar', resource=self.org)
+        self.config.save()
+
+    def tearDown(self):
+        ClientConfig.objects.all().delete()
+        super().tearDown()
+
+    def test_put(self):
+        response = self.client.get(
+            '/client-configs/12356/',
+            {
+                'name': 'updated'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 404)
+
+        response = self.client.put(
+            self.config.uri,
+            {
+                'name': 'updated'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.config.refresh_from_db()
+        self.assertTrue(response.data['name'] == self.config.name == 'updated')
+
+    def test_delete(self):
+        random_user1 = UserProfileFactory()
+        random_user2 = UserProfileFactory()
+        response = self.client.delete(
+            self.config.uri,
+            HTTP_AUTHORIZATION='Token ' + random_user1.get_token(),
+            format='json'
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(ClientConfig.objects.count(), 1)
+
+        template = ClientConfig(
+            is_template=True, config=self.dummy_config, name='foobar', resource=self.org, created_by=random_user1
+        )
+        template.save()
+        response = self.client.delete(
+            template.uri,
+            HTTP_AUTHORIZATION='Token ' + random_user2.get_token(),
+            format='json'
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(ClientConfig.objects.count(), 2)
+
+        response = self.client.delete(
+            template.uri,
+            HTTP_AUTHORIZATION='Token ' + random_user1.get_token(),
+            format='json'
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(ClientConfig.objects.count(), 1)

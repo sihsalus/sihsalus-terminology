@@ -1,0 +1,349 @@
+import json
+from collections import Counter
+
+from django.conf import settings
+from django.contrib.postgres.fields import ArrayField
+from django.core.exceptions import ValidationError
+from django.db import models, IntegrityError
+from django.db.models import Sum
+from pydash import get
+
+from core.common.constants import PERSIST_NEW_ERROR_MESSAGE, ACCESS_TYPE_CHOICES, ACCESS_TYPE_NONE
+from core.common.models import BaseModel
+from core.common.utils import get_export_service, generate_temp_version
+
+
+def default_score_configuration():
+    return {'recommended': 100, 'available': 70}
+
+
+class MapProject(BaseModel):
+    OBJECT_TYPE = 'MapProject'
+    mnemonic_attr = 'id'
+    BATCH_SIZE = 50
+
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    # Private unless shared explicitly: only the owner, members of the owning org and staff can see a project.
+    public_access_for_retired_edit = ACCESS_TYPE_NONE
+    public_access = models.CharField(
+        max_length=16, choices=ACCESS_TYPE_CHOICES, default=ACCESS_TYPE_NONE, blank=True
+    )
+    organization = models.ForeignKey(
+        'orgs.Organization', on_delete=models.CASCADE, null=True, blank=True, related_name='map_projects')
+    user = models.ForeignKey(
+        'users.UserProfile', on_delete=models.CASCADE, null=True, blank=True, related_name='map_projects')
+    input_file_name = models.TextField()
+    matches = ArrayField(models.JSONField(), default=list, null=True, blank=True)
+    columns = ArrayField(models.JSONField(), default=list)
+    target_repo_url = models.TextField(null=True, blank=True)
+    algorithms = ArrayField(models.JSONField(), default=list, null=True, blank=True)
+    include_retired = models.BooleanField(default=False)
+    logs = models.JSONField(default=dict, null=True, blank=True)
+    score_configuration = models.JSONField(default=default_score_configuration, null=True, blank=True)
+    filters = models.JSONField(default=dict, null=True, blank=True)
+    candidates = models.JSONField(default=dict, null=True, blank=True)
+    lookup_config = models.JSONField(default=dict, null=True, blank=True)
+    analysis = models.JSONField(default=dict, null=True, blank=True)
+    encoder_model = models.TextField(null=True, blank=True, default=settings.ENCODER_MODEL_NAME)
+    prompt_template_key = models.TextField(null=True, blank=True)
+    prompt_output_locale = models.CharField(max_length=10, null=True, blank=True)
+    # Plural by design — the UI currently exposes single-select, but the
+    # field is shaped for the multi-select workflow planned in a few weeks.
+    # No further migration needed at that point.
+    input_locales = ArrayField(models.CharField(max_length=10), null=True, blank=True, default=list)
+    use_lexical_variants = models.BooleanField(default=False)
+
+    # Fields that define how a project matches —
+    # excluding identity, results, logs, and audit metadata.
+    # Used by the copy-project flow.
+    CONFIGURATION_FIELDS = [
+        'algorithms', 'encoder_model', 'filters', 'include_retired',
+        'lookup_config', 'score_configuration', 'target_repo_url', 'prompt_template_key',
+        'prompt_output_locale', 'input_locales', 'use_lexical_variants'
+    ]
+
+    class Meta:
+        db_table = 'map_projects'
+
+    @property
+    def mnemonic(self):
+        return self.id
+
+    @property
+    def parent(self):
+        return self.organization if self.organization_id else self.user
+
+    @property
+    def parent_id(self):
+        return self.organization_id or self.user_id
+
+    @property
+    def matches_summary(self):
+        if self.matches:
+            counter = Counter()
+            counter.update(match.get('state') for match in self.matches if 'state' in match)
+            return dict(counter)
+        return None
+
+    @property
+    def visible_columns(self):
+        if self.columns:
+            return [col for col in self.columns if 'hidden' not in col or col['hidden'] is False and col.get('label')]  # pylint: disable=not-an-iterable,line-too-long
+        return []
+
+    @property
+    def summary(self):
+        return {
+            'matches': self.matches_summary,
+            'columns': [col.get('label') for col in self.visible_columns],
+        }
+
+    @property
+    def rows_used(self):
+        """
+        `mapper.rows_per_project` is project-scoped, not user-scoped, and is already
+        fully derivable from AutomatchRun - no separate counter needed. Retries
+        (parent_run set) re-attempt already-declared rows, so only top-level runs
+        count toward the project's declared size.
+        """
+        return self.auto_match_runs.filter(parent_run__isnull=True).aggregate(total=Sum('intended_rows'))['total'] or 0
+
+    def calculate_uri(self):
+        return self.parent.uri + "map-projects/" + str((self.id or generate_temp_version())) + "/"
+
+    @property
+    def _upload_dir_path(self):
+        return f"map_projects/{self.id}/"
+
+    @property
+    def file_path(self):
+        return self._upload_dir_path + self.input_file_name
+
+    @property
+    def file_url(self):
+        if self.input_file_name:
+            service = get_export_service()
+            return service.url_for(self.file_path)
+        return None
+
+    def update_input_file(self, input_file):
+        if input_file:
+            service = get_export_service()
+            file_name = input_file.name
+            key = self._upload_dir_path + file_name
+            result = service.upload(key=key, file_content=input_file)
+            if result == 204:
+                self.input_file_name = file_name
+                self.save()
+
+    @classmethod
+    def persist_new(cls, instance, user, **kwargs):
+        errors = {}
+        persisted = False
+
+        instance.created_by = instance.updated_by = user
+        try:
+            input_file = kwargs.pop('input_file', None)
+            instance.input_file_name = input_file.name if input_file else None
+            instance.full_clean()
+            instance.save(**kwargs)
+            if instance.id:
+                instance.save()
+                persisted = True
+                instance.update_input_file(input_file)
+        except IntegrityError as ex:
+            errors.update({'__all__': ex.args})
+        except ValidationError as ex:
+            errors = get(ex, 'message_dict', {}) or get(ex, 'error_dict', {})
+        finally:
+            if not persisted and not errors:
+                errors['non_field_errors'] = PERSIST_NEW_ERROR_MESSAGE.format(cls.__name__)
+        return errors
+
+    @classmethod
+    def persist_changes(cls, instance, user, **kwargs):
+        errors = {}
+        try:
+            input_file = kwargs.pop('input_file', None)
+            if input_file:  # without a new file, keep the stored one
+                instance.input_file_name = input_file.name
+            instance.updated_by = user
+            instance.full_clean()
+            instance.save(**kwargs)
+            if input_file:
+                instance.update_input_file(input_file)
+        except ValidationError as ex:
+            errors.update(get(ex, 'message_dict', {}) or get(ex, 'error_dict', {}))
+        except IntegrityError as ex:
+            errors.update({'__all__': ex.args})
+
+        return errors
+
+    def delete(self, using=None, keep_parents=False):
+        file_path = self.file_path
+        result = super().delete(using=using, keep_parents=keep_parents)
+        self._delete_uploaded_file(file_path)
+        return result
+
+    @staticmethod
+    def _delete_uploaded_file(file_path):
+        from core.common.tasks import delete_s3_objects
+        delete_s3_objects.apply_async((file_path,), queue='default', permanent=False)
+
+    @classmethod
+    def format_request_data(cls, data, parent_resource=None):
+        # Multipart requests can wrap JSON-capable fields in single-item lists.
+        # Keep list-shaped config fields intact so ArrayField-backed values like
+        # input_locales do not collapse into a scalar during update flows.
+        new_data = {
+            key: val[0] if (
+                isinstance(val, list) and
+                len(val) == 1 and
+                not isinstance(val[0], (dict, list)) and
+                key not in ['candidates', 'analysis', 'input_locales']
+            ) else val for key, val in data.items()
+        }
+        cls.format_json(new_data, 'matches')
+        cls.format_json(new_data, 'columns')
+        cls.format_json(new_data, 'score_configuration')
+        cls.format_json(new_data, 'filters')
+        cls.format_json(new_data, 'candidates')
+        cls.format_json(new_data, 'analysis')
+        cls.format_json(new_data, 'algorithms')
+        cls.format_json(new_data, 'lookup_config')
+        cls.format_json(new_data, 'input_locales')
+
+        # The owner comes only from the URL (parent_resource), never from the request body.
+        new_data.pop('organization_id', None)
+        new_data.pop('user_id', None)
+        if parent_resource:
+            new_data[parent_resource.resource_type.lower() + '_id'] = parent_resource.id
+
+        file = data.get('file')
+        if file:
+            new_data['input_file_name'] = file.name
+
+        return new_data
+
+    @staticmethod
+    def format_json(new_data, field):
+        if field in new_data and isinstance(new_data[field], str):
+            try:
+                new_data[field] = json.loads(new_data[field])
+            except json.JSONDecodeError:
+                pass
+
+    def soft_delete(self):
+        self.delete()
+
+    def clean(self):
+        self.clean_filters()
+        self.clean_include_retired()
+        self.clean_encoder_model()
+        self.clean_matches()
+
+    def clean_matches(self):
+        if self.matches:
+            try:
+                self.matches = json.loads(self.matches)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    def clean_include_retired(self):
+        if not self.include_retired:
+            self.include_retired = False
+
+    def clean_encoder_model(self):
+        self.encoder_model = self.encoder_model.strip() if self.encoder_model else settings.ENCODER_MODEL_NAME
+
+    def clean_filters(self):
+        if not self.filters:
+            self.filters = {}
+        for key, value in self.filters.copy().items():
+            if not value:
+                self.filters.pop(key)
+
+    @property
+    def target_repo(self):
+        if not self.target_repo_url:
+            return None
+
+        from core.sources.models import Source
+        repo, _ = Source.resolve_reference_expression(self.target_repo_url)
+        return repo if repo and repo.id else None
+
+    @property
+    def fields_mapped(self):
+        return [
+            col.get('label') for col in self.visible_columns if (
+                    col['label'].lower() in [
+                        'id', 'description', 'mapping: list', 'mapping: code',
+                        'concept_class', 'class', 'datatype', 'name', 'synonyms'
+                    ] or col['label'].lower().startswith('property:')
+            )
+        ] if self.columns else []
+
+
+class AutomatchRun(BaseModel):
+    """
+    System-of-record for a single Mapper auto-match run — a child of MapProject.
+
+    Tracks the lifecycle of one auto-match execution: how many input rows were
+    intended, how many completed/failed, the project configuration captured at
+    run start (``config_snapshot``), who/what triggered it, and the originating
+    client. It is created at run start and PATCHed as rows complete (see
+    OpenConceptLab/ocl_online#105 §A, #109).
+
+    Re-run semantics (ocl_online#105 OQ3): re-running the failed rows of a run
+    creates a *new* AutomatchRun with ``parent_run`` set and
+    ``trigger_source='ui-rerun-row'``. The retry's ``intended_rows`` is the count
+    of *failed* rows being re-run (not the original total) and its
+    ``config_snapshot`` is the config at retry time. The parent run's
+    ``failed_rows`` / ``completion_status`` are an immutable snapshot and are
+    never mutated retrospectively; "all attempts" queries walk the
+    ``parent_run`` chain.
+    """
+    OBJECT_TYPE = 'AutomatchRun'
+
+    # completion_status vocabulary
+    RUNNING = 'running'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+    CANCELLED = 'cancelled'
+    PARTIAL = 'partial'
+    COMPLETION_STATUSES = [RUNNING, COMPLETED, FAILED, CANCELLED, PARTIAL]
+    # Statuses that close out a run; reaching one stamps completed_at.
+    TERMINAL_STATUSES = [COMPLETED, FAILED, CANCELLED, PARTIAL]
+
+    # trigger_source vocabulary
+    TRIGGER_SOURCES = ['ui-auto-match', 'ui-rerun-row', 'api', 'cli', 'scheduled']
+
+    map_project = models.ForeignKey(
+        MapProject, on_delete=models.CASCADE, related_name='auto_match_runs')
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    intended_rows = models.IntegerField()  # set at run start from input
+    completed_rows = models.IntegerField(default=0)  # updated as rows complete
+    failed_rows = models.IntegerField(default=0)
+    # algorithms, encoder, template, score_config, filters AT START
+    config_snapshot = models.JSONField(default=dict)
+    started_by = models.ForeignKey(
+        'users.UserProfile', on_delete=models.SET_NULL, null=True, related_name='started_auto_match_runs')
+    completion_status = models.CharField(max_length=16, default=RUNNING)
+    trigger_source = models.CharField(max_length=32)
+    # set when a re-run of failed rows spawns a new run
+    parent_run = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.SET_NULL, related_name='retry_runs')
+    client_user_agent = models.TextField(null=True, blank=True)
+    client_ip = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'automatch_runs'
+        indexes = [
+            models.Index(fields=['map_project', '-started_at']),
+            models.Index(fields=['completion_status']),
+        ]
+
+    def calculate_uri(self):
+        return f"/auto-match-runs/{self.id or generate_temp_version()}/"

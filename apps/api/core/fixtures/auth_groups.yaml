@@ -1,0 +1,116 @@
+# The Mapper-gating and authoring Django permissions (ocl_issues#2780/#2782/#2766, ocl_online#230). Plan groups granting
+# them are seeded by `manage.py seed_group_capabilities` from deployment config.
+# pk is pinned so re-running `loaddata core/fixtures/*` on every container start
+# (pre_startup.sh) updates these same rows instead of inserting duplicates on the
+# unique (content_type, codename) constraint - same reasoning as the group pks below,
+# but starting well above them: auth_permission already had 252 rows (max id 252,
+# confirmed against the dev database) and keeps growing as new models are added, unlike
+# auth_group which this app fully owns.
+- model: "auth.permission"
+  pk: 1001
+  fields:
+    codename: mapper_use
+    name: Can use the Mapper ($match/$rerank) and manage own map projects
+    content_type: [users, userprofile]
+- model: "auth.permission"
+  pk: 1002
+  fields:
+    codename: mapper_ai_assistant
+    name: Can invoke the Mapper AI Assistant ($invoke)
+    content_type: [users, userprofile]
+- model: "auth.permission"
+  pk: 1003
+  fields:
+    codename: mapper_custom_algorithms
+    name: Can use externally hosted/custom match algorithms
+    content_type: [users, userprofile]
+- model: "auth.permission"
+  pk: 1004
+  fields:
+    codename: mapper_org_projects
+    name: Can create or use organization-owned map projects
+    content_type: [users, userprofile]
+- model: "auth.permission"
+  pk: 1005
+  fields:
+    codename: mapper_scispacy
+    name: Can use ScispaCy-LOINC Mapper matching
+    content_type: [users, userprofile]
+- model: "auth.permission"
+  pk: 1006
+  fields:
+    codename: bulk_import_advanced
+    name: Can bulk import zip files, FHIR/NPM packages, OCL repository exports, or from a URL
+    content_type: [users, userprofile]
+- model: "auth.permission"
+  pk: 1007
+  fields:
+    codename: bulk_import_priority
+    name: Can use the concurrent import queue and more than 5 import threads
+    content_type: [users, userprofile]
+- model: "auth.permission"
+  pk: 1008
+  fields:
+    codename: list_unpaginated
+    name: Can request unpaginated (Compress) list responses
+    content_type: [users, userprofile]
+- model: "auth.group"
+  pk: 1
+  fields:
+    name: ocl_servers
+- model: "auth.group"
+  pk: 2
+  fields:
+    name: ocl_fhir_servers
+- model: "auth.group"
+  pk: 3
+  fields:
+    name: hapi_fhir_servers
+- model: "auth.group"
+  pk: 4
+  fields:
+    name: operations_panel
+- model: "auth.group"
+  pk: 5
+  fields:
+    name: mapper_ai_assistant
+- model: "auth.group"
+  pk: 6
+  fields:
+    name: mapper-waitlist
+- model: "auth.group"
+  pk: 7
+  fields:
+    name: mapper-approved
+- model: "auth.group"
+  pk: 8
+  fields:
+    name: guest_user
+- model: "auth.group"
+  pk: 9
+  fields:
+    name: standard_user
+- model: "auth.group"
+  pk: 10
+  fields:
+    name: premium_user
+- model: "auth.group"
+  pk: 11
+  fields:
+    name: staff_user
+- model: "auth.group"
+  pk: 12
+  fields:
+    name: superadmin_user
+- model: "auth.group"
+  pk: 13
+  fields:
+    name: mapper_cross_encoder
+- model: "auth.group"
+  pk: 14
+  fields:
+    name: graphql_api
+- model: "auth.group"
+  pk: 15
+  fields:
+    name: core_user

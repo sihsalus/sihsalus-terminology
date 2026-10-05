@@ -1,0 +1,902 @@
+import importlib
+from datetime import datetime
+
+from django.apps import apps
+from django.contrib.auth.models import Group, Permission
+from django.http import Http404
+from mock import Mock, patch, ANY
+from rest_framework.authtoken.models import Token
+
+from core.collections.tests.factories import OrganizationCollectionFactory
+from core.common.constants import ACCESS_TYPE_NONE, HEAD, OCL_ORG_ID, ACCESS_TYPE_VIEW, RETIRED_ACCESS_TYPE_EDIT
+from core.common.tasks import send_user_verification_email, send_user_reset_password_email
+from core.common.tests import OCLTestCase, OCLAPITestCase, PREVIEW_GROUP_NAME
+from core.orgs.models import Organization
+from core.sources.tests.factories import OrganizationSourceFactory
+from core.users.constants import USER_OBJECT_TYPE, OCL_SERVERS_GROUP, MAPPER_USE_PERMISSION, \
+    MAPPER_AI_ASSISTANT_PERMISSION, MAPPER_SCISPACY_PERMISSION, STAFF_GROUP, SUPERADMIN_GROUP
+from core.users.documents import UserProfileDocument
+from core.users.models import UserProfile
+from core.users.tests.factories import UserProfileFactory
+
+
+class UserProfileTest(OCLTestCase):
+    def setUp(self):
+        super().setUp()
+        self.org = Organization.objects.get(id=OCL_ORG_ID)
+
+    def test_create_userprofile_positive(self):
+        self.assertFalse(UserProfile.objects.filter(username='user1').exists())
+        user = UserProfile(
+            username='user1',
+            email='user1@test.com',
+            last_name='Schindler',
+            first_name='Oskar',
+            password='password',
+        )
+        user.full_clean()
+        user.save()
+        user.organizations.add(self.org)
+
+        self.assertIsNotNone(user.id)
+        self.assertEqual(user.username, user.mnemonic)
+        self.assertTrue(UserProfile.objects.filter(username='user1').exists())
+
+    def test_name(self):
+        self.assertEqual(
+            UserProfile(first_name='First', last_name="Last").name,
+            "First Last"
+        )
+
+    def test_full_name(self):
+        self.assertEqual(
+            UserProfile(first_name='First', last_name="Last").full_name,
+            "First Last"
+        )
+
+    def test_resource_type(self):
+        user = UserProfile()
+
+        self.assertEqual(user.resource_type, USER_OBJECT_TYPE)
+
+    def test_mnemonic(self):
+        self.assertEqual(UserProfile().mnemonic, '')
+        self.assertEqual(UserProfile(username='foo').mnemonic, 'foo')
+
+    def test_user(self):
+        self.assertEqual(UserProfile().user, '')
+        self.assertEqual(UserProfile(username='foo').user, 'foo')
+
+    def test_get_search_document(self):
+        self.assertEqual(UserProfile.get_search_document(), UserProfileDocument)
+
+    def test_status(self):
+        self.assertEqual(UserProfile(is_active=True, verified=True).status, 'verified')
+        self.assertEqual(UserProfile(is_active=True, verified=False).status, 'unverified')
+        self.assertEqual(UserProfile(is_active=False, verified=True).status, 'deactivated')
+        self.assertEqual(UserProfile(is_active=False, verified=False).status, 'deactivated')
+
+    @patch('core.users.models.UserProfile.source_set')
+    def test_public_sources(self, source_set_mock):
+        source_set_mock.filter = Mock(return_value=Mock(exclude=Mock(return_value=Mock(count=Mock(return_value=10)))))
+
+        self.assertEqual(UserProfile().public_sources, 10)
+        source_set_mock.filter.assert_called_once_with(version=HEAD)
+        source_set_mock.filter().exclude.assert_called_once_with(public_access=ACCESS_TYPE_NONE)
+        source_set_mock.filter().exclude().count.assert_called_once()
+
+    @patch('core.orgs.models.Organization.collection_set')
+    def test_public_collections(self, collection_set_mock):
+        collection_set_mock.filter = Mock(
+            return_value=Mock(exclude=Mock(return_value=Mock(count=Mock(return_value=10)))))
+
+        self.assertEqual(Organization().public_collections, 10)
+        collection_set_mock.filter.assert_called_once_with(version=HEAD)
+        collection_set_mock.filter().exclude.assert_called_once_with(public_access=ACCESS_TYPE_NONE)
+        collection_set_mock.filter().exclude().count.assert_called_once()
+
+    def test_delete(self):
+        user = UserProfileFactory()
+        user_id = user.id
+
+        self.assertTrue(user.is_active)
+        self.assertTrue(UserProfile.objects.filter(id=user_id).exists())
+
+        user.soft_delete()
+
+        self.assertFalse(user.is_active)
+        self.assertTrue(UserProfile.objects.filter(id=user_id).exists())
+
+        user.delete()
+
+        self.assertFalse(UserProfile.objects.filter(id=user_id).exists())
+
+    def test_user_active_inactive_should_affect_children(self):
+        user = UserProfileFactory(is_active=True)
+        source = OrganizationSourceFactory(user=user, is_active=True)
+        collection = OrganizationCollectionFactory(user=user, is_active=True)
+
+        user.is_active = False
+        user.save()
+        source.refresh_from_db()
+        collection.refresh_from_db()
+
+        self.assertFalse(user.is_active)
+        self.assertFalse(source.is_active)
+        self.assertFalse(collection.is_active)
+
+        user.is_active = True
+        user.save()
+        source.refresh_from_db()
+        collection.refresh_from_db()
+
+        self.assertTrue(user.is_active)
+        self.assertTrue(source.is_active)
+        self.assertTrue(collection.is_active)
+
+    def test_update_password(self):
+        user = UserProfileFactory()
+        user.set_password('Password123!')
+        user.save()
+
+        user.update_password()
+        self.assertTrue(user.check_password('Password123!'))
+
+        self.assertEqual(
+            user.update_password(password='newpassword'),
+            {'errors': ['This password is too common.', 'This password is not alphanumeric.']}
+        )
+        self.assertEqual(
+            user.update_password(password='short'),
+            {
+                'errors': [
+                    'This password is too short. It must contain at least 8 characters.',
+                    'This password is not alphanumeric.'
+                ]
+            }
+        )
+
+        user.verification_token = 'some-token'
+        user.save()
+        user.update_password(password='Newpassw0rd')
+        self.assertIsNone(user.verification_token)
+        self.assertFalse(user.check_password('Password123!'))
+        self.assertTrue(user.check_password('Newpassw0rd'))
+
+        user.update_password(hashed_password='hashedpassword')
+        self.assertFalse(user.check_password('password'))
+        self.assertEqual(user.password, 'hashedpassword')
+
+    def test_get_token(self):
+        user = UserProfileFactory()
+
+        self.assertFalse(Token.objects.filter(user=user).exists())
+
+        token = user.get_token()
+
+        self.assertIsNotNone(token)
+        self.assertEqual(user.auth_token.key, token)
+        self.assertEqual(user.get_token(), token)
+
+    def test_set_token(self):
+        user = UserProfileFactory()
+
+        self.assertFalse(Token.objects.filter(user=user).exists())
+
+        user.set_token('token')
+        self.assertEqual(user.auth_token.key, 'token')
+
+    @patch('core.users.models.send_user_verification_email')
+    def test_send_verification_email(self, mail_mock):
+        user = UserProfile(id=189)
+        user.send_verification_email()
+
+        mail_mock.apply_async.assert_called_once_with((189,), queue='default', permanent=False)
+
+    @patch('core.users.models.send_user_reset_password_email')
+    def test_send_reset_password_email(self, mail_mock):
+        user = UserProfile(id=189)
+        user.send_reset_password_email()
+
+        mail_mock.apply_async.assert_called_once_with((189,), queue='default', permanent=False)
+
+    def test_email_verification_url(self):
+        user = UserProfile(id=189, username='foobar', verification_token='some-token')
+        self.assertEqual(
+            user.email_verification_url,
+            'http://localhost:4000/#/accounts/foobar/verify/some-token/'
+        )
+
+    def test_reset_password_url(self):
+        user = UserProfile(id=189, username='foobar', verification_token='some-token')
+        self.assertEqual(
+            user.reset_password_url,
+            'http://localhost:4000/#/accounts/foobar/password/reset/some-token/'
+        )
+
+    def test_mark_verified(self):
+        user = UserProfileFactory(verified=False, verification_token='some-token')
+        self.assertFalse(user.verified)
+
+        self.assertFalse(user.mark_verified(token='wrong-token'))
+        user.refresh_from_db()
+        self.assertEqual(user.verification_token, 'some-token')
+        self.assertFalse(user.verified)
+
+        self.assertTrue(user.mark_verified(token='some-token'))
+        user.refresh_from_db()
+        self.assertIsNone(user.verification_token)
+        self.assertTrue(user.verified)
+
+        user.save = Mock()
+        self.assertTrue(user.mark_verified(token='some-token'))
+        self.assertIsNone(user.verification_token)
+        user.save.assert_not_called()
+
+    def test_auth_groups(self):
+        user = UserProfileFactory()
+        self.assertEqual(user.auth_groups.count(), 0)
+
+        user.groups.add(Group.objects.get(name=OCL_SERVERS_GROUP))
+
+        self.assertEqual(user.auth_groups.count(), 1)
+
+    def test_deactivate(self):
+        user = UserProfileFactory(is_active=True, deactivated_at=None, verified=True)
+
+        self.assertEqual(user.status, 'verified')
+
+        user.deactivate()
+
+        self.assertEqual(user.status, 'deactivated')
+        self.assertFalse(user.verified)
+        self.assertFalse(user.is_active)
+
+    def test_verify(self):
+        user = UserProfileFactory(
+            is_active=False, deactivated_at=datetime.now(), verified=False, verification_token=None)
+
+        self.assertEqual(user.status, 'deactivated')
+
+        user.send_verification_email = Mock()
+
+        user.verify()
+
+        self.assertEqual(user.status, 'verification_pending')
+        self.assertFalse(user.verified)
+        self.assertTrue(user.is_active)
+        self.assertIsNotNone(user.verification_token)
+        user.send_verification_email.assert_called_once()
+
+    def test_user_in_preview_group_has_mapper_permissions(self):
+        # Django never assigns the `preview` group itself - Keycloak grants it at
+        # signup and every login syncs it via the existing OIDC backend/set_groups().
+        # This only verifies the permission side once a user is a member.
+
+        user = UserProfileFactory()
+        user.groups.add(Group.objects.get(name=PREVIEW_GROUP_NAME))
+
+        self.assertTrue(user.has_perm(MAPPER_USE_PERMISSION))
+        self.assertTrue(user.has_perm(MAPPER_AI_ASSISTANT_PERMISSION))
+
+    def test_set_groups_makes_superuser_staff(self):
+        user = UserProfileFactory(is_staff=False, is_superuser=False)
+        Group.objects.get_or_create(name=SUPERADMIN_GROUP)
+        Group.objects.get_or_create(name=STAFF_GROUP)
+
+        user.set_groups([SUPERADMIN_GROUP])
+        user.refresh_from_db()
+        self.assertTrue(user.is_superuser)
+        self.assertTrue(user.is_staff)
+
+        user.set_groups([STAFF_GROUP])
+        user.refresh_from_db()
+        self.assertFalse(user.is_superuser)
+        self.assertTrue(user.is_staff)
+
+        user.set_groups([])
+        user.refresh_from_db()
+        self.assertFalse(user.is_superuser)
+        self.assertFalse(user.is_staff)
+
+    def test_user_without_preview_group_has_no_mapper_permission(self):
+        user = UserProfileFactory()
+
+        self.assertFalse(user.has_perm(MAPPER_USE_PERMISSION))
+
+
+class TokenAuthenticationViewTest(OCLAPITestCase):
+    def test_post(self):
+        response = self.client.post('/users/login/', {})
+
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.post('/users/login/', {'username': 'foo', 'password': 'bar'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data,
+            {'non_field_errors': ["Unable to log in with provided credentials."]}
+        )
+
+        user = UserProfileFactory()
+        user.set_password('password')
+        user.save()
+        self.assertIsNone(user.last_login)
+
+        response = self.client.post('/users/login/', {'username': user.username, 'password': 'password'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'token': ANY})
+        user.refresh_from_db()
+        self.assertIsNotNone(user.last_login)
+
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_get_405(self, is_sso_enabled_mock):
+        is_sso_enabled_mock.return_value = False
+
+        response = self.client.get(
+            '/users/login/?client_id=client-id&redirect_uri=http://post-login-url&state=state&nonce=nonce'
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+    @patch('core.users.views.OpenIDAuthService.get_login_redirect_url')
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_get_200(self, is_sso_enabled_mock, get_login_url_mock):
+        is_sso_enabled_mock.return_value = True
+        get_login_url_mock.return_value = 'http://login-redirect.com'
+
+        response = self.client.get(
+            '/users/login/?client_id=client-id&redirect_uri=http://post-login-url&state=state&nonce=nonce'
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers['Location'], 'http://login-redirect.com')
+        get_login_url_mock.assert_called_once_with(
+            'client-id', 'http://post-login-url', 'state', 'nonce', None, None
+        )
+
+
+class UserLogoViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = UserProfileFactory(username='username1')
+        self.token = self.user.get_token()
+
+    @patch('core.services.storages.cloud.aws.S3.upload_base64')
+    def test_post_200(self, upload_base64_mock):
+        upload_base64_mock.return_value = 'users/username1/logo.png'
+        self.assertIsNone(self.user.logo_url)
+        self.assertIsNone(self.user.logo_path)
+
+        response = self.client.post(
+            self.user.uri + 'logo/',
+            {'base64': 'base64-data'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        expected_logo_url = 'http://oclapi2-dev.s3.amazonaws.com/users/username1/logo.png'
+        self.assertEqual(response.data['logo_url'].replace('https://', 'http://'), expected_logo_url)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.logo_url.replace('https://', 'http://'), expected_logo_url)
+        self.assertEqual(self.user.logo_path, 'users/username1/logo.png')
+        upload_base64_mock.assert_called_once_with('base64-data', 'users/username1/logo.png', False, True)
+
+
+class TasksTest(OCLTestCase):
+    @patch('core.common.tasks.EmailMessage.send')
+    def test_send_user_verification_email(self, send_mail_mock):
+        send_mail_mock.return_value = 1
+        self.assertIsNone(send_user_verification_email(404))
+        send_mail_mock.assert_not_called()
+
+        user = UserProfileFactory()
+        mail = send_user_verification_email(user.id)
+
+        self.assertEqual(mail.content_subtype, 'html')
+        self.assertEqual(mail.subject, 'Confirm E-mail Address')
+        self.assertEqual(mail.to, [user.email])
+        self.assertTrue(user.email_verification_url in mail.body)
+        self.assertTrue(f'Hi {user.username},' in mail.body)
+        send_mail_mock.assert_called_once()
+
+    @patch('core.common.tasks.EmailMessage.send')
+    def test_send_user_reset_password_email(self, send_mail_mock):
+        send_mail_mock.return_value = 1
+        self.assertIsNone(send_user_reset_password_email(404))
+        send_mail_mock.assert_not_called()
+
+        user = UserProfileFactory()
+        mail = send_user_reset_password_email(user.id)
+
+        self.assertEqual(mail.content_subtype, 'html')
+        self.assertEqual(mail.subject, 'Password Reset E-mail')
+        self.assertEqual(mail.to, [user.email])
+        self.assertTrue(user.reset_password_url in mail.body)
+        self.assertTrue(f'Hi {user.username},' in mail.body)
+        send_mail_mock.assert_called_once()
+
+
+class UserContentSummaryViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = UserProfileFactory(username='summaryuser')
+        self.token = self.user.get_token()
+
+    def test_unauthenticated(self):
+        response = self.client.get('/users/summaryuser/content-summary/')
+        self.assertEqual(response.status_code, 401)
+
+    def test_self_user(self):
+        response = self.client.get(
+            '/users/summaryuser/content-summary/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['username'], 'summaryuser')
+        self.assertEqual(response.data['concepts_created'], 0)
+        self.assertEqual(response.data['concepts_updated'], 0)
+        self.assertEqual(response.data['mappings_created'], 0)
+        self.assertEqual(response.data['mappings_updated'], 0)
+        self.assertEqual(response.data['sources_owned'], 0)
+        self.assertEqual(response.data['collections_owned'], 0)
+        self.assertEqual(response.data['references_added'], 0)
+        self.assertEqual(response.data['versions_created'], 0)
+        self.assertEqual(response.data['expansions_created'], 0)
+
+    def test_other_user_forbidden(self):
+        other_user = UserProfileFactory(username='otheruser')
+        other_token = other_user.get_token()
+
+        response = self.client.get(
+            '/users/summaryuser/content-summary/',
+            HTTP_AUTHORIZATION='Token ' + other_token,
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_staff_can_view_other_user(self):
+        admin = UserProfileFactory(username='adminuser', is_staff=True)
+        admin_token = admin.get_token()
+
+        response = self.client.get(
+            '/users/summaryuser/content-summary/',
+            HTTP_AUTHORIZATION='Token ' + admin_token,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['username'], 'summaryuser')
+
+    def test_nonexistent_user(self):
+        response = self.client.get(
+            '/users/doesnotexist/content-summary/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_with_content(self):
+        from core.sources.tests.factories import UserSourceFactory
+        from core.concepts.tests.factories import ConceptFactory
+        from core.mappings.tests.factories import MappingFactory
+        from core.collections.tests.factories import UserCollectionFactory
+
+        source = UserSourceFactory(user=self.user, created_by=self.user)
+        ConceptFactory(parent=source, created_by=self.user, updated_by=self.user)
+        MappingFactory(parent=source, created_by=self.user, updated_by=self.user)
+        UserCollectionFactory(user=self.user, created_by=self.user)
+
+        response = self.client.get(
+            '/users/summaryuser/content-summary/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['sources_owned'], 1)
+        self.assertEqual(response.data['collections_owned'], 1)
+        self.assertGreaterEqual(response.data['concepts_created'], 1)
+        self.assertGreaterEqual(response.data['mappings_created'], 1)
+
+
+class UserViewsAPITest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.admin = UserProfile.objects.get(username='ocladmin')
+        self.admin_token = self.admin.get_token()
+
+    def test_oidc_callback_get_throttles(self):
+        from core.users.views import OCLOIDCAuthenticationCallbackView
+        view = OCLOIDCAuthenticationCallbackView()
+        view.request = Mock(user=self.admin)
+        self.assertIsInstance(view.get_throttles(), list)
+
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_login_sso_enabled_400(self, is_sso_enabled_mock):
+        is_sso_enabled_mock.return_value = True
+
+        response = self.client.post('/users/login/', {'username': 'foo', 'password': 'bar'})
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch('core.users.views.update_last_login')
+    def test_login_update_last_login_exception_is_swallowed(self, update_last_login_mock):
+        update_last_login_mock.side_effect = Exception('boom')
+        user = UserProfileFactory()
+        user.set_password('password')
+        user.save()
+
+        response = self.client.post('/users/login/', {'username': user.username, 'password': 'password'})
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_user_list_query_param_filters(self):
+        response = self.client.get(
+            '/users/?updatedSince=2020-01-01T00:00:00Z&updatedBy=ocladmin&lastLoginSince=2020-01-01T00:00:00Z'
+            '&lastLoginBefore=2030-01-01T00:00:00Z&dateJoinedSince=2020-01-01T00:00:00Z'
+            '&dateJoinedBefore=2030-01-01T00:00:00Z',
+            HTTP_AUTHORIZATION='Token ' + self.admin_token,
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_user_list_create_weak_password_returns_errors(self):
+        response = self.client.post(
+            '/users/', {'username': 'weakpassworduser', 'email': 'weakpassworduser@x.com', 'password': 'weak'},
+            HTTP_AUTHORIZATION='Token ' + self.admin_token,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('password', response.data)
+
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_signup_perform_create_sso_enabled_400(self, is_sso_enabled_mock):
+        is_sso_enabled_mock.return_value = True
+
+        response = self.client.post(
+            '/users/signup/', {'username': 'ssouser', 'email': 'ssouser@x.com', 'password': 'whatever'}
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_email_verification_get_object_not_found_returns_404(self):
+        from core.users.views import UserEmailVerificationView
+        view = UserEmailVerificationView()
+        view.get_object = Mock(return_value=None)
+
+        response = view.get(Mock(), verification_token='sometoken')
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('core.users.views.OpenIDAuthService.get_reset_password_redirect_url')
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_password_reset_get_sso_enabled_redirects(self, is_sso_enabled_mock, get_redirect_url_mock):
+        is_sso_enabled_mock.return_value = True
+        get_redirect_url_mock.return_value = 'http://reset-redirect.com'
+
+        response = self.client.get(
+            '/users/password/reset/?client_id=client-id&redirect_uri=http://post-reset-url'
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers['Location'], 'http://reset-redirect.com')
+
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_password_reset_get_sso_disabled_405(self, is_sso_enabled_mock):
+        is_sso_enabled_mock.return_value = False
+
+        response = self.client.get('/users/password/reset/')
+
+        self.assertEqual(response.status_code, 405)
+
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_password_reset_put_sso_enabled_400(self, is_sso_enabled_mock):
+        is_sso_enabled_mock.return_value = True
+
+        response = self.client.put(
+            '/users/password/reset/', {'token': 'sometoken', 'new_password': 'whatever'}, format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_password_reset_put_weak_password_400(self):
+        user = UserProfileFactory(verification_token='some-reset-token')
+
+        response = self.client.put(
+            '/users/password/reset/', {'token': 'some-reset-token', 'new_password': 'weak'}, format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('errors', response.data)
+        user.refresh_from_db()
+
+    @patch('core.services.auth.django.DjangoAuthService.update_password')
+    def test_password_reset_put_update_password_errors(self, update_password_mock):
+        update_password_mock.return_value = {'errors': ['some error']}
+        UserProfileFactory(verification_token='some-other-reset-token')
+
+        response = self.client.put(
+            '/users/password/reset/', {'token': 'some-other-reset-token', 'new_password': 'Newpassw0rd!'},
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_put_auth_groups_accepts_any_existing_group(self):
+        user = UserProfileFactory()
+
+        response = self.client.put(
+            f'/users/{user.username}/?includeAuthGroups=true',
+            {'auth_groups': [PREVIEW_GROUP_NAME, OCL_SERVERS_GROUP, 'no-such-group']},
+            HTTP_AUTHORIZATION='Token ' + self.admin.get_token(),
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(sorted(user.auth_groups), sorted([OCL_SERVERS_GROUP, PREVIEW_GROUP_NAME]))
+        self.assertEqual(sorted(response.data['auth_groups']), sorted([OCL_SERVERS_GROUP, PREVIEW_GROUP_NAME]))
+
+    def test_non_staff_self_put_ignores_auth_groups(self):
+        user = UserProfileFactory()
+        user.groups.add(Group.objects.get(name=PREVIEW_GROUP_NAME))
+
+        response = self.client.put(
+            '/user/?includeAuthGroups=true',
+            {'auth_groups': ['core_user', OCL_SERVERS_GROUP]},
+            HTTP_AUTHORIZATION='Token ' + user.get_token(),
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list(user.auth_groups), [PREVIEW_GROUP_NAME])
+        self.assertEqual(response.data['auth_groups'], [PREVIEW_GROUP_NAME])
+
+    def test_user_detail_summary_serializer(self):
+        user = UserProfileFactory(username='summaryserializeruser')
+
+        response = self.client.get(
+            '/users/summaryserializeruser/?summary=true', HTTP_AUTHORIZATION='Token ' + self.admin_token
+        )
+
+        self.assertEqual(response.status_code, 200)
+        user.refresh_from_db()
+
+    def test_user_detail_self_shortcut(self):
+        user = UserProfileFactory(username='selfshortcutuser')
+        token = user.get_token()
+
+        response = self.client.get('/user/', HTTP_AUTHORIZATION='Token ' + token)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['username'], 'selfshortcutuser')
+
+    def test_user_detail_includes_capabilities_when_requested(self):
+        user = UserProfileFactory()
+        user.groups.add(Group.objects.get(name=PREVIEW_GROUP_NAME))
+        user.user_permissions.add(Permission.objects.get(codename='mapper_scispacy'))
+
+        response = self.client.get(
+            '/user/?includeCapabilities=true', HTTP_AUTHORIZATION=f"Token {user.get_token()}"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('users.mapper_use', response.data['permissions'])
+        self.assertIn(MAPPER_SCISPACY_PERMISSION, response.data['permissions'])
+        capabilities_by_name = {c['name']: c for c in response.data['capabilities']}
+        self.assertEqual(
+            capabilities_by_name['mapper.match_operations'],
+            {'name': 'mapper.match_operations', 'limit': 100, 'used': 0})
+        self.assertEqual(
+            capabilities_by_name['mapper.rows_per_project'],
+            {'name': 'mapper.rows_per_project', 'limit': 25, 'used': None})
+        self.assertEqual(
+            capabilities_by_name['mapper.projects'], {'name': 'mapper.projects', 'limit': 1, 'used': 0})
+        self.assertEqual(
+            capabilities_by_name['ai_assistant.calls'], {'name': 'ai_assistant.calls', 'limit': 6, 'used': 0})
+        self.assertEqual(
+            capabilities_by_name['ai_assistant.change_comments'],
+            {'name': 'ai_assistant.change_comments', 'limit': 100, 'used': 0})
+
+    def test_user_detail_excludes_capabilities_by_default(self):
+        user = UserProfileFactory()
+        user.user_permissions.add(Permission.objects.get(codename='mapper_scispacy'))
+
+        response = self.client.get('/user/', HTTP_AUTHORIZATION=f"Token {user.get_token()}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('capabilities', response.data)
+        self.assertNotIn('permissions', response.data)
+
+    def test_user_detail_never_returns_verification_token(self):
+        user = UserProfileFactory(username='verificationtokenuser', verification_token='secret-token')
+
+        response = self.client.get(f'/users/{user.username}/?includeVerificationToken=true')
+
+        self.assertEqual(response.status_code, 401)
+
+        for token in [user.get_token(), self.admin_token]:
+            response = self.client.get(
+                f'/users/{user.username}/?includeVerificationToken=true', HTTP_AUTHORIZATION='Token ' + token)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn('verification_token', response.data)
+            self.assertNotIn('secret-token', str(response.data))
+
+    def test_user_detail_private_fields_only_for_self_and_staff(self):
+        user = UserProfileFactory(username='privatefieldsuser', email='private@example.com')
+        other_user = UserProfileFactory(username='privatefieldsother')
+        private_fields = ['email', 'last_login', 'is_staff', 'is_superuser']
+
+        response = self.client.get(
+            f'/users/{user.username}/', HTTP_AUTHORIZATION='Token ' + other_user.get_token())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['username'], user.username)
+        for field in private_fields:
+            self.assertNotIn(field, response.data)
+
+        response = self.client.get(
+            f'/users/{user.username}/?summary=true', HTTP_AUTHORIZATION='Token ' + other_user.get_token())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('is_staff', response.data)
+        self.assertNotIn('is_superuser', response.data)
+
+        for token in [user.get_token(), self.admin_token]:
+            response = self.client.get(f'/users/{user.username}/', HTTP_AUTHORIZATION='Token ' + token)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data['email'], 'private@example.com')
+            for field in private_fields:
+                self.assertIn(field, response.data)
+
+    def test_user_detail_plan_fields_only_for_self_and_staff(self):
+        user = UserProfileFactory(username='planfieldsuser')
+        user.groups.add(Group.objects.get(name=PREVIEW_GROUP_NAME))
+        other_user = UserProfileFactory(username='planfieldsother')
+        plan_fields = ['auth_groups', 'permissions', 'capabilities']
+        url = f'/users/{user.username}/?includeCapabilities=true&includeAuthGroups=true'
+
+        response = self.client.get(url, HTTP_AUTHORIZATION='Token ' + other_user.get_token())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['username'], user.username)
+        for field in plan_fields:
+            self.assertNotIn(field, response.data)
+
+        for token in [user.get_token(), self.admin_token]:
+            response = self.client.get(url, HTTP_AUTHORIZATION='Token ' + token)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data['auth_groups'], [PREVIEW_GROUP_NAME])
+            self.assertIn(MAPPER_USE_PERMISSION, response.data['permissions'])
+            self.assertIn(
+                {'name': 'mapper.match_operations', 'limit': 100, 'used': 0}, response.data['capabilities'])
+
+    @patch('core.users.models.UserProfile.get_all_permissions', return_value=set())
+    @patch('core.users.models.UserProfile.get_capability_usage', return_value=0)
+    def test_user_detail_does_not_compute_plan_for_other_users(self, usage_mock, permissions_mock):
+        user = UserProfileFactory(username='planusageuser')
+        other_user = UserProfileFactory(username='planusageother')
+        url = f'/users/{user.username}/?includeCapabilities=true'
+
+        response = self.client.get(url, HTTP_AUTHORIZATION='Token ' + other_user.get_token())
+
+        self.assertEqual(response.status_code, 200)
+        usage_mock.assert_not_called()
+        permissions_mock.assert_not_called()
+
+        response = self.client.get(url, HTTP_AUTHORIZATION='Token ' + user.get_token())
+
+        self.assertEqual(response.status_code, 200)
+        usage_mock.assert_called()
+        permissions_mock.assert_called()
+
+    def test_user_detail_get_object_anonymous_self_raises_404(self):
+        from django.contrib.auth.models import AnonymousUser
+        from core.users.views import UserDetailView
+        view = UserDetailView()
+        view.kwargs = {'user_is_self': True}
+        view.request = Mock(user=AnonymousUser())
+
+        with self.assertRaises(Http404):
+            view.get_object()
+
+    def test_user_detail_update_other_user_permission_denied(self):
+        UserProfileFactory(username='targetuser')
+        other_user = UserProfileFactory(username='otherrequestinguser')
+        other_token = other_user.get_token()
+
+        response = self.client.put(
+            '/users/targetuser/', {'company': 'new-company'},
+            HTTP_AUTHORIZATION='Token ' + other_token, format='json'
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    @patch('core.users.models.UserProfile.delete')
+    def test_user_detail_hard_delete_exception_returns_400(self, delete_mock):
+        delete_mock.side_effect = Exception('boom')
+        user = UserProfileFactory(username='harddeleteuser')
+
+        response = self.client.delete(
+            f'/users/{user.username}/?hardDelete=true', HTTP_AUTHORIZATION='Token ' + self.admin_token
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch('core.users.views.AuthService.is_sso_enabled')
+    def test_staff_toggle_sso_enabled_405(self, is_sso_enabled_mock):
+        is_sso_enabled_mock.return_value = True
+        user = UserProfileFactory(username='stafftoggleuser')
+
+        response = self.client.put(
+            f'/users/{user.username}/staff/', {}, HTTP_AUTHORIZATION='Token ' + self.admin_token, format='json'
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+    def test_follower_followed_get_object_self(self):
+        from core.users.views import AbstractFollowerFollowedView
+        user = UserProfileFactory(username='followerselfuser')
+        view = AbstractFollowerFollowedView()
+        view.user_is_self = True
+        view.kwargs = {}
+        view.request = Mock(user=user, method='GET')
+
+        self.assertEqual(view.get_object(), user)
+
+    def test_follower_followed_get_object_not_found_404(self):
+        user = UserProfileFactory(username='followingviewer')
+        token = user.get_token()
+
+        response = self.client.get(
+            '/users/doesnotexistuser/following/', HTTP_AUTHORIZATION='Token ' + token
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_following_post_invalid_follow_uri_400(self):
+        follower = UserProfileFactory(username='followerinvaliduri')
+        token = follower.get_token()
+
+        response = self.client.post(
+            f'/users/{follower.username}/following/', {'follow': '/orgs/NoOrg/sources/NoSource/'},
+            HTTP_AUTHORIZATION='Token ' + token, format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_following_post_inactive_follow_404(self):
+        follower = UserProfileFactory(username='followerinactive')
+        token = follower.get_token()
+        source = OrganizationSourceFactory(is_active=False)
+
+        response = self.client.post(
+            f'/users/{follower.username}/following/', {'follow': source.uri},
+            HTTP_AUTHORIZATION='Token ' + token, format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_following_post_self_follow_400(self):
+        follower = UserProfileFactory(username='followerselffollow')
+        token = follower.get_token()
+
+        response = self.client.post(
+            f'/users/{follower.username}/following/', {'follow': follower.uri},
+            HTTP_AUTHORIZATION='Token ' + token, format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+
+class RetirePublicEditMigrationTest(OCLTestCase):
+    def test_migration_moves_public_edit_users_to_view(self):
+        migration = importlib.import_module('core.users.migrations.0036_retire_public_edit_access')
+        editable = UserProfileFactory()
+        private = UserProfileFactory(public_access=ACCESS_TYPE_NONE)
+        UserProfile.objects.filter(id=editable.id).update(public_access=RETIRED_ACCESS_TYPE_EDIT)
+
+        migration.retire_public_edit_access(apps, None)
+
+        editable.refresh_from_db()
+        private.refresh_from_db()
+        self.assertEqual(editable.public_access, ACCESS_TYPE_VIEW)
+        self.assertEqual(private.public_access, ACCESS_TYPE_NONE)

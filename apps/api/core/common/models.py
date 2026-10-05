@@ -1,0 +1,1701 @@
+import logging
+import time
+
+from celery.result import AsyncResult
+from celery_once import AlreadyQueued
+from django.conf import settings
+from django.contrib.contenttypes.fields import GenericRelation
+from django.contrib.postgres.fields import ArrayField
+from django.core.cache import cache
+from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
+from django.db import models, IntegrityError, transaction
+from django.db.models import Value, Q, Count, Func
+from django.db.models.expressions import CombinedExpression, F
+from django.utils import timezone
+from django.utils.functional import cached_property
+from django.utils.text import get_valid_filename
+from django_elasticsearch_dsl.registries import registry
+from django_elasticsearch_dsl.signals import RealTimeSignalProcessor
+from elasticsearch import ApiError, TransportError
+from elasticsearch.helpers import BulkIndexError, parallel_bulk, streaming_bulk
+from pydash import get, compact
+
+from core.celery import app as celery_app
+from core.common.tasks import update_collection_active_concepts_count, update_collection_active_mappings_count, \
+    delete_s3_objects
+from core.common.utils import reverse_resource, reverse_resource_version, parse_updated_since_param, drop_version, \
+    to_parent_uri, is_canonical_uri, get_export_service, from_string_to_date, get_truthy_values, \
+    canonical_url_to_url_and_version, get_current_authorized_user, encode_string, decode_string, \
+    normalize_public_access
+from core.common.utils import to_owner_uri
+from core.common.constants import VERSION_UNCOPYABLE_EXTRAS
+from core.settings import DEFAULT_LOCALE
+from . import ERRBIT_LOGGER
+from .checksums import ChecksumModel
+from .constants import (
+    ACCESS_TYPE_CHOICES, DEFAULT_ACCESS_TYPE, NAMESPACE_REGEX,
+    ACCESS_TYPE_VIEW, SUPER_ADMIN_USER_ID,
+    HEAD, PERSIST_NEW_ERROR_MESSAGE, SOURCE_PARENT_CANNOT_BE_NONE, PARENT_RESOURCE_CANNOT_BE_NONE,
+    CREATOR_CANNOT_BE_NONE, CANNOT_DELETE_ONLY_VERSION, OPENMRS_VALIDATION_SCHEMA, VALIDATION_SCHEMAS,
+    DEFAULT_VALIDATION_SCHEMA, ES_REQUEST_TIMEOUT, UPDATED_BY_USERNAME_PARAM, ES_RETRYABLE_ERROR_TYPES)
+from .es import ESScript
+from .exceptions import Http400, BatchIndexingError
+from .fields import URIField
+from .mixins import SourceContainerMixin
+from .tasks import handle_save, handle_m2m_changed, seed_children_to_new_version, update_validation_schema, \
+    update_source_active_concepts_count, update_source_active_mappings_count
+from ..toggles.models import Toggle
+
+TRUTHY = get_truthy_values()
+
+logger = logging.getLogger('oclapi')
+
+
+class BatchIndexRun:
+    """
+    One batched ES indexing run (OpenConceptLab/ocl_online#241):
+    - every batch is attempted, even after an earlier one failed;
+    - every failed item of a batch is counted, whichever of its bulk request chunks it was in (see bulk());
+    - a bulk request ES rejects for now (429, rejected execution, circuit breaker, read-only index block) is retried
+      with exponential backoff. Once a batch is still rejected after all its retries, later batches get one attempt
+      each until ES takes one again, so a read-only index fails a run in minutes rather than hours;
+    - a failed batch is logged and sent to Errbit with the first item errors ES reported: id, status, type and
+      reason, never the document;
+    - finish() raises BatchIndexingError with the counts if any batch failed, so the task running it fails.
+    """
+    MAX_LOGGED_ERRORS = 5
+
+    def __init__(self, document):
+        self.document_name = getattr(document, '__name__', None) or str(document)
+        self.batches = 0
+        self.failed_batches = 0
+        self.docs = 0
+        self.failed_docs = 0
+        self.rejected_batches = 0
+        self.es_rejecting = False
+
+    @property
+    def summary(self):
+        return {
+            'batches': self.batches, 'failed_batches': self.failed_batches,
+            'docs': self.docs, 'failed_docs': self.failed_docs
+        }
+
+    @staticmethod
+    def get_error_details(error):
+        """id, status, type and reason of one BulkIndexError item -- never its document source ('data')."""
+        details = next(iter(error.values()), {}) if isinstance(error, dict) else {}
+        cause = details.get('error')
+        cause = cause if isinstance(cause, dict) else {'reason': cause}
+        reason = cause.get('reason')
+        return {
+            'id': details.get('_id'), 'status': details.get('status'),
+            'type': cause.get('type'), 'reason': None if reason is None else str(reason)[:500]
+        }
+
+    @classmethod
+    def is_rejected_error(cls, error):
+        """Whether ES refused this BulkIndexError item only for now (overloaded, or the index is read-only)."""
+        details = cls.get_error_details(error)
+        return details['status'] == 429 or details['type'] in ES_RETRYABLE_ERROR_TYPES
+
+    @classmethod
+    def is_rejected(cls, ex):
+        """Whether ES refused the write only for now (overloaded, or the index is read-only), so it's worth a retry."""
+        if isinstance(ex, BulkIndexError):
+            return any(map(cls.is_rejected_error, ex.errors))
+        if isinstance(ex, ApiError):
+            return ex.status_code == 429 or ex.error in ES_RETRYABLE_ERROR_TYPES
+        return isinstance(ex, BatchIndexingError) and ex.rejected
+
+    @staticmethod
+    def bulk(doc, actions, parallel=True, **kwargs):
+        """
+        Sends actions through the ES bulk helpers and, once every chunk has been sent, raises one BulkIndexError
+        with every failed item (in the helpers' {op_type: item} shape). Their own raise_on_error stops at the first
+        failed chunk -- parallel_bulk drops the other chunks' errors, streaming_bulk never sends the later chunks --
+        so a batch spanning chunks would be under-counted. Request-level errors (e.g. a 429 ApiError) still raise.
+        """
+        client = doc._get_connection()  # pylint: disable=protected-access
+        if parallel:
+            if doc.django.queryset_pagination and 'chunk_size' not in kwargs:
+                kwargs['chunk_size'] = doc.django.queryset_pagination  # as django_elasticsearch_dsl's parallel_bulk
+            results = parallel_bulk(client, actions, raise_on_error=False, **kwargs)
+        else:
+            results = streaming_bulk(client, actions, raise_on_error=False, **kwargs)
+        errors = [item for ok, item in results if not ok]
+        if errors:
+            raise BulkIndexError(f'{len(errors)} document(s) failed to index.', errors)
+
+    @classmethod
+    def describe(cls, ex, limit=MAX_LOGGED_ERRORS):
+        if isinstance(ex, BulkIndexError):
+            details = [cls.get_error_details(error) for error in ex.errors[:limit]]
+            return f'{len(ex.errors)} document(s) failed to index, first {len(details)}: {details}'
+        return f'{ex.__class__.__name__}: {str(ex)[:1000]}'
+
+    def retry_rejected(self, bulk_func):
+        """Returns bulk_func(), retrying it with exponential backoff while ES rejects it for now."""
+        attempts = 1 if self.es_rejecting else max(settings.ES_BULK_RETRY_MAX_ATTEMPTS, 1)
+        attempt = 1
+        while True:
+            try:
+                return bulk_func()
+            except (BulkIndexError, ApiError) as ex:
+                if attempt >= attempts or not self.is_rejected(ex):
+                    raise
+                wait = settings.ES_BULK_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)
+                attempt += 1
+                logger.warning(
+                    '%s bulk request rejected by Elasticsearch (%s), retrying in %ss (attempt %s of %s)',
+                    self.document_name, self.describe(ex, 1), wait, attempt, attempts
+                )
+                time.sleep(wait)
+
+    def attempt(self, start, batch, index_func):
+        """Runs index_func(batch). A failure is logged and counted, not raised, so it can't stop the next batches."""
+        self.batches += 1
+        self.docs += len(batch)
+        try:
+            index_func(batch)
+            self.es_rejecting = False
+        except Exception as ex:  # pylint: disable=broad-except
+            self.es_rejecting = self.is_rejected(ex)
+            if self.es_rejecting:
+                self.rejected_batches += 1
+            self.failed_batches += 1
+            if isinstance(ex, BulkIndexError):
+                failed_docs = len(ex.errors)
+            elif isinstance(ex, BatchIndexingError) and ex.summary:
+                failed_docs = ex.summary['failed_docs']
+            else:
+                failed_docs = len(batch)
+            self.failed_docs += failed_docs
+            message = (f'{self.document_name} batch (start={start}, size={len(batch)}) failed to index '
+                       f'{failed_docs} document(s): {self.describe(ex)}')
+            logger.error(message)
+            ERRBIT_LOGGER.log(BatchIndexingError(message))
+
+    def finish(self):
+        """Returns the run's summary, or raises BatchIndexingError with it if any batch failed."""
+        if self.failed_batches:
+            message = (f'{self.document_name} indexing failed: {self.failed_batches} of {self.batches} batch(es) '
+                       f'and {self.failed_docs} of {self.docs} document(s) failed to index')
+            if self.rejected_batches:
+                message += f', {self.rejected_batches} batch(es) still rejected by Elasticsearch after retries'
+            raise BatchIndexingError(message, self.summary, bool(self.rejected_batches))
+        return self.summary
+
+
+class BaseModel(models.Model):
+    """
+    Base model from which all resources inherit.
+    Contains timestamps and is_active field for logical deletion.
+    """
+    class Meta:
+        abstract = True
+        indexes = [
+            models.Index(fields=['-updated_at']),
+            models.Index(fields=['-created_at']),
+            models.Index(fields=['is_active']),
+        ]
+
+    # what a retired 'Edit' is stored as
+    public_access_for_retired_edit = ACCESS_TYPE_VIEW
+
+    id = models.BigAutoField(primary_key=True)
+    public_access = models.CharField(
+        max_length=16, choices=ACCESS_TYPE_CHOICES, default=DEFAULT_ACCESS_TYPE, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        'users.UserProfile',
+        related_name='%(app_label)s_%(class)s_related_created_by',
+        related_query_name='%(app_label)s_%(class)ss_created_by',
+        on_delete=models.DO_NOTHING,
+        default=SUPER_ADMIN_USER_ID,
+    )
+    updated_by = models.ForeignKey(
+        'users.UserProfile',
+        related_name='%(app_label)s_%(class)s_related_updated_by',
+        related_query_name='%(app_label)s_%(class)ss_updated_by',
+        on_delete=models.DO_NOTHING,
+        default=SUPER_ADMIN_USER_ID,
+    )
+    is_active = models.BooleanField(default=True)
+    extras = models.JSONField(null=True, blank=True, default=dict)
+    uri = models.TextField(null=True, blank=True)
+    _index = True
+
+    @property
+    def events(self):
+        from core.events.models import Event
+        return Event.get_two_way_events_for(self.uri)
+
+    def update_extras(self, key, value):
+        self.extras = self.extras or {}
+        self.extras[key] = value
+        try:
+            self.save(update_fields=['extras'])
+        except:  # pylint: disable=bare-except
+            pass
+
+    @property
+    def model_name(self):
+        return self.__class__.__name__
+
+    @property
+    def app_name(self):
+        return self.__module__.split('.')[1]
+
+    def index(self):
+        if not get(settings, 'TEST_MODE', False):
+            handle_save.apply_async((self.app_name, self.model_name, self.id), queue='indexing', permanent=False)
+
+    @property
+    def should_index(self):
+        if getattr(self, '_index', None) is not None:
+            return self._index
+        return True
+
+    def soft_delete(self):
+        if self.is_active:
+            self.is_active = False
+            self.save()
+
+    def undelete(self):
+        if not self.is_active:
+            self.is_active = True
+            self.save()
+
+    @staticmethod
+    def get_encoded_str_variations(value):
+        return [
+            value, encode_string(value, safe=' '), encode_string(value, safe='+'),
+            encode_string(value, safe='+%'), encode_string(value, safe='% +'),
+            decode_string(value), decode_string(value, False)
+        ]
+    def clean_fields(self, exclude=None):
+        self.public_access = normalize_public_access(self.public_access, self.public_access_for_retired_edit)
+        super().clean_fields(exclude=exclude)
+
+    def save(self, *args, force_insert=False, force_update=False, using=None, update_fields=None):
+        self.public_access = normalize_public_access(self.public_access, self.public_access_for_retired_edit)
+        super().save(
+            *args, force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields)
+
+    @property
+    def is_versioned(self):
+        return False
+
+    @property
+    def public_can_view(self):
+        return normalize_public_access(self.public_access).lower() == ACCESS_TYPE_VIEW.lower()
+
+    @property
+    def resource_type(self):
+        return get(self, 'OBJECT_TYPE')
+
+    @property
+    def resource_version_type(self):
+        return get(self, 'OBJECT_VERSION_TYPE') or self.resource_type
+
+    @property
+    def url(self):
+        if self.uri:
+            return self.uri
+
+        return self.calculate_uri()
+
+    def calculate_uri(self):
+        if self.is_versioned and not self.is_head:
+            uri = reverse_resource_version(self, self.view_name)
+        else:
+            uri = reverse_resource(self, self.view_name)
+
+        return uri
+
+    @property
+    def view_name(self):
+        return self.get_default_view_name()
+
+    def get_default_view_name(self):
+        entity_name = self.__class__.__name__.lower()
+
+        if self.is_versioned and not self.is_head:
+            return f"{entity_name}-version-detail"
+
+        return f"{entity_name}-detail"
+
+    @classmethod
+    def pause_indexing(cls):
+        cls.toggle_indexing(False)
+
+    @classmethod
+    def resume_indexing(cls):
+        if not get(settings, 'TEST_MODE', False):
+            cls.toggle_indexing(True)   # pragma: no cover
+
+    @staticmethod
+    def toggle_indexing(state=True):
+        settings.ELASTICSEARCH_DSL_AUTO_REFRESH = state
+        settings.ELASTICSEARCH_DSL_AUTOSYNC = state
+        settings.ES_SYNC = state
+
+    @staticmethod
+    def get_exact_or_criteria(attr, values, decode=False):
+        criteria = Q()
+
+        if isinstance(values, str):
+            values = values.split(',')
+
+        for value in values:
+            criteria = criteria | Q(**{f'{attr}': decode_string(value) if decode else value})
+
+        return criteria
+
+    @staticmethod
+    def batch_index(    # pylint: disable=too-many-arguments
+            queryset, document, single_batch=False, prefetch=None, select_related=None, partial_doc=None, parallel=True,
+            refresh=None
+    ):
+        if partial_doc:
+            version = partial_doc.get('_append_source_version')
+            if version:
+                return BaseModel.batch_index_source_version_append(
+                    queryset, document, version, partial_doc.get('is_in_latest_source_version'),
+                    single_batch, bool(parallel)
+                )
+            return BaseModel.batch_index_partial(queryset, document, single_batch, partial_doc, bool(parallel))
+        return BaseModel.batch_index_full(
+            single_batch, queryset, document, prefetch, select_related, bool(parallel), refresh)
+
+    @staticmethod
+    def batch_index_source_version_append(  # pylint: disable=too-many-arguments
+            queryset, document, version, is_in_latest_source_version=None, single_batch=False, parallel=True
+    ):
+        """
+        Partial-update: append `version` to each resource's `source_version` list (and optionally
+        set `is_in_latest_source_version`), without recomputing the rest of the document. Falls
+        back to a full re-index for any docs not yet present in ES.
+        """
+        if get(settings, 'TEST_MODE', False):
+            return None
+
+        index_name = document()._index._name  # pylint: disable=protected-access
+        params = {'version': version}
+        if is_in_latest_source_version is not None:
+            params['is_in_latest_source_version'] = is_in_latest_source_version
+
+        def get_actions(batch_ids):
+            for rid in batch_ids:
+                yield {
+                    '_op_type': 'update',
+                    '_index': index_name,
+                    '_id': rid,
+                    'retry_on_conflict': 3,
+                    'script': {'source': ESScript.APPEND_SOURCE_VERSION_SCRIPT, 'params': params},
+                }
+
+        return BaseModel.batch_index_partial_by_ids(
+            queryset, document, get_actions, single_batch, parallel,
+            on_bulk_error=lambda err: BaseModel.full_index_missing_docs_or_raise(err, queryset, document)
+        )
+
+    @staticmethod
+    def batch_index_full(  # pylint: disable=too-many-arguments
+            single_batch: bool, queryset, document, prefetch, select_related, parallel=True, refresh=None):
+        """
+        Full (re)index, 500 docs a batch (single_batch: all in one). Every batch is attempted; if any failed, raises
+        BatchIndexingError with the counts once they all have (see BatchIndexRun). Returns the run's summary.
+        refresh=False doesn't make ES refresh after each batch (the document's auto_refresh does by default).
+        """
+        if get(settings, 'TEST_MODE', False):
+            return None
+
+        doc = document()
+
+        if prefetch:
+            queryset = queryset.prefetch_related(*prefetch)
+        if select_related:
+            queryset = queryset.select_related(*select_related)
+
+        kwargs = {}
+        refresh = doc.django.auto_refresh if refresh is None else refresh
+        if refresh:  # as django_elasticsearch_dsl's Document.update
+            kwargs['refresh'] = refresh
+        run = BatchIndexRun(document)
+
+        def index_batch(objects):
+            run.retry_rejected(lambda: BatchIndexRun.bulk(
+                doc, doc._get_actions(objects, 'index'), parallel, **kwargs))  # pylint: disable=protected-access
+
+        if single_batch:
+            run.attempt(0, list(queryset.all()), index_batch)
+        else:
+            batch_size = 500
+            start = 0
+            while True:
+                batch = list(queryset.order_by('-id')[start:start+batch_size])
+                if not batch:
+                    break
+                run.attempt(start, batch, index_batch)
+                start += batch_size
+
+        return run.finish()
+
+    @staticmethod
+    def batch_index_partial_by_ids(  # pylint: disable=too-many-arguments
+            queryset, document, get_actions, single_batch=False, parallel=True, on_bulk_error=None, refresh=None
+    ):
+        """
+        Shared batching loop. get_actions(batch_ids) must yield ES action dicts.
+
+        A BulkIndexError still left after BatchIndexRun's retries goes to `on_bulk_error` (default:
+        full_index_missing_docs_or_raise). Every batch is attempted; if any failed, raises BatchIndexingError
+        with the counts once they all have. Returns the run's summary. refresh as in batch_index_full.
+        """
+        if get(settings, 'TEST_MODE', False):
+            return None
+
+        doc = document()
+        kwargs = {}
+        refresh = doc.django.auto_refresh if refresh is None else refresh
+        if refresh:
+            kwargs['refresh'] = refresh
+        run = BatchIndexRun(document)
+
+        def index_batch(ids):
+            try:
+                run.retry_rejected(lambda: BatchIndexRun.bulk(doc, get_actions(ids), parallel, **kwargs))
+            except BulkIndexError as err:
+                if on_bulk_error is None:
+                    BaseModel.full_index_missing_docs_or_raise(err, queryset, document)
+                else:
+                    on_bulk_error(err)
+
+        if single_batch:
+            run.attempt(0, list(queryset.all().values_list('id', flat=True)), index_batch)
+        else:
+            batch_size = 500
+            start = 0
+            id_qs = queryset.order_by('-id').values_list('id', flat=True)
+            while True:
+                batch = list(id_qs[start:start + batch_size])
+                if not batch:
+                    break
+                run.attempt(start, batch, index_batch)
+                start += batch_size
+
+        return run.finish()
+
+    @staticmethod
+    def full_index_missing_docs_or_raise(err, queryset, document, prefetch=None, select_related=None):
+        """
+        Handles a BulkIndexError from a single scripted/partial-update batch: full-indexes the docs that were
+        missing (404) from ES so they get created with every field, then re-raises for any non-404 (genuine)
+        failures. If that full index failed too, raises one BatchIndexingError counting the genuine failures plus
+        the missing docs still failing, and keeping whether ES rejected it. If ES rejected some of the batch for now
+        (429 / read-only), the missing docs aren't full-indexed (that would be rejected too) but re-raised.
+        """
+        missing = [e for e in err.errors if e.get('update', {}).get('status') == 404]
+        real_errors = [e for e in err.errors if e.get('update', {}).get('status') != 404]
+        if missing and not any(map(BatchIndexRun.is_rejected_error, real_errors)):
+            try:
+                # Docs not yet in ES -- full index so they appear with all fields
+                BaseModel.batch_index_full(
+                    single_batch=False, queryset=queryset.filter(id__in={e['update']['_id'] for e in missing}),
+                    document=document, prefetch=prefetch or [], select_related=select_related or []
+                )
+                missing = []
+            except BatchIndexingError as ex:
+                if not real_errors:
+                    raise
+                real_error = BulkIndexError(f'{len(real_errors)} document(s) failed to index.', real_errors)
+                raise BatchIndexingError(
+                    f'{BatchIndexRun.describe(real_error)}; full-indexing the {len(missing)} missing document(s) '
+                    f'failed too: {ex}',
+                    {'failed_docs': len(real_errors) + get(ex, 'summary.failed_docs', len(missing))}, ex.rejected
+                ) from err
+        if real_errors:
+            errors = real_errors + missing
+            raise BulkIndexError(f'{len(errors)} document(s) failed to index.', errors) from err
+
+    @staticmethod
+    def batch_index_partial(queryset, document, single_batch, partial_doc, parallel=True):
+        index_name = document()._index._name  # pylint: disable=protected-access
+
+        def get_actions(ids):
+            for object_id in ids:
+                yield {
+                    '_op_type': 'update',
+                    '_index': index_name,
+                    '_id': object_id,
+                    'doc': partial_doc,
+                    'doc_as_upsert': True,
+                }
+
+        return BaseModel.batch_index_partial_by_ids(queryset, document, get_actions, single_batch, parallel)
+
+    @staticmethod
+    @transaction.atomic
+    def batch_delete(queryset):
+        for obj in queryset.filter():
+            obj.delete()
+
+    def record_create_event(self):
+        from core.events.models import Event
+        self.record_event(Event.CREATED)
+
+    def record_event(self, event_type):
+        from core.events.models import Event
+        Event.record(self, event_type)
+
+    def record_joined_ocl_event(self):
+        from core.events.models import Event
+        self.record_event(Event.JOINED)
+
+    def __repr__(self):
+        parts = []
+        current = self
+        while current is not None:
+            if current.is_versioned and not current.is_head:
+                parts.append(f"{current.resource_version_type}:{current.mnemonic}:{current.version}")
+            else:
+                parts.append(f"{current.resource_type}:{current.mnemonic}")
+            current = get(current, 'parent')
+
+        return "/".join(reversed(parts))
+
+
+class CommonLogoModel(models.Model):
+    logo_path = models.TextField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+    @property
+    def logo_url(self):
+        url = None
+        if self.logo_path:
+            url = get_export_service().public_url_for(self.logo_path)
+
+        return url
+
+    def upload_base64_logo(self, data, name):
+        name = self.uri[1:] + name
+        self.logo_path = get_export_service().upload_base64(data, name, False, True)
+        self.save()
+
+
+class BaseResourceModel(BaseModel, CommonLogoModel):
+    """
+    A base resource has a mnemonic that is unique across all objects of its type.
+    A base resource may contain sub-resources.
+    (An Organization is a base resource, but a Concept is not.)
+    """
+    mnemonic = models.CharField(max_length=255, validators=[RegexValidator(regex=NAMESPACE_REGEX)],)
+    mnemonic_attr = 'mnemonic'
+
+    class Meta:
+        abstract = True
+        indexes = [
+            models.Index(fields=['mnemonic']),
+        ] + BaseModel.Meta.indexes
+
+    def __str__(self):
+        return str(self.mnemonic)
+
+
+class VersionedModel(BaseResourceModel):
+    version = models.CharField(max_length=255)
+    released = models.BooleanField(default=False, blank=True, null=True)
+    retired = models.BooleanField(default=False)
+    is_latest_version = models.BooleanField(default=True)
+    name = models.TextField()
+    full_name = models.TextField(null=True, blank=True)
+    default_locale = models.TextField(default=DEFAULT_LOCALE, blank=True)
+    supported_locales = ArrayField(models.CharField(max_length=20), null=True, blank=True)
+    website = models.TextField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    external_id = models.TextField(null=True, blank=True)
+    custom_validation_schema = models.TextField(blank=True, null=True)
+
+    class Meta:
+        abstract = True
+        indexes = [
+            models.Index(fields=['retired']),
+        ] + BaseResourceModel.Meta.indexes
+
+    @property
+    def is_versioned(self):
+        return True
+
+    @property
+    def versioned_resource_type(self):
+        return self.resource_type
+
+    @property
+    def versions(self):
+        return self.__class__.objects.filter(**{self.mnemonic_attr: self.mnemonic}).order_by('-created_at')
+
+    @property
+    def active_versions(self):
+        return self.versions.filter(is_active=True)
+
+    @property
+    def released_versions(self):
+        return self.active_versions.filter(released=True)
+
+    @property
+    def num_versions(self):
+        return self.versions.count()
+
+    @property
+    def released_versions_count(self):
+        return self.versions.filter(released=True).count()
+
+    @property
+    def sibling_versions(self):
+        return self.versions.exclude(id=self.id)
+
+    @property
+    def prev_version(self):
+        return self.sibling_versions.filter(
+            is_active=True, created_at__lte=self.created_at
+        ).order_by('-created_at').first()
+
+    @property
+    def prev_version_uri(self):
+        return get(self, 'prev_version.uri')
+
+    @property
+    def is_head(self):
+        return self.version == HEAD
+
+    def get_head(self):
+        return self if self.is_head else self.active_versions.filter(version=HEAD).first()
+
+    head = property(get_head)
+
+    @property
+    def versioned_object_url(self):
+        return drop_version(self.uri)
+
+    @classmethod
+    def get_version(cls, mnemonic, version=HEAD, filters=None):
+        if not filters:
+            filters = {}
+        return cls.objects.filter(**{cls.mnemonic_attr: mnemonic, **filters}, version=version).first()
+
+    def get_latest_version(self):
+        return self.active_versions.filter(is_latest_version=True).order_by('-created_at').first()
+
+    def get_last_version(self):
+        return self.active_versions.order_by('-created_at').first()
+
+    def get_latest_released_version(self):
+        return self.released_versions.order_by('-created_at').first()
+
+    def get_prev_released_version(self):
+        return self.released_versions.exclude(id=self.id).order_by('-created_at').first()
+
+    @property
+    def is_latest_released(self):
+        return self.released and self.id == self.get_latest_released_version().id
+
+    @classmethod
+    def find_latest_released_version_by(cls, filters):
+        return cls.objects.filter(**filters, released=True).order_by('-created_at').first()
+
+    def get_url_kwarg(self):
+        if self.is_head:
+            return self.get_resource_url_kwarg()
+        return self.get_version_url_kwarg()
+
+    @property
+    def versions_url(self):
+        return drop_version(self.uri) + 'versions/'
+
+
+class ConceptContainerModel(VersionedModel, ChecksumModel):
+    """
+    A sub-resource is an object that exists within the scope of its parent resource.
+    Its mnemonic is unique within the scope of its parent resource.
+    (A Source is a sub-resource, but an Organization is not.)
+    """
+    organization = models.ForeignKey('orgs.Organization', on_delete=models.CASCADE, blank=True, null=True)
+    user = models.ForeignKey('users.UserProfile', on_delete=models.CASCADE, blank=True, null=True)
+    _background_process_ids = ArrayField(models.CharField(max_length=255), default=list, null=True, blank=True)
+
+    canonical_url = URIField(null=True, blank=True)
+    identifier = models.JSONField(null=True, blank=True, default=dict)
+    contact = models.JSONField(null=True, blank=True, default=dict)
+    jurisdiction = models.JSONField(null=True, blank=True, default=dict)
+    publisher = models.TextField(null=True, blank=True)
+    purpose = models.TextField(null=True, blank=True)
+    copyright = models.TextField(null=True, blank=True)
+    revision_date = models.DateTimeField(null=True, blank=True)
+    text = models.TextField(null=True, blank=True)  # for about description (markup)
+    snapshot = models.JSONField(null=True, blank=True, default=dict)
+    experimental = models.BooleanField(null=True, blank=True, default=None)
+    meta = models.JSONField(null=True, blank=True)
+    active_concepts = models.IntegerField(null=True, blank=True, default=None)
+    active_mappings = models.IntegerField(null=True, blank=True, default=None)
+    custom_validation_schema = models.CharField(
+        choices=VALIDATION_SCHEMAS, default=DEFAULT_VALIDATION_SCHEMA, max_length=100
+    )
+    client_configs = GenericRelation(
+        'client_configs.ClientConfig', object_id_field='resource_id', content_type_field='resource_type'
+    )
+    url_registry_entries = GenericRelation(
+        'url_registry.URLRegistry', object_id_field='repo_id', content_type_field='repo_type'
+    )
+    followers = GenericRelation('users.Follow', object_id_field='following_id', content_type_field='following_type')
+    external_exports = GenericRelation(
+        'repos.RepoExternalExport', object_id_field='resource_id', content_type_field='resource_type'
+    )
+
+    class Meta:
+        abstract = True
+        indexes = [
+                      models.Index(fields=['version'])
+                  ] + VersionedModel.Meta.indexes
+
+    @property
+    def is_collection(self):
+        from core.collections.models import Collection
+        return self.resource_type == Collection.OBJECT_TYPE
+
+    @property
+    def should_set_active_concepts(self):
+        return self.active_concepts is None
+
+    @property
+    def should_set_active_mappings(self):
+        return self.active_mappings is None
+
+    @property
+    def is_openmrs_schema(self):
+        return self.custom_validation_schema == OPENMRS_VALIDATION_SCHEMA
+
+    def update_children_counts(self, sync=False):
+        self.update_concepts_count(sync)
+        self.update_mappings_count(sync)
+
+    def update_mappings_count(self, sync=False):
+        task = None
+        job = None
+        try:
+            if sync or get(settings, 'TEST_MODE'):
+                self.set_active_mappings()
+                self.save(update_fields=['active_mappings'])
+            elif self.__class__.__name__ == 'Source':
+                job = update_source_active_mappings_count
+            elif self.__class__.__name__ == 'Collection':
+                job = update_collection_active_mappings_count
+            if job:
+                from core.tasks.models import Task
+                task = Task.new(
+                    name=job.__name__, queue='concurrent', user=(get_current_authorized_user() or self.updated_by)
+                )
+                job.apply_async((self.id,), task_id=task.id, queue='concurrent')
+        except AlreadyQueued:
+            if task:
+                task.delete()
+
+    def update_concepts_count(self, sync=False):
+        task = None
+        job = None
+        try:
+            if sync or get(settings, 'TEST_MODE'):
+                self.set_active_concepts()
+                self.save(update_fields=['active_concepts'])
+            elif self.__class__.__name__ == 'Source':
+                job = update_source_active_concepts_count
+            elif self.__class__.__name__ == 'Collection':
+                job = update_collection_active_concepts_count
+            if job:
+                from core.tasks.models import Task
+                task = Task.new(
+                    name=job.__name__, queue='concurrent', user=(get_current_authorized_user() or self.updated_by)
+                )
+                job.apply_async((self.id,), task_id=task.id, queue='concurrent')
+        except AlreadyQueued:
+            if task:
+                task.delete()
+
+    @property
+    def last_child_update(self):
+        last_concept_update = self.last_concept_update
+        last_mapping_update = self.last_mapping_update
+        if last_concept_update and last_mapping_update:
+            return max(last_concept_update, last_mapping_update)
+        return last_concept_update or last_mapping_update or self.updated_at or timezone.now()
+
+    def get_last_child_update_from_export_url(self, export_url):
+        generic_path = self.get_version_export_path(suffix=None)
+        try:
+            last_child_updated_at = export_url.split(generic_path)[1].split('?')[0].replace('.zip', '')
+            return from_string_to_date(last_child_updated_at.replace('_', ' ')).isoformat()
+        except:  # pylint: disable=bare-except
+            return None
+
+    @classmethod
+    def get_base_queryset(cls, params):
+        username = params.get('user', None)
+        org = params.get('org', None)
+        version = params.get('version', None)
+        is_latest = params.get('is_latest', None) in TRUTHY
+        updated_since = parse_updated_since_param(params)
+        updated_by = params.get(UPDATED_BY_USERNAME_PARAM, None)
+
+        queryset = cls.objects.filter(is_active=True)
+        if username:
+            queryset = queryset.filter(cls.get_exact_or_criteria('user__username', username))
+        if org:
+            queryset = queryset.filter(cls.get_exact_or_criteria('organization__mnemonic', org))
+        if version:
+            queryset = queryset.filter(cls.get_exact_or_criteria('version', version, True))
+        if is_latest:
+            queryset = queryset.filter(is_latest_version=True)
+        if updated_since:
+            queryset = queryset.filter(updated_at__gte=updated_since)
+        if updated_by:
+            queryset = queryset.filter(updated_by__username=updated_by)
+
+        return queryset
+
+    @property
+    def concepts_url(self):
+        return reverse_resource(self, 'concept-list')
+
+    @property
+    def mappings_url(self):
+        return reverse_resource(self, 'mapping-list')
+
+    @property
+    def parent(self):
+        return self.organization if self.organization_id else self.user
+
+    @property
+    def parent_id(self):
+        return self.organization_id or self.user_id
+
+    @property
+    def parent_url(self):
+        return to_owner_uri(self.uri)
+
+    @property
+    def parent_resource(self):
+        return get(self, 'parent.mnemonic')
+
+    @property
+    def parent_resource_type(self):
+        return get(self, 'parent.resource_type')
+
+    @property
+    def versions(self):
+        return super().versions.filter(
+            organization_id=self.organization_id, user_id=self.user_id
+        ).order_by('-created_at')
+
+    def delete(self, using=None, keep_parents=False, force=False, sync=False):  # pylint: disable=arguments-differ
+        export_paths = self.get_export_paths_to_delete()
+        deleted_urls = [self.url]
+        if self.is_head:
+            other_versions = list(self.versions.exclude(id=self.id))
+            for other_version in other_versions:
+                other_version.clear_cache()
+                export_paths += other_version.get_export_paths_to_delete()
+                deleted_urls.append(other_version.url)
+            self.versions.exclude(id=self.id).delete()
+        elif self.is_latest_version:
+            prev_version = self.prev_version
+            if not force and not prev_version:
+                raise ValidationError({'detail': CANNOT_DELETE_ONLY_VERSION})
+            if prev_version:
+                prev_version.is_latest_version = True
+                prev_version.save()
+
+        self.delete_pins()
+        self.delete_following()
+        self.delete_version_changelogs(deleted_urls)
+        self.delete_version_checksum_maps(deleted_urls)
+
+        super().delete(using=using, keep_parents=keep_parents)
+        self.delete_export_paths(export_paths, sync)
+        self.post_delete_actions()
+
+    @staticmethod
+    def delete_version_changelogs(urls):
+        from core.repos.models import VersionChangelog
+        VersionChangelog.objects.filter(Q(version1_url__in=urls) | Q(version2_url__in=urls)).delete()
+
+    @staticmethod
+    def delete_version_checksum_maps(urls):
+        from core.repos.models import VersionChecksumMap
+        VersionChecksumMap.objects.filter(version_url__in=urls).delete()
+
+    def get_export_paths_to_delete(self):
+        return [self.get_version_export_path(suffix=None)] + list(
+            self.external_exports.values_list('file_path', flat=True))
+
+    @staticmethod
+    def delete_export_paths(export_paths, sync=False):
+        for export_path in export_paths:
+            if sync:
+                delete_s3_objects(export_path)
+            else:
+                delete_s3_objects.apply_async((export_path,), queue='default', permanent=False)
+
+    def get_concepts_cache_keys(self):
+        return self.__get_resources_cache_keys('concepts')
+
+    def get_mappings_cache_keys(self):
+        return self.__get_resources_cache_keys('mappings')
+
+    def __get_resources_cache_keys(self, resources):
+        return f'repo_cache:body:{self.uri}{resources}/', f'repo_cache:headers:{self.uri}{resources}/'
+
+    def post_delete_actions(self):
+        return self.clear_cache()
+
+    def clear_cache(self):
+        concepts_cleared = self.clear_concepts_cache()
+        mappings_cleared = self.clear_mappings_cache()
+        return concepts_cleared, mappings_cleared
+
+    def clear_concepts_cache(self):
+        return self.__clear_resource_cache(*self.get_concepts_cache_keys())
+
+    def clear_mappings_cache(self):
+        return self.__clear_resource_cache(*self.get_mappings_cache_keys())
+
+    @staticmethod
+    def __clear_resource_cache(body_key, headers_key):
+        try:
+            return cache.delete_pattern(f'{body_key}*') + cache.delete_pattern(f'{headers_key}*')
+        except:  # pylint: disable=bare-except
+            return False
+
+    def delete_pins(self):
+        if self.is_head:
+            from core.pins.models import Pin
+            Pin.objects.filter(resource_type__model=self.resource_type.lower(), resource_id=self.id).delete()
+
+    def delete_following(self):
+        if self.is_head:
+            from core.users.models import Follow
+            Follow.objects.filter(following_type__model=self.resource_type.lower(), following_id=self.id).delete()
+
+    def get_active_concepts(self):
+        return self.get_concepts_queryset().filter(is_active=True, retired=False)
+
+    def get_active_mappings(self):
+        return self.get_mappings_queryset().filter(is_active=True, retired=False)
+
+    active_concepts_queryset = property(get_active_concepts)
+    active_mappings_queryset = property(get_active_mappings)
+
+    def has_parent_edit_access(self, user):
+        if user.is_staff:
+            return True
+
+        if self.organization_id:
+            return self.parent.is_member(user)
+
+        return self.user_id == user.id
+
+    def has_edit_access(self, user):
+        return self.has_parent_edit_access(user)
+
+    def has_view_access(self, user):
+        if self.public_can_view:
+            return True
+
+        return bool(user and user.is_authenticated and self.has_parent_edit_access(user))
+
+    @staticmethod
+    def get_version_url_kwarg():
+        return 'version'
+
+    def set_parent(self, parent_resource):
+        parent_resource_type = parent_resource.resource_type
+
+        if parent_resource_type == 'Organization':
+            self.organization = parent_resource
+        elif parent_resource_type in ['UserProfile', 'User']:
+            self.user = parent_resource
+
+    @staticmethod
+    def cascade_children_to_expansion(**kwargs):
+        pass
+
+    def update_mappings(self):
+        pass
+
+    def seed_references(self):
+        pass
+
+    @property
+    def should_auto_expand(self):
+        return True
+
+    @property
+    def identity_uris(self):
+        return compact([self.uri, self.canonical_url])
+
+    @classmethod
+    def persist_new(cls, obj, created_by, **kwargs):
+        errors = {}
+        parent_resource = kwargs.pop('parent_resource', None) or obj.parent
+        if not parent_resource:
+            errors['parent'] = PARENT_RESOURCE_CANNOT_BE_NONE
+            return errors
+        obj.set_parent(parent_resource)
+        user = created_by
+        if not user:
+            errors['created_by'] = CREATOR_CANNOT_BE_NONE
+        if errors:
+            return errors
+
+        obj.created_by = user
+        obj.updated_by = user
+        try:
+            obj.full_clean()
+        except ValidationError as ex:
+            errors.update(get(ex, 'message_dict', {}) or get(ex, 'error_dict', {}))
+        if errors:
+            return errors
+
+        persisted = False
+        obj.version = HEAD
+        try:
+            obj.save(**kwargs)
+            if obj.id:
+                obj.post_create_actions()
+            persisted = True
+        except IntegrityError as ex:
+            errors.update({'__all__': ex.args})
+        finally:
+            if not persisted:
+                errors['non_field_errors'] = PERSIST_NEW_ERROR_MESSAGE.format(cls.__name__)
+        return errors
+
+    @classmethod
+    def persist_new_version(cls, obj, user=None, **kwargs):
+        """Persist a repository version and schedule its children snapshot."""
+        errors = {}
+
+        obj.is_active = True
+        sync = kwargs.pop('sync', False)
+        if user:
+            obj.created_by = user
+            obj.updated_by = user
+        repo_resource_name = obj.__class__.__name__
+        head = obj.head
+        if not head:
+            errors[repo_resource_name.lower()] = 'Version Head not found.'
+            return errors
+
+        is_test_mode = get(settings, 'TEST_MODE', False)
+        with transaction.atomic():
+            # Serialize version creation with destructive child operations on the HEAD repository.
+            head = cls.objects.select_for_update().get(id=head.id)
+            obj.update_version_data(head)
+            obj.save(**kwargs)
+
+            if obj.id:
+                obj.sibling_versions.update(is_latest_version=False)
+
+            task_args = (obj.resource_type.lower(), obj.id, not is_test_mode, sync)
+            if is_test_mode or sync:
+                seed_children_to_new_version(*task_args)
+            else:
+                from core.tasks.models import Task
+                task = Task.new(
+                    queue='default',
+                    user=user,
+                    name=seed_children_to_new_version.__name__,
+                    args=task_args,
+                )
+
+                # Mark the version as processing before the response goes out
+                obj.add_processing(task.id)
+
+                def enqueue_seed_task():
+                    """Queue snapshot seeding only after its repository version is committed."""
+                    seed_children_to_new_version.apply_async(
+                        task_args,
+                        task_id=task.id,
+                        queue='default',
+                        persist_args=True
+                    )
+
+                transaction.on_commit(enqueue_seed_task)
+
+        return errors
+
+    def index_resources_for_self_as_latest_released(self, only_update=False):  # pylint: disable=unused-argument
+        pass
+
+    @classmethod
+    def persist_changes(cls, obj, updated_by, original_schema, **kwargs):  # pylint: disable=too-many-locals
+        errors = {}
+        parent_resource = kwargs.pop('parent_resource', obj.parent)
+        if not parent_resource:
+            errors['parent'] = SOURCE_PARENT_CANNOT_BE_NONE
+
+        queue_schema_update_task = obj.is_validation_necessary()
+        original_repo = cls.objects.filter(id=obj.id).first()
+
+        is_source = cls.__name__ == 'Source'
+        should_reindex_resources = is_source and obj.released != original_repo.released
+        concepts_reindex_filters = obj.get_concepts_reindex_filters(original_repo) if is_source else None
+
+        obj._should_update_public_access = is_source and obj.public_access != original_repo.public_access  # pylint: disable=protected-access
+        obj._should_update_is_active = is_source and obj.is_active != original_repo.is_active  # pylint: disable=protected-access
+
+        try:
+            obj.full_clean()
+        except ValidationError as ex:
+            errors.update(get(ex, 'message_dict', {}) or get(ex, 'error_dict', {}))
+
+        if errors:
+            return errors
+
+        if updated_by:
+            obj.updated_by = updated_by
+        try:
+            if queue_schema_update_task:
+                target_schema = obj.custom_validation_schema
+                obj.custom_validation_schema = original_schema
+
+            obj.save(**kwargs)
+
+            if queue_schema_update_task:
+                from core.tasks.models import Task
+                task = Task.new(queue='default', user=updated_by, name=update_validation_schema.__name__)
+                update_validation_schema.apply_async(
+                    (obj.app_name, obj.id, target_schema), task_id=task.id, queue='default')
+            if should_reindex_resources:
+                if obj.released:
+                    obj.index_resources_for_self_as_latest_released(only_update=True)
+                else:
+                    obj.index_resources_for_self_as_unreleased()
+            elif concepts_reindex_filters is not None:
+                obj.index_concepts_async(obj.updated_by, **concepts_reindex_filters)
+
+        except IntegrityError as ex:
+            errors.update({'__all__': ex.args})
+        except AlreadyQueued as ex:
+            errors.update({'__all__': 'Already Queued'})
+
+        return errors
+
+    def validate_child_concepts(self):
+        # If source is being configured to have a validation schema
+        # we need to validate all concepts
+        # according to the new schema
+        from core.concepts.validators import ValidatorSpecifier
+
+        concepts = self.get_active_concepts()
+        failed_concept_validations = []
+
+        validator = ValidatorSpecifier().with_validation_schema(
+            self.custom_validation_schema
+        ).with_repo(self).with_reference_values().get()
+
+        for concept in concepts:
+            try:
+                validator.validate(concept)
+            except ValidationError as validation_error:
+                concept_validation_error = {
+                    'mnemonic': concept.mnemonic,
+                    'url': concept.url,
+                    'errors': get(validation_error, 'message_dict') or get(validation_error, 'error_dict'),
+                }
+                failed_concept_validations.append(concept_validation_error)
+
+        return failed_concept_validations
+
+    def update_version_data(self, head):
+        self.description = self.description or head.description
+        self.name = head.name
+        self.full_name = head.full_name
+        self.website = head.website
+        self.public_access = head.public_access
+        self.supported_locales = head.supported_locales
+        self.default_locale = head.default_locale
+        self.external_id = head.external_id
+        self.organization = head.organization
+        self.user = head.user
+        self.canonical_url = head.canonical_url
+        self.identifier = head.identifier
+        self.contact = head.contact
+        self.jurisdiction = head.jurisdiction
+        self.publisher = head.publisher
+        self.purpose = head.purpose
+        self.copyright = head.copyright
+        self.revision_date = head.revision_date
+        self.text = head.text
+        self.experimental = head.experimental
+        self.custom_validation_schema = head.custom_validation_schema
+        self.extras = {
+            key: value for key, value in (head.extras or {}).items()
+            if key not in VERSION_UNCOPYABLE_EXTRAS
+        }
+
+    def add_processing(self, process_id):
+        if not process_id:
+            return
+        if self.id:
+            self.__class__.objects.filter(id=self.id).exclude(
+                _background_process_ids__contains=[process_id]
+            ).update(
+                _background_process_ids=CombinedExpression(
+                    F('_background_process_ids'),
+                    '||',
+                    Value([process_id], ArrayField(models.CharField(max_length=255)))
+                )
+            )
+        if process_id not in (self._background_process_ids or []):
+            if self._background_process_ids is None:
+                self._background_process_ids = []
+            self._background_process_ids.append(process_id)
+
+    def remove_processing(self, process_id):
+        if self.id:
+            try:
+                self.__class__.objects.filter(id=self.id).update(
+                    _background_process_ids=Func(
+                        F('_background_process_ids'),
+                        Value(process_id, output_field=models.CharField(max_length=255)),
+                        function='array_remove'
+                    )
+                )
+            except Exception as ex:  # pylint: disable=broad-except
+                ERRBIT_LOGGER.log(ex)
+        if self._background_process_ids and process_id in self._background_process_ids:
+            self._background_process_ids.remove(process_id)
+
+    def remove_processing_many(self, process_ids):
+        for process_id in process_ids:
+            self.remove_processing(process_id)
+
+    @property
+    def is_processing(self):  # pylint: disable=too-many-branches
+        background_ids = self._background_process_ids
+        if not background_ids:
+            return False
+
+        falsy_ids = [process_id for process_id in background_ids if not process_id]
+        valid_ids = [process_id for process_id in background_ids if process_id]
+
+        if falsy_ids:
+            self.remove_processing_many(falsy_ids)
+
+        if not valid_ids:
+            return False
+
+        finished_ids = set()
+        try:
+            # Batch-resolve all task statuses in a single round-trip to the result backend instead of
+            # one AsyncResult() lookup per id - HEAD versions can accumulate thousands of stale ids.
+            for task_id, _ in celery_app.backend.get_many(
+                valid_ids, interval=0, timeout=None, max_iterations=1
+            ):
+                finished_ids.add(task_id)
+        except Exception:  # pylint: disable=broad-except
+            finished_ids = set()
+
+        still_processing = False
+        for process_id in valid_ids:
+            if process_id in finished_ids:
+                self.remove_processing(process_id)
+            else:
+                still_processing = True
+
+        return still_processing
+
+    def clear_processing(self):
+        self._background_process_ids = []
+        try:
+            self.save(update_fields=['_background_process_ids'])
+        except:  # pylint: disable=bare-except
+            pass
+
+    def get_supported_locales(self):
+        locales = [self.default_locale]
+        if self.supported_locales:
+            # to maintain the order of default locale always first
+            locales += [locale for locale in self.supported_locales if locale != self.default_locale]
+        return locales
+
+    @property
+    def is_exporting(self):
+        is_processing = self.is_processing
+
+        if is_processing:
+            for process_id in self._background_process_ids:
+                res = AsyncResult(process_id)
+                task_name = res.name
+                if task_name and task_name.startswith('core.common.tasks.export_'):
+                    return True
+
+        return False
+
+    @property
+    def active_url_registry_entries(self):
+        return self.url_registry_entries.filter(is_active=True)
+
+    @cached_property
+    def version_export_path(self):
+        last_update = self.last_child_update.strftime('%Y-%m-%d_%H%M%S')
+        return self.get_version_export_path(suffix=f"{last_update}.zip")
+
+    def get_version_export_path(self, suffix='*'):
+        version = self.version
+        if not version.lower().startswith('v'):
+            version = f"v{version}"
+
+        owner = self.parent
+        owner_mnemonic = owner.mnemonic
+        owner_type = f'{owner.get_url_kwarg()}s'
+        path = f"{owner_type}/{owner_mnemonic}/{owner_mnemonic}_{self.mnemonic}_{version}"
+        expansion = get(self, 'expansion.mnemonic')
+        if expansion:
+            path = f"{path}_{expansion}"
+        path = f'{path}.'
+
+        if suffix:
+            path += suffix
+
+        return path
+
+    def get_external_export_path(self, key, filename):
+        base_path = self.get_version_export_path(suffix=None).rstrip('.')
+        safe_filename = get_valid_filename(filename)
+        return f"{base_path}/external/{key}_{safe_filename}"
+
+    def get_export_path(self):
+        if self.is_head:
+            return self.version_export_path
+        service = get_export_service()
+        return service.get_last_key_from_path(self.get_version_export_path(suffix=None)) or self.version_export_path
+
+    def has_export(self):
+        service = get_export_service()
+        if self.is_head:
+            return service.exists(self.version_export_path)
+        return service.has_path(self.get_version_export_path(suffix=None))
+
+    def can_view_all_content(self, user):
+        if get(user, 'is_anonymous'):
+            return False
+        return get(
+            user, 'is_staff'
+        ) or self.public_can_view or self.user_id == user.id or self.organization.members.filter(id=user.id).exists()
+
+    @classmethod
+    def resolve_expression_to_version(cls, expression):
+        url = expression
+        namespace = None
+        version = None
+        instance = None
+        resolved_registry_entry = None
+        if isinstance(expression, dict) and get(expression, 'url'):
+            url = expression['url']
+            namespace = expression.get('namespace', None)
+            version = expression.get('version', None)
+        if url:
+            instance, resolved_registry_entry = cls.resolve_reference_expression(url, namespace, version)
+        return instance, resolved_registry_entry
+
+    @classmethod
+    def resolve_reference_expression(cls, url, namespace=None, version=None):
+        """
+        resolves to repository version according to this process:
+
+        1. If canonical URL provided:
+            - Owner's URL Registry: If namespace is set in the request (and not global) and an owner-specific
+            canonical URL registry is defined for the namespace, attempt to resolve with the
+            namespace-specific canonical URL registry:
+                -- If the canonical URL is defined in the owner's registry, return the matching repo/repo version
+                from the namespace specified in the registry entry or return 404 not found
+                -- If no matching entry in the registry, then continue
+            - Repos in the namespace: If namespace is set in the request (and not global), attempt to resolve the
+             canonical URL with the repos defined in the namespace:
+                -- If the canonical URL matches a repo/repo version in the namespace, then return the repo/repo version
+                -- If unresolved, then continue
+            - Global URL Registry: If namespace is undefined or explicitly set to global in the request, or if URL
+             did not match an entry in the owner-specific registry and did not match a repo in the namespace, attempt
+             to resolve the canonical URL with the Global Canonical URL Registry:
+                -- If the canonical URL is defined in the global registry, return the matching repo/repo version from
+                 the namespace specified in the registry entry or return 404 not found
+                -- If no matching entry in the global registry, then return 404 not found (even if the canonical URL
+                is defined somewhere else in OCL)
+        2. Else if relative URL provided:
+            - Return the repository directly using the relative URL, or return 404 if not found
+        """
+
+        resolution_url, version, is_canonical = cls.__get_resolution_url(url, version)
+        instance = None
+        is_global_namespace = not namespace or namespace == '/'
+        criteria = models.Q(is_active=True, retired=False)
+
+        from core.url_registry.models import URLRegistry
+        registry_entry = None
+        if is_canonical:
+            if Toggle.get('URL_REGISTRY_IN_RESOLVE_REFERENCE_TOGGLE'):
+                registry_entry = None
+                if not is_global_namespace:
+                    owner = SourceContainerMixin.get_object_from_namespace(namespace)
+                    if owner:
+                        registry_entry = owner.url_registry_entries.filter(is_active=True, url=resolution_url).first()
+                        instance = registry_entry.lookup_entry() if registry_entry else owner.find_repo_by_canonical_url(  # pylint: disable=line-too-long
+                            resolution_url)
+
+                if is_global_namespace or (not registry_entry and not instance):
+                    registry_entry = URLRegistry.get_active_global_entries().filter(url=resolution_url).first()
+                    if registry_entry:
+                        instance = registry_entry.lookup_entry()
+
+                return cls.resolve_repo(instance, version, is_canonical, resolution_url), registry_entry
+
+            criteria &= models.Q(canonical_url=resolution_url)
+            if namespace:
+                criteria &= models.Q(models.Q(user__uri=namespace) | models.Q(organization__uri=namespace))
+        else:
+            criteria &= models.Q(uri=(resolution_url if resolution_url.endswith('/') else resolution_url + '/'))
+
+        from core.repos.models import Repository
+        return cls.resolve_repo(Repository.get(criteria), version, is_canonical, resolution_url), registry_entry
+
+    @classmethod
+    def resolve_repo(cls, instance, version, is_canonical, resolution_url):
+        if instance:
+            if version:
+                instance = instance.versions.filter(version=decode_string(version)).first()
+            elif instance.is_head:
+                instance = instance.get_latest_released_version() or instance
+
+        if not instance:
+            from core.sources.models import Source
+            instance = Source()
+
+        instance.is_fqdn = is_canonical
+        instance.resolution_url = resolution_url
+        if is_canonical and instance.id and not instance.canonical_url:
+            instance.canonical_url = resolution_url
+        return instance
+
+    @staticmethod
+    def __get_resolution_url(url, version):
+        lookup_url, extracted_version = canonical_url_to_url_and_version(url)
+        version = version or extracted_version
+        lookup_url = lookup_url.split('?')[0]
+        is_canonical = is_canonical_uri(lookup_url) or is_canonical_uri(url)
+        resolution_url = lookup_url if is_canonical else to_parent_uri(lookup_url)
+        return resolution_url, version, is_canonical
+
+    def clean(self):
+        if not self.custom_validation_schema:
+            self.custom_validation_schema = DEFAULT_VALIDATION_SCHEMA
+
+        super().clean()
+
+        if self.released and not self.revision_date:
+            self.revision_date = timezone.now()
+
+    @property
+    def map_types_count(self):
+        return self.get_active_mappings().aggregate(count=Count('map_type', distinct=True))['count']
+
+    @property
+    def concept_class_count(self):
+        return self.get_active_concepts().aggregate(count=Count('concept_class', distinct=True))['count']
+
+    @property
+    def datatype_count(self):
+        return self.get_active_concepts().aggregate(count=Count('datatype', distinct=True))['count']
+
+    @property
+    def retired_concepts_count(self):
+        return self.get_concepts_queryset().filter(retired=True).count()
+
+    @property
+    def retired_mappings_count(self):
+        return self.get_mappings_queryset().filter(retired=True).count()
+
+    @property
+    def concepts_distribution(self):
+        facets = self.get_concept_facets()
+        return {
+            'active': self.active_concepts,
+            'retired': self.retired_concepts_count,
+            'concept_class': self._to_clean_facets(facets.conceptClass or []),
+            'datatype': self._to_clean_facets(facets.datatype or []),
+            'locale': self._to_clean_facets(facets.locale or []),
+            'name_type': self._to_clean_facets(facets.nameTypes or []),
+            'contributors': self._to_clean_facets(facets.updatedBy or [])
+        }
+
+    @property
+    def mappings_distribution(self):
+        facets = self.get_mapping_facets()
+
+        return {
+            'active': self.active_mappings,
+            'retired': self.retired_mappings_count,
+            'map_type': self._to_clean_facets(facets.mapType or []),
+            'contributors': self._to_clean_facets(facets.updatedBy or [])
+        }
+
+    @property
+    def versions_distribution(self):
+        return {
+            'total': self.num_versions,
+            'released': self.released_versions_count
+        }
+
+    def get_concepts_extras_distribution(self):
+        return self.get_distinct_extras_keys(self.get_concepts_queryset(), 'concepts')
+
+    @staticmethod
+    def get_distinct_extras_keys(queryset, resource):
+        return set(queryset.exclude(retired=True).extra(
+            select={'key': f"jsonb_object_keys({resource}.extras)"}).values_list('key', flat=True))
+
+    def get_name_locales_queryset(self):
+        from core.concepts.models import ConceptName
+        return ConceptName.objects.filter(concept__in=self.get_active_concepts(), retired=False)
+
+    @property
+    def concept_names_distribution(self):
+        locales = self.get_name_locales_queryset()
+        locales_total = locales.distinct('locale').count()
+        names_total = locales.distinct('type').count()
+        return {'locales': locales_total, 'names': names_total}
+
+    def get_name_locale_distribution(self):
+        return self._get_distribution(self.get_name_locales_queryset(), 'locale')
+
+    def get_name_locale_list_distribution(self):
+        return self.get_concepts_queryset().distinct('names__locale').values_list('names__locale', flat=True)
+
+    def get_name_type_distribution(self):
+        return self._get_distribution(self.get_name_locales_queryset(), 'type')
+
+    def get_concept_class_distribution(self):
+        return self._get_distribution(self.get_active_concepts(), 'concept_class')
+
+    def get_datatype_distribution(self):
+        return self._get_distribution(self.get_active_concepts(), 'datatype')
+
+    def get_map_type_distribution(self):
+        return self._get_distribution(self.get_active_mappings(), 'map_type')
+
+    @staticmethod
+    def _get_distribution(queryset, field):
+        return list(queryset.values(field).annotate(count=Count('id')).values(field, 'count').order_by('-count'))
+
+    def get_concept_facets(self, filters=None):
+        from core.concepts.search import ConceptFacetedSearch
+        return self._get_resource_facets(ConceptFacetedSearch, filters, parent=self)
+
+    def get_mapping_facets(self, filters=None):
+        from core.mappings.search import MappingFacetedSearch
+        return self._get_resource_facets(MappingFacetedSearch, filters)
+
+    def _get_resource_facets(self, facet_class, filters=None, **kwargs):
+        search = facet_class(query='', filters=self._get_resource_facet_filters(filters), **kwargs)
+        search.params(request_timeout=ES_REQUEST_TIMEOUT)
+        try:
+            facets = search.execute().facets
+        except TransportError as ex:  # pragma: no cover
+            ERRBIT_LOGGER.log(ex)
+            raise Http400(detail=get(ex, 'info') or get(ex, 'error') or str(ex)) from ex
+
+        return facets
+
+    def _to_clean_facets(self, facets, remove_self=False):
+        _facets = []
+        for facet in facets:
+            _facet = facet[:2]
+            if remove_self:
+                if facet[0] != self.mnemonic:
+                    _facets.append(_facet)
+            else:
+                _facets.append(_facet)
+        return _facets
+
+    def get_changelog_task_by_name(self, name):
+        from core.tasks.models import Task
+        if not name:
+            return None
+        prev_version = self.prev_version
+        if not prev_version:
+            return None
+        return Task.find(
+            name__iendswith=name, args__0=prev_version.uri, args__1=self.uri)
+
+    @property
+    def states(self):
+        return self.get_tasks_info('state')
+
+    @property
+    def tasks(self):
+        return self.get_tasks_info('id')
+
+    def get_tasks_info(self, attribute=None):
+        from core.tasks.serializers import TaskListSerializer
+        tasks = self.get_tasks()
+
+        result = {}
+        for task_name, task in tasks.items():
+            if task:
+                result[task_name] = (get(task, attribute) or None) if attribute else TaskListSerializer(task).data
+
+        return result
+
+    def get_tasks(self):
+        seed_task = self.get_seed_new_version_task()
+        index_concepts_task = self.get_index_concepts_task()
+        index_mappings_task = self.get_index_mappings_task()
+        export_task = self.get_export_task()
+        changelog_task = self.get_changelog_task() if hasattr(self, 'get_changelog_task') else None
+
+        return {
+            'seeded_concepts': seed_task,
+            'seeded_mappings': seed_task,
+            'indexed_concepts': index_concepts_task,
+            'indexed_mappings': index_mappings_task,
+            'exported': export_task,
+            'changelog': changelog_task,
+        }
+
+    def upload_external_export(self, key, file, user, description=None):
+        from core.repos.models import RepoExternalExport
+        return RepoExternalExport.upsert(self, key, file, user, description)
+
+
+class CelerySignalProcessor(RealTimeSignalProcessor):
+    def handle_save(self, sender, instance, **kwargs):
+        if settings.ES_SYNC and instance.__class__ in registry.get_models() and instance.should_index:
+            if get(settings, 'TEST_MODE', False):
+                handle_save(instance.app_name, instance.model_name, instance.id)
+            else:
+                handle_save.apply_async(
+                    (instance.app_name, instance.model_name, instance.id), queue='indexing', permanent=False)
+
+    def handle_m2m_changed(self, sender, instance, action, **kwargs):
+        if settings.ES_SYNC and instance.__class__ in registry.get_models() and instance.should_index:
+            if get(settings, 'TEST_MODE', False):
+                handle_m2m_changed(instance.app_name, instance.model_name, instance.id, action)
+            else:
+                handle_m2m_changed.apply_async(
+                    (instance.app_name, instance.model_name, instance.id, action), queue='indexing', permanent=False)

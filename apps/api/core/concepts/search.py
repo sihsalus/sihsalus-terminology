@@ -1,0 +1,458 @@
+from elasticsearch_dsl import TermsFacet, Q, NestedFacet
+from pydash import flatten, is_number, compact, get
+
+from core.common.constants import FACET_SIZE, HEAD
+from core.common.lexical_variants import LexicalVariantDictionary
+from core.common.search import CustomESFacetedSearch, CustomESSearch
+from core.common.utils import get_embeddings, is_canonical_uri
+from core.concepts.models import Concept
+
+
+class BooleanTermsFacet(TermsFacet):
+    """
+    Terms facet for a property the source declares as boolean. Such a property is mapped as
+    boolean or as long, depending on whether the concepts store `false` or `0` in extras: a
+    boolean field carries the readable form in key_as_string, which the default get_value
+    discards, and a long field only ever yields 0/1. Both are surfaced as 'false'/'true', the
+    values the filter accepts back. See OpenConceptLab/ocl_issues#2692.
+    """
+    BUCKET_KEYS = {0: 'false', 1: 'true'}
+
+    def get_value(self, bucket):
+        key = bucket['key']
+        return get(bucket, 'key_as_string') or self.BUCKET_KEYS.get(key, key)
+
+
+class ConceptFacetedSearch(CustomESFacetedSearch):
+    index = 'concepts'
+    doc_types = [Concept]
+    fields = [
+        'datatype', 'concept_class', 'locale', 'retired', 'is_latest_version',
+        'source', 'owner', 'owner_type', 'name', 'collection', 'name_types',
+        'description_types', 'id', 'synonyms', 'extras', 'updated_by'
+    ]
+
+    base_facets = {
+        'datatype': TermsFacet(field='datatype_text.keyword', size=100),
+        '_datatype': TermsFacet(field='datatype', size=100),
+        'conceptClass': TermsFacet(field='concept_class_text.keyword', size=100),
+        '_conceptClass': TermsFacet(field='concept_class', size=100),
+        'locale': TermsFacet(field='locale', size=100),
+        'retired': TermsFacet(field='retired'),
+        'source': TermsFacet(field='source_text.keyword', size=FACET_SIZE),
+        'collection': TermsFacet(field='collection', size=FACET_SIZE),
+        'owner': TermsFacet(field='owner_text.keyword', size=FACET_SIZE),
+        'ownerType': TermsFacet(field='owner_type'),
+        'updatedBy': TermsFacet(field='updated_by', size=FACET_SIZE),
+        'is_latest_version': TermsFacet(field='is_latest_version'),
+        'is_in_latest_source_version': TermsFacet(field='is_in_latest_source_version'),
+        'collection_owner_url': TermsFacet(field='collection_owner_url', size=FACET_SIZE),
+        'expansion': TermsFacet(field='expansion', size=FACET_SIZE),
+        'nameTypes': TermsFacet(field='name_types', size=FACET_SIZE),
+        'descriptionTypes': TermsFacet(field='description_types', size=FACET_SIZE),
+        'source_version': TermsFacet(field='source_version', size=FACET_SIZE),
+        'collection_version': TermsFacet(field='collection_version', size=FACET_SIZE),
+        'targetRepo': NestedFacet("mapped_codes", TermsFacet(field="mapped_codes.source", size=FACET_SIZE)),
+        'targetRepoMapType': NestedFacet("mapped_codes", TermsFacet(field="mapped_codes.map_type", size=FACET_SIZE)),
+    }
+
+    def __init__(self, parent=None, **kwargs):
+        facets = {**self.base_facets}
+        if parent is not None:
+            facets = {
+                **facets,
+                **self.build_property_facets_from_source(parent)
+            }
+        self.facets = facets
+        super().__init__(**kwargs)
+
+    @staticmethod
+    def get_boolean_property_facet_field(code):
+        """
+        A boolean-declared property is mapped as `boolean` or `long` when extras hold a real
+        JSON boolean/int, and as `text` (with an auto `.keyword` sub-field) when extras hold the
+        literal string 'true'/'false'. Boolean and long fields have doc values and aggregate
+        directly on the bare field; text fields have fielddata disabled, so aggregating them
+        raises a 400 unless the `.keyword` sub-field is used instead. See
+        OpenConceptLab/ocl_issues#2699.
+        """
+        from elasticsearch_dsl.connections import connections  # pylint: disable=import-outside-toplevel
+        field = f"properties.{code}"
+        try:
+            mapping = connections.get_connection().indices.get_field_mapping(fields=field, index='concepts')
+        except Exception:  # pylint: disable=broad-except
+            return field
+        for index_mapping in mapping.values():
+            field_info = get(index_mapping, 'mappings').get(field, {}).get('mapping', {}).get(code, {})
+            if field_info.get('type') == 'text':
+                return f"{field}.keyword"
+        return field
+
+    @classmethod
+    def build_property_facets_from_source(cls, parent):
+        property_types = get(parent, 'property_types') or {}
+        facets = {}
+        for _filter in (get(parent, 'filters') or []):
+            code = _filter['code']
+            if property_types.get(code) == 'boolean':
+                field = cls.get_boolean_property_facet_field(code)
+                facets[f"properties__{code}"] = BooleanTermsFacet(field=field, size=FACET_SIZE)
+            else:
+                facets[f"properties__{code}"] = TermsFacet(field=f"properties.{code}.keyword", size=FACET_SIZE)
+        return facets
+
+
+class ConceptFuzzySearch:  # pragma: no cover
+    filter_fields = []
+    priority_fields = [
+        ['id', 0.3],
+        ['name', 0.3],
+        ['synonyms', 0.1],
+        ['same_as_mapped_codes', 0.1],
+        ['other_map_codes', 0.1],
+        ['concept_class', 'datatype', 0.1],
+        ['description', 0]
+    ]
+    semantic_priority_fields = [
+        ['id', 0.3],
+        ['_name', 0],
+        ['_synonyms', 0],
+        ['name', 0],
+        ['synonyms', 0],
+        ['same_as_mapped_codes', 0.1],
+        ['other_map_codes', 0.1],
+        ['concept_class', 'datatype', 0],
+    ]
+    fuzzy_fields = ['name', 'synonyms']
+
+    @staticmethod
+    def get_target_repo(repo_url):
+        from core.sources.models import Source
+        repo, _ = Source.resolve_reference_expression(repo_url)
+        if repo.id:
+            return repo
+        return None
+
+    @classmethod
+    def get_target_repo_params(cls, repo_url):
+        return cls.get_repo_params(cls.get_target_repo(repo_url))
+
+    @classmethod
+    def get_repo_params(cls, repo):
+        if repo:
+            return {
+                'owner': repo.parent.mnemonic,
+                'owner_type': repo.parent.resource_type,
+                'source_version': repo.version,
+                'source': repo.mnemonic
+            }
+        return {}
+
+    @staticmethod
+    def get_exact_and_contains_criteria(field, value, boost=0, add_boost=True):
+        return (CustomESSearch.get_match_criteria(field, value, boost) |
+                Q('match_phrase', **{
+                    field: {
+                        'query': value,
+                        'boost': 1 + boost if add_boost else boost
+                    }
+                }))
+
+    @classmethod
+    def search(  # pylint: disable=too-many-locals,too-many-arguments,too-many-branches,too-many-statements
+            cls, data, repo_url, repo_params=None, include_retired=False,
+            is_semantic=False, num_candidates=2000, k_nearest=50, map_config=None, additional_filter_criterion=None,
+            locale_filter=None, variants_repo=None
+    ):
+        from core.concepts.documents import ConceptDocument
+        map_config = map_config or []
+        filter_query = cls.get_filter_criteria(
+            data, include_retired, repo_params, repo_url, additional_filter_criterion)
+        or_clauses = []
+
+        priority_criteria = []
+        fields = cls.semantic_priority_fields if is_semantic else cls.priority_fields
+        for field_set in fields:
+            boost = field_set[-1]
+            for field in field_set[:-1]:
+                value = data.get(field, None)
+                if value:
+                    values = value if isinstance(value, list) else [value]
+                    for val in values:
+                        val = val or ""
+                        priority_criteria.append(CustomESSearch.get_or_match_criteria(field, val, boost))
+        for field, value in data.items():
+            if field.startswith('properties__'):
+                property_code = field.split('properties__', 1)[-1]
+                priority_criteria.append(
+                    Q('term', **{f"properties.{property_code}.keyword": value.strip('\"').strip('\'')}))
+
+        knn_queries = []
+        name = None
+        synonyms = []
+        if is_semantic:
+            name = data.get('name', None)
+            synonyms = data.get('synonyms')
+            if synonyms and not isinstance(synonyms, list):
+                synonyms = compact([synonyms])
+            synonyms = synonyms or []
+            locale_filter = locale_filter if isinstance(
+                locale_filter, list) else locale_filter.split(',') if locale_filter else []
+            locale_filter = [loc.strip() for loc in locale_filter]
+            if locale_filter:
+                def get_locale_filter(path):
+                    return Q({
+                        "nested":
+                            {
+                                "path": path,
+                                "query": {
+                                    "bool": {
+                                        "minimum_should_match": 1,
+                                        "should": [
+                                            {"terms": {f"{path}.locale": locale_filter}},
+                                            {"terms": {f"{path}.locale.keyword": locale_filter}}
+                                        ]
+                                    }
+                                }
+                            }
+                        })
+                filter_query.must.append(Q(
+                    "bool",
+                    should=[get_locale_filter("_embeddings"), get_locale_filter("_synonyms_embeddings")],
+                    minimum_should_match=1
+                ))
+
+            def get_knn_query(_field, _value, _boost):
+                return {
+                        "field": _field,
+                        "query_vector": get_embeddings(_value).tolist(),
+                        "k": k_nearest,
+                        "num_candidates": num_candidates,
+                        "filter": filter_query,
+                        "boost": _boost
+                }
+            if name:
+                knn_queries.append(get_knn_query("_embeddings.vector", name, 0.3))
+                knn_queries.append(get_knn_query("_synonyms_embeddings.vector", name, 0.275))
+                if variants_repo:
+                    for name_variant in LexicalVariantDictionary.get_variant_terms(name, source_uri=variants_repo):
+                        knn_queries.append(get_knn_query("_embeddings.vector", name_variant, 0.285))
+                        knn_queries.append(get_knn_query("_synonyms_embeddings.vector", name_variant, 0.26))
+            for synonym in synonyms:
+                if synonym is not None:
+                    knn_queries.append(get_knn_query("_synonyms_embeddings.vector", synonym, 0.125))
+                    knn_queries.append(get_knn_query("_embeddings.vector", synonym, 0.15))
+                    if variants_repo:
+                        synonym_variants = LexicalVariantDictionary.get_variant_terms(
+                            synonym,
+                            source_uri=variants_repo,
+                        )
+                        for synonym_variant in synonym_variants:
+                            knn_queries.append(get_knn_query("_synonyms_embeddings.vector", synonym_variant, 0.115))
+                            knn_queries.append(get_knn_query("_embeddings.vector", synonym_variant, 0.14))
+        else:
+            for field in cls.fuzzy_fields:
+                value = data.get(field, None)
+                if value:
+                    values = value if isinstance(value, list) else [value]
+                    for val in compact(values):
+                        val = str(val) or ""
+                        _search_str = CustomESSearch.get_wildcard_search_string(
+                            CustomESSearch.get_search_string(val, decode=True, lower=True)
+                        )
+                        priority_criteria.append(CustomESSearch.get_wildcard_criteria(field, _search_str, 0.01))
+                        priority_criteria.append(CustomESSearch.fuzzy_criteria(val, field, 0, 3))
+
+        if priority_criteria:
+            combined_or = None
+            for criteria in priority_criteria:
+                combined_or = criteria if combined_or is None else combined_or | criteria
+            or_clauses.append(combined_or)
+
+        nested_mapped_codes_queries = cls.get_mapped_code_queries(data, map_config)
+
+        if nested_mapped_codes_queries:
+            or_clauses.append(Q("bool", should=nested_mapped_codes_queries, minimum_should_match=1, boost=0.1))
+
+        wrapped_clauses = [
+            Q("bool", must=[Q(filter_query), clause])
+            for clause in or_clauses
+        ]
+
+        search = ConceptDocument.search()
+        for knn_query in knn_queries:
+            search = search.knn(**knn_query)
+        if wrapped_clauses:
+            search = search.query(Q("bool", should=wrapped_clauses, minimum_should_match=1))
+        else:
+            search = search.query(Q("bool", must=[Q(filter_query)]))
+
+        if is_semantic:
+            if name:
+                if variants_repo:
+                    name_terms = [name] + list(
+                        LexicalVariantDictionary.get_variant_terms(
+                            name,
+                            source_uri=variants_repo,
+                        )
+                    )
+                    synonym_terms = list(synonyms)
+                    for s in synonyms:
+                        synonym_terms.extend(LexicalVariantDictionary.get_variant_terms(s, source_uri=variants_repo))
+                else:
+                    name_terms = [name]
+                    synonym_terms = list(synonyms)
+                rescore_queries = [
+                    {
+                        "constant_score": {
+                            "filter": {
+                                "bool": {
+                                    "should": [
+                                        {
+                                            "term": {
+                                                "_name": {
+                                                    "value": t,
+                                                    "case_insensitive": True
+                                                }
+                                            }
+                                        } for t in name_terms
+                                    ],
+                                    "minimum_should_match": 1
+                                }
+                            },
+                            "boost": 3
+                        }
+                    }
+                ]
+                if synonym_terms:
+                    rescore_queries.append({
+                        "constant_score": {
+                            "filter": {
+                                "bool": {
+                                    "should": [
+                                        {
+                                            "term": {
+                                                "_synonyms": {
+                                                    "value": t,
+                                                    "case_insensitive": True
+                                                }
+                                            }
+                                        } for t in synonym_terms
+                                    ],
+                                    "minimum_should_match": 1
+                                }
+                            },
+                            "boost": 1
+                        }
+                    })
+                search = search.extra(rescore={
+                    "window_size": 250,
+                    "query": {
+                        "score_mode": "total",
+                        "query_weight": 1.0,
+                        "rescore_query_weight": 35.0,
+                        "rescore_query": {
+                            "dis_max": {
+                                "tie_breaker": 0.0,
+                                "queries": rescore_queries
+                            }
+                        }
+                    }
+                })
+
+        highlight = [
+            'name', 'synonyms'
+        ] if is_semantic else  [field for field in flatten([*cls.fuzzy_fields, *fields]) if not is_number(field)]
+        search = search.highlight(*highlight)
+        search = search.sort({'_score': {'order': 'desc'}})
+        return search
+
+    @classmethod
+    def get_mapped_code_queries(cls, data, map_config):
+        mapped_codes = cls.get_mapped_codes(data, map_config)
+        nested_mapped_codes_queries = []
+        for mapped_code in mapped_codes:
+            source = mapped_code.get('source', None)
+            code = mapped_code.get('code', None)
+            map_type = mapped_code.get('map_type', None)
+            queries = []
+            if source:
+                queries.append(Q("term", **{"mapped_codes.source": source}))
+            if code:
+                queries.append(Q("term", **{"mapped_codes.code": code}))
+            if map_type:
+                queries.append(Q("term", **{"mapped_codes.map_type": map_type}))
+            if queries:
+                nested_mapped_codes_queries.append(Q("nested", path="mapped_codes", query=Q("bool", must=queries)))
+        return nested_mapped_codes_queries
+
+    @classmethod
+    def get_mapped_codes(cls, data, map_config):  # pylint: disable=too-many-locals
+        from core.sources.models import Source
+
+        mapped_codes = []
+        for config in map_config:
+            config_type = config.get('type')
+            column = config.get('input_column')
+            target_urls = config.get('target_urls') or []
+            target_source_url = config.get('target_source_url') or None
+            delimiter = config.get('delimiter') or ','
+            separator = config.get('separator') or ':'
+            is_list = config_type == 'mapping-list'
+
+            if not config_type or not column:
+                continue
+            if (is_list and not target_urls) or (not is_list and not target_source_url):
+                continue
+            value = data.get(column) or None
+            if not value:
+                continue
+
+            mapped_code = {'source': None, 'code': None}
+            if is_list:
+                values = {}
+                for val in value.split(delimiter):
+                    parts = val.strip().split(separator)
+                    values[parts[0].strip().lower()] = parts[1].strip() if len(parts) > 1 else None
+                for source_code, url in target_urls.items():
+                    if url and is_canonical_uri(url):
+                        repo, _ = Source.resolve_reference_expression(url, version=HEAD)
+                        url = repo.uri if repo and repo.id else None
+                    mapped_code['source'] = url
+                    mapped_code['code'] = values.get(source_code.strip().lower()) or None
+            else:
+                if is_canonical_uri(target_source_url):
+                    repo, _ = Source.resolve_reference_expression(target_source_url, version=HEAD)
+                    target_source_url = repo.uri if repo and repo.id else None
+                mapped_code['source'] = target_source_url
+                mapped_code['code'] = value
+
+            if mapped_code['source'] and mapped_code['code']:
+                mapped_codes.append(mapped_code)
+        return mapped_codes
+
+    @classmethod
+    def get_filter_criteria(cls, data, include_retired, repo_params, repo_url, additional_filter_criterion=None):  # pylint: disable=too-many-arguments
+        must_clauses = []
+        repo_params = repo_params or cls.get_target_repo_params(repo_url)
+        for field, value in repo_params.items():
+            must_clauses.append(Q('match', **{field: value}))
+        if not include_retired:
+            must_clauses.append(Q('match', retired=False))
+        for field in cls.filter_fields:
+            value = data.get(field)
+            if value:
+                must_clauses.append(Q('match', **{field: value}))
+
+        if additional_filter_criterion:
+            must_clauses.append(additional_filter_criterion)
+
+        return Q("bool", must=must_clauses)
+
+    @classmethod
+    def get_search_results(cls, row, repo_url, offset=0, limit=5):
+        from core.concepts.documents import ConceptDocument
+        search = cls.search(row, repo_url)
+        es_search = CustomESSearch(search[offset:limit], ConceptDocument)
+        es_search.to_queryset()
+        return es_search.queryset, es_search.scores, es_search.max_score, es_search.highlights

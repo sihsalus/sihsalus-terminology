@@ -1,0 +1,3164 @@
+import json
+import time
+import zipfile
+
+from celery_once import AlreadyQueued
+from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import transaction
+from django.test import override_settings
+from mock import patch, Mock, ANY, PropertyMock
+from mock.mock import call
+from rest_framework.exceptions import ErrorDetail
+
+from core.bundles.models import Bundle
+from core.capabilities.constants import CLONE_RESOURCES_PER_CALL_CAPABILITY_ID
+from core.capabilities.models import UserCapabilityOverride
+from core.collections.tests.factories import OrganizationCollectionFactory, ExpansionFactory
+from core.common.tasks import export_source
+from core.common.tests import OCLAPITestCase
+from core.common.utils import get_latest_dir_in_path
+from core.concepts.documents import ConceptDocument
+from core.concepts.models import Concept
+from core.concepts.serializers import ConceptVersionExportSerializer
+from core.concepts.tests.factories import ConceptDescriptionFactory, ConceptFactory, ConceptNameFactory
+from core.mappings.documents import MappingDocument
+from core.mappings.models import Mapping
+from core.mappings.serializers import MappingVersionExportSerializer
+from core.mappings.tests.factories import MappingFactory
+from core.orgs.models import Organization
+from core.sources.models import Source, CloneLimitExceeded
+from core.sources.serializers import SourceDetailSerializer, SourceVersionExportSerializer
+from core.sources.tests.factories import OrganizationSourceFactory, UserSourceFactory
+from core.users.models import UserProfile
+from core.users.tests.factories import UserProfileFactory
+
+
+class SourceListViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.source_payload = {
+            'website': '', 'custom_validation_schema': 'None', 'name': 's2', 'default_locale': 'ab',
+            'short_code': 's2', 'description': '', 'source_type': '', 'full_name': 'source 2', 'public_access': 'View',
+            'external_id': '', 'id': 's2', 'supported_locales': 'af,am', 'canonical_url': 'https://foo.com/foo/bar/'
+        }
+
+    def test_get_200(self):
+        response = self.client.get(
+            self.organization.sources_url,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+
+        source = OrganizationSourceFactory(organization=self.organization)
+
+        response = self.client.get(
+            self.organization.sources_url + '?verbose=true',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['short_code'], source.mnemonic)
+        self.assertEqual(response.data[0]['owner'], self.organization.mnemonic)
+        self.assertEqual(response.data[0]['owner_type'], 'Organization')
+        self.assertEqual(response.data[0]['owner_url'], self.organization.uri)
+        self.assertEqual(response.data[0]['type'], 'Source')
+        for attr in ['active_concepts', 'active_mappings', 'versions', 'summary']:
+            self.assertFalse(attr in response.data[0])
+
+        response = self.client.get(
+            self.organization.sources_url + '?verbose=true&includeSummary=true',
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['short_code'], source.mnemonic)
+        self.assertEqual(response.data[0]['owner'], self.organization.mnemonic)
+        self.assertEqual(response.data[0]['owner_type'], 'Organization')
+        self.assertEqual(response.data[0]['owner_url'], self.organization.uri)
+        self.assertTrue('summary' in response.data[0])
+        for attr in ['active_concepts', 'active_mappings', 'versions']:
+            self.assertTrue(attr in response.data[0]['summary'])
+
+        response = self.client.get(
+            self.organization.sources_url + '?brief=true',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(
+            response.data[0],
+            {
+                'id': source.mnemonic,
+                'url': source.uri,
+                'type': 'Source',
+                'name': source.name,
+                'description': source.description
+            }
+        )
+
+    def test_get_200_with_latest_released_version(self):
+        source = OrganizationSourceFactory(organization=self.organization)
+        OrganizationSourceFactory(
+            mnemonic=source.mnemonic, organization=self.organization, version='v1', released=True)
+        OrganizationSourceFactory(
+            mnemonic=source.mnemonic, organization=self.organization, version='v2', released=False)
+
+        response = self.client.get(self.organization.sources_url, format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertFalse('latest_released_version' in response.data[0])
+
+        response = self.client.get(
+            self.organization.sources_url + '?includeLatestReleasedVersion=true', format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['id'], source.mnemonic)
+        self.assertEqual(response.data[0]['latest_released_version'], 'v1')
+
+        response = self.client.get('/sources/?includeLatestReleasedVersion=true', format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [data['latest_released_version'] for data in response.data if data['id'] == source.mnemonic],
+            ['v1']
+        )
+
+    def test_get_200_with_latest_released_version_none_when_never_released(self):
+        source = OrganizationSourceFactory(organization=self.organization)
+        OrganizationSourceFactory(
+            mnemonic=source.mnemonic, organization=self.organization, version='v1', released=False)
+
+        response = self.client.get(
+            self.organization.sources_url + '?includeLatestReleasedVersion=true', format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertIsNone(response.data[0]['latest_released_version'])
+
+    def test_get_200_zip(self):
+        response = self.client.get(
+            self.organization.sources_url,
+            HTTP_COMPRESS='true',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/zip')
+        content = json.loads(zipfile.ZipFile(response.rendered_content.filelike).read('export.json').decode('utf-8'))
+        self.assertEqual(content, [])
+
+        source = OrganizationSourceFactory(organization=self.organization)
+
+        response = self.client.get(
+            self.organization.sources_url + '?verbose=true',
+            HTTP_COMPRESS='true',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/zip')
+        content = json.loads(zipfile.ZipFile(response.rendered_content.filelike).read('export.json').decode('utf-8'))
+        self.assertEqual(content, SourceDetailSerializer([source], many=True).data)
+
+    def test_post_201(self):
+        sources_url = f"/orgs/{self.organization.mnemonic}/sources/"
+
+        response = self.client.post(
+            sources_url,
+            self.source_payload,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted([
+                'type', 'uuid', 'id', 'short_code', 'name', 'full_name', 'description', 'source_type',
+                'custom_validation_schema', 'public_access', 'default_locale', 'supported_locales', 'website',
+                'url', 'owner', 'owner_type', 'owner_url', 'created_on', 'updated_on', 'created_by',
+                'updated_by', 'extras', 'external_id', 'versions_url', 'version', 'concepts_url', 'mappings_url',
+                'canonical_url', 'identifier', 'publisher', 'contact', 'meta',
+                'jurisdiction', 'purpose', 'copyright', 'content_type', 'revision_date', 'logo_url', 'text',
+                'experimental', 'case_sensitive', 'collection_reference', 'hierarchy_meaning', 'compositional',
+                'version_needed', 'hierarchy_root_url', 'autoid_concept_mnemonic', 'autoid_mapping_mnemonic',
+                'autoid_concept_external_id', 'autoid_mapping_external_id',
+                'autoid_concept_name_external_id', 'autoid_concept_description_external_id',
+                'autoid_concept_mnemonic_start_from', 'autoid_concept_external_id_start_from',
+                'autoid_mapping_mnemonic_start_from', 'autoid_mapping_external_id_start_from', 'checksums',
+                'properties', 'filters', 'match_algorithms'
+            ])
+        )
+        source = Source.objects.last()
+
+        self.assertEqual(response.data['uuid'], str(source.id))
+        self.assertEqual(response.data['short_code'], source.mnemonic)
+        self.assertEqual(response.data['full_name'], source.full_name)
+        self.assertEqual(response.data['owner_url'], source.parent.uri)
+        self.assertEqual(response.data['url'], source.uri)
+        self.assertEqual(response.data['canonical_url'], source.canonical_url)
+        self.assertEqual(response.data['default_locale'], 'ab')
+        self.assertEqual(response.data['supported_locales'], ['ab', 'af', 'am'])
+        self.assertEqual(source.default_locale, 'ab')
+        self.assertEqual(source.canonical_url, 'https://foo.com/foo/bar/')
+        self.assertEqual(source.supported_locales, ['af', 'am'])
+        self.assertIsNone(source.active_mappings)
+        self.assertIsNone(source.active_concepts)
+
+    def test_post_400(self):
+        sources_url = f"/orgs/{self.organization.mnemonic}/sources/"
+
+        response = self.client.post(
+            sources_url,
+            {**self.source_payload, 'name': None},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(list(response.data.keys()), ['name'])
+
+
+class SourceRetrieveUpdateDestroyViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+
+    def test_get(self):
+        response = self.client.get(
+            self.organization.sources_url + 'source1/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+        self.assertEqual(response.status_code, 404)
+
+        source = OrganizationSourceFactory(
+            organization=self.organization, default_locale='en', supported_locales=['fr'])
+        response = self.client.get(
+            source.uri,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(source.id))
+        self.assertEqual(response.data['short_code'], source.mnemonic)
+        self.assertEqual(response.data['default_locale'], 'en')
+        self.assertEqual(response.data['supported_locales'], ['en', 'fr'])
+
+        source2 = OrganizationSourceFactory(
+            organization=self.organization, default_locale='en', supported_locales=['fr', 'en'])
+        response = self.client.get(
+            source2.uri,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(source2.id))
+        self.assertEqual(response.data['short_code'], source2.mnemonic)
+        self.assertEqual(response.data['default_locale'], 'en')
+        self.assertEqual(response.data['supported_locales'], ['en', 'fr'])
+
+        source3 = OrganizationSourceFactory(
+            organization=self.organization, default_locale='en', supported_locales=None)
+        response = self.client.get(
+            source3.uri,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(source3.id))
+        self.assertEqual(response.data['short_code'], source3.mnemonic)
+        self.assertEqual(response.data['default_locale'], 'en')
+        self.assertEqual(response.data['supported_locales'], ['en'])
+
+    def test_put_200(self):
+        source = OrganizationSourceFactory(organization=self.organization)
+        self.assertTrue(source.is_head)
+        self.assertEqual(source.versions.count(), 1)
+        self.assertEqual(source.default_locale, 'en')
+        self.assertEqual(source.supported_locales, ['fr'])
+
+        sources_url = f"/orgs/{self.organization.mnemonic}/sources/{source.mnemonic}/"
+
+        response = self.client.put(
+            sources_url,
+            {'full_name': 'Full name', 'supported_locales': ['fr']},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertListEqual(
+            sorted(list(response.data.keys())),
+            sorted([
+                'type', 'uuid', 'id', 'short_code', 'name', 'full_name', 'description', 'source_type',
+                'custom_validation_schema', 'public_access', 'default_locale', 'supported_locales', 'website',
+                'url', 'owner', 'owner_type', 'owner_url', 'created_on', 'updated_on', 'created_by',
+                'updated_by', 'extras', 'external_id', 'versions_url', 'version', 'concepts_url', 'mappings_url',
+                'canonical_url', 'identifier', 'publisher', 'contact', 'meta',
+                'jurisdiction', 'purpose', 'copyright', 'content_type', 'revision_date', 'logo_url', 'text',
+                'experimental', 'case_sensitive', 'collection_reference', 'hierarchy_meaning', 'compositional',
+                'version_needed', 'hierarchy_root_url', 'autoid_concept_mnemonic', 'autoid_mapping_mnemonic',
+                'autoid_concept_external_id', 'autoid_mapping_external_id',
+                'autoid_concept_name_external_id', 'autoid_concept_description_external_id',
+                'autoid_concept_mnemonic_start_from', 'autoid_concept_external_id_start_from',
+                'autoid_mapping_mnemonic_start_from', 'autoid_mapping_external_id_start_from', 'checksums',
+                'properties', 'filters', 'match_algorithms'
+            ])
+        )
+        source = Source.objects.last()
+
+        self.assertTrue(source.is_head)
+        self.assertEqual(source.versions.count(), 1)
+        self.assertEqual(response.data['full_name'], source.full_name)
+        self.assertEqual(response.data['full_name'], 'Full name')
+        self.assertEqual(response.data['default_locale'], 'en')
+        self.assertEqual(response.data['supported_locales'], ['en', 'fr'])
+        self.assertEqual(source.default_locale, 'en')
+        self.assertEqual(source.supported_locales, ['fr'])
+
+    def test_put_hierarchy_root(self):
+        source = OrganizationSourceFactory(organization=self.organization)
+        self.assertTrue(source.is_head)
+        self.assertEqual(source.versions.count(), 1)
+        concept = ConceptFactory(parent=source)
+
+        sources_url = f"/orgs/{self.organization.mnemonic}/sources/{source.mnemonic}/"
+
+        response = self.client.put(
+            sources_url,
+            {'hierarchy_root_url': concept.uri},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['hierarchy_root_url'], concept.uri)
+        source.refresh_from_db()
+        self.assertEqual(source.hierarchy_root_id, concept.id)
+
+        concept2 = ConceptFactory(parent=source)
+
+        sources_url = f"/orgs/{self.organization.mnemonic}/sources/{source.mnemonic}/"
+
+        response = self.client.put(
+            sources_url,
+            {'hierarchy_root_url': concept2.uri},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['hierarchy_root_url'], concept2.uri)
+        source.refresh_from_db()
+        self.assertEqual(source.hierarchy_root_id, concept2.id)
+
+        unknown_concept = ConceptFactory()
+
+        sources_url = f"/orgs/{self.organization.mnemonic}/sources/{source.mnemonic}/"
+
+        response = self.client.put(
+            sources_url,
+            {'hierarchy_root_url': unknown_concept.uri},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'hierarchy_root': ['Hierarchy Root must belong to the same Source.']})
+
+        source.refresh_from_db()
+        self.assertEqual(source.hierarchy_root_id, concept2.id)
+
+    @patch('core.sources.views.delete_source')
+    def test_delete_202(self, delete_source_task_mock):  # async delete
+        delete_source_task_mock.__name__ = 'delete_source_task'
+        delete_source_task_mock.apply_async = Mock(return_value=Mock(task_id='task-id', state='PENDING'))
+        source = OrganizationSourceFactory(mnemonic='source', organization=self.organization)
+        response = self.client.delete(
+            source.uri + '?async=true',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            response.data,
+            {
+                'id': ANY,
+                'task': ANY,
+                'state': 'PENDING',
+                'queue': 'default',
+                'username': self.user.username,
+                'name': 'delete_source_task'
+            }
+        )
+        delete_source_task_mock.apply_async.assert_called_once_with((source.id,), task_id=ANY, queue='default')
+
+    @patch('core.common.models.delete_s3_objects')
+    def test_delete_204(self, delete_s3_objects_mock):  # sync delete
+        source = OrganizationSourceFactory(mnemonic='source', organization=self.organization)
+        response = self.client.delete(
+            source.uri + '?inline=true',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Source.objects.filter(id=source.id).exists())
+        self.assertFalse(Source.objects.filter(mnemonic='source').exists())
+        delete_s3_objects_mock.apply_async.assert_called_once_with(
+            (f'orgs/{self.organization.mnemonic}/{self.organization.mnemonic}_source_vHEAD.',),
+            queue = 'default', permanent = False
+        )
+
+
+class SourceVersionListViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.source = OrganizationSourceFactory(organization=self.organization)
+
+    def test_get_200(self):
+        response = self.client.get(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['version'], 'HEAD')
+
+        response = self.client.get(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/'
+            f'?verbose=true&includeSummary=true',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['version'], 'HEAD')
+        self.assertEqual(response.data[0]['concepts_url'], self.source.concepts_url)
+
+    @patch('core.sources.models.index_source_concepts', Mock(__name__='index_source_concepts'))
+    @patch('core.sources.models.index_source_mappings', Mock(__name__='index_source_mappings'))
+    def test_post_201(self):
+        response = self.client.post(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+            {
+                'id': 'v1',
+                'description': 'Version 1'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNotNone(response.data['uuid'])
+        self.assertEqual(response.data['version'], 'v1')
+        self.assertEqual(self.source.versions.count(), 2)
+
+    @patch('core.sources.models.index_source_concepts', Mock(__name__='index_source_concepts'))
+    @patch('core.sources.models.index_source_mappings', Mock(__name__='index_source_mappings'))
+    def test_post_201_copies_properties_and_filters_from_head(self):
+        self.source.properties = [{'code': 'p1'}]
+        self.source.filters = [{'code': 'f1'}]
+        self.source.save()
+
+        response = self.client.post(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+            {
+                'id': 'v1',
+                'description': 'Version 1'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['properties'], [{'code': 'p1'}])
+        self.assertEqual(response.data['filters'], [{'code': 'f1'}])
+
+        new_version = self.source.versions.get(version='v1')
+        self.assertEqual(new_version.properties, [{'code': 'p1'}])
+        self.assertEqual(new_version.filters, [{'code': 'f1'}])
+
+    @patch('core.sources.models.index_source_concepts', Mock(__name__='index_source_concepts'))
+    @patch('core.sources.models.index_source_mappings', Mock(__name__='index_source_mappings'))
+    def test_post_201_uses_head_properties_and_filters_when_older_version_exists(self):
+        # Regression for a prod bug where SourceVersionListView.create() resolved "head_object"
+        # via get_queryset().first() (ordered by -created_at, no version filter). That returns the
+        # most recently created *version* row rather than HEAD whenever an older version already
+        # exists (HEAD is always created first, so it always has the oldest created_at) -- so a new
+        # version silently copied a stale/older version's properties and filters instead of HEAD's.
+        OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.organization, version='v0'
+        )
+        properties = [
+            {
+                'code': 'is_clinical', 'type': 'boolean',
+                'description': 'false for strictly administrative concepts; absent means clinical'
+            },
+            {
+                'code': 'is_set', 'type': 'boolean',
+                'description': '1 when the concept is a set (integer, CIEL production convention)'
+            }
+        ]
+        filters = [
+            {'code': 'is_clinical', 'operator': ['=', 'exists'], 'value': 'true,false'},
+            {'code': 'is_set', 'operator': ['=', 'exists'], 'value': 'true,false'}
+        ]
+        self.source.properties = properties
+        self.source.filters = filters
+        self.source.save()
+
+        response = self.client.post(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+            {
+                'id': 'v1',
+                'description': 'Version 1'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['properties'], properties)
+        self.assertEqual(response.data['filters'], filters)
+
+        new_version = self.source.versions.get(version='v1')
+        self.assertEqual(new_version.properties, properties)
+        self.assertEqual(new_version.filters, filters)
+
+    def test_post_409(self):
+        OrganizationSourceFactory(version='v1', organization=self.organization, mnemonic=self.source.mnemonic)
+        with transaction.atomic():
+            response = self.client.post(
+                f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+                {
+                    'id': 'v1',
+                    'description': 'Version 1'
+                },
+                HTTP_AUTHORIZATION='Token ' + self.token,
+                format='json'
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['detail'], "Source version 'v1' already exist.")
+
+    @patch('core.sources.models.index_source_concepts', Mock(__name__='index_source_concepts'))
+    @patch('core.sources.models.index_source_mappings', Mock(__name__='index_source_mappings'))
+    def test_post_201_released_as_string(self):
+        response = self.client.post(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+            {
+                'id': 'v1',
+                'description': 'Version 1',
+                'released': 'true'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.source.versions.count(), 2)
+        self.assertIs(self.source.versions.get(version='v1').released, True)
+
+    def test_post_400_released_invalid_string(self):
+        response = self.client.post(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+            {
+                'id': 'v1',
+                'description': 'Version 1',
+                'released': 'yeah'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data, {'released': [ErrorDetail(string='Must be a valid boolean.', code='invalid')]})
+        self.assertEqual(self.source.versions.count(), 1)
+
+    @patch('core.sources.views.export_source')
+    def test_post_400(self, export_source_mock):
+        response = self.client.post(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/versions/',
+            {
+                'id': None,
+                'description': 'Version 1'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'version': [ErrorDetail(string='This field may not be null.', code='null')]})
+        export_source_mock.apply_async.assert_not_called()
+
+
+class SourceLatestVersionRetrieveUpdateViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.source = OrganizationSourceFactory(organization=self.organization)
+        self.latest_version = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, is_latest_version=True, organization=self.organization, version='v1',
+            released=True
+        )
+
+    def test_get_200(self):
+        response = self.client.get(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/latest/',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['id'], 'v1')
+        self.assertEqual(response.data['uuid'], str(self.latest_version.id))
+        self.assertEqual(response.data['short_code'], self.source.mnemonic)
+        self.assertEqual(response.data['type'], 'Source Version')
+
+        response = self.client.get(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/latest/summary/',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['id'], 'v1')
+        self.assertEqual(response.data['uuid'], str(self.latest_version.id))
+        self.assertEqual(response.data['active_concepts'], None)
+        self.assertEqual(response.data['active_mappings'], None)
+
+    def test_put_200(self):
+        self.assertIsNone(self.latest_version.external_id)
+
+        external_id = '123'
+        response = self.client.put(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/latest/',
+            {'external_id': external_id},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['id'], 'v1')
+        self.assertEqual(response.data['uuid'], str(self.latest_version.id))
+        self.assertEqual(response.data['short_code'], self.source.mnemonic)
+        self.assertEqual(response.data['external_id'], external_id)
+
+        self.latest_version.refresh_from_db()
+        self.assertEqual(self.latest_version.external_id, external_id)
+
+    def test_put_400(self):
+        response = self.client.put(
+            f'/orgs/{self.organization.mnemonic}/sources/{self.source.mnemonic}/latest/',
+            {'id': None},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'id': [ErrorDetail(string='This field may not be null.', code='null')]})
+
+
+class SourceExtrasViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.extras = {'foo': 'bar', 'tao': 'ching'}
+        self.source = OrganizationSourceFactory(organization=self.organization, extras=self.extras)
+
+    def test_get_200(self):
+        response = self.client.get(self.source.uri + 'extras/', format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, self.extras)
+
+
+class SourceVersionExtrasViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.extras = {'foo': 'bar', 'tao': 'ching'}
+        self.source = OrganizationSourceFactory(organization=self.organization, extras=self.extras)
+        self.source_v1 = OrganizationSourceFactory(
+            organization=self.organization, extras=self.extras, mnemonic=self.source.mnemonic, version='v1')
+
+    def test_get_200(self):
+        response = self.client.get(self.source_v1.uri + 'extras/', format='json')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, self.extras)
+
+
+class SourceVersionRetrieveUpdateDestroyViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.source = OrganizationSourceFactory(organization=self.organization)
+        self.source_v1 = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.organization, version='v1',
+        )
+
+    def test_get_200(self):
+        response = self.client.get(
+            self.source_v1.uri,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['version'], 'v1')
+
+    def test_put_200(self):
+        self.assertEqual(self.source.extras, {})
+        self.assertEqual(self.source_v1.extras, {})
+
+        extras = {'foo': 'bar'}
+        response = self.client.put(
+            self.source_v1.uri,
+            {'extras': extras},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['extras'], extras)
+        self.source_v1.refresh_from_db()
+        self.assertEqual(self.source_v1.extras, extras)
+        self.assertEqual(self.source.extras, {})
+
+    def test_put_400(self):
+        response = self.client.put(
+            self.source_v1.uri,
+            {'id': None},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, {'id': [ErrorDetail(string='This field may not be null.', code='null')]})
+
+    @patch('core.common.models.delete_s3_objects')
+    def test_version_delete_204(self, delete_s3_objects_mock):
+        self.assertEqual(self.source.versions.count(), 2)
+
+        response = self.client.delete(
+            self.source_v1.uri,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.source.versions.count(), 1)
+        self.assertFalse(self.source.versions.filter(version='v1').exists())
+        delete_s3_objects_mock.apply_async.assert_called_once_with(
+            (f'orgs/{self.source.parent.mnemonic}/{self.source.parent.mnemonic}_{self.source.mnemonic}_v1.',),
+            queue='default', permanent=False
+        )
+
+    @patch('core.common.models.delete_s3_objects')
+    def test_version_delete_204_referenced_in_private_collection(self, delete_s3_objects_mock):
+        concept = ConceptFactory(parent=self.source_v1)
+
+        collection = OrganizationCollectionFactory(public_access='None', autoexpand_head=False)
+        collection.add_expressions({'expressions': [concept.uri]}, collection.created_by)
+        self.assertEqual(collection.expansions.count(), 0)
+        self.assertEqual(collection.references.count(), 1)
+
+        response = self.client.delete(
+            self.source_v1.uri,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.source.versions.count(), 1)
+        self.assertFalse(self.source.versions.filter(version='v1').exists())
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.source.versions.count(), 1)
+        self.assertFalse(self.source.versions.filter(version='v1').exists())
+        delete_s3_objects_mock.apply_async.assert_called_once_with(
+            (f'orgs/{self.source.parent.mnemonic}/{self.source.parent.mnemonic}_{self.source.mnemonic}_v1.',),
+            queue='default', permanent=False
+        )
+
+        source_v2 = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.organization, version='v2',
+        )
+        self.assertEqual(self.source.versions.count(), 2)
+
+        concept2 = ConceptFactory(parent=self.source)
+        concept2_latest_version = concept2.get_latest_version()
+        concept2_latest_version.sources.add(source_v2)
+
+        expansion = ExpansionFactory(collection_version=collection)
+        collection.expansion_uri = expansion.uri
+        collection.autoexpand_head = True
+        collection.save()
+        collection.add_expressions({'expressions': [concept2.uri]}, collection.created_by)
+        self.assertEqual(collection.expansion.concepts.count(), 1)
+        self.assertEqual(collection.references.count(), 2)
+
+        response = self.client.delete(
+            source_v2.uri,
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.source.versions.count(), 1)
+        self.assertFalse(self.source.versions.filter(version='v2').exists())
+
+    @patch('core.sources.models.index_source_mappings')
+    @patch('core.sources.models.index_source_concepts')
+    def test_version_updated_to_released_should_index_children(
+            self, index_source_concepts_task_mock, index_source_mappings_task_mock
+    ):
+        index_source_concepts_task_mock.__name__ = 'index_source_concepts'
+        index_source_mappings_task_mock.__name__ = 'index_source_mappings'
+
+        self.assertFalse(self.source_v1.released)
+        self.assertEqual(self.source.get_latest_released_version(), None)
+
+        response = self.client.put(
+            self.source_v1.uri,
+            {'released': True, 'description': 'Updated to released'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['version'], 'v1')
+        self.assertEqual(self.source.versions.count(), 2)
+        version = self.source.get_latest_released_version()
+        self.assertEqual(version.id, self.source_v1.id)
+        self.assertTrue(version.is_latest_released)
+        index_source_concepts_task_mock.apply_async.assert_called_once_with(
+            (version.id, {'is_in_latest_source_version': True}), queue='indexing', persist_args=True, task_id=ANY)
+        index_source_mappings_task_mock.apply_async.assert_called_once_with(
+            (version.id, {'is_in_latest_source_version': True}), queue='indexing', persist_args=True, task_id=ANY)
+
+    @patch('core.sources.models.index_source_mappings')
+    @patch('core.sources.models.index_source_concepts')
+    def test_released_version_updated_to_released_again_should_not_reindex_children(
+            self, index_source_concepts_task_mock, index_source_mappings_task_mock
+    ):
+        self.source_v1.released = True
+        self.source_v1.save()
+
+        response = self.client.put(
+            self.source_v1.uri,
+            {'released': True, 'description': 'random update'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['version'], 'v1')
+        self.assertEqual(self.source.versions.count(), 2)
+        version = self.source.get_latest_released_version()
+        self.assertEqual(version.id, self.source_v1.id)
+        self.assertTrue(version.is_latest_released)
+        index_source_concepts_task_mock.apply_async.assert_not_called()
+        index_source_mappings_task_mock.apply_async.assert_not_called()
+
+    @patch('core.sources.models.index_source_mappings')
+    @patch('core.sources.models.index_source_concepts')
+    def test_released_version_updated_to_unreleased_should_reindex_children(
+            self, index_source_concepts_task_mock, index_source_mappings_task_mock
+    ):
+        index_source_concepts_task_mock.__name__ = 'index_source_concepts'
+        index_source_mappings_task_mock.__name__ = 'index_source_mappings'
+
+        self.source_v1.released = True
+        self.source_v1.save()
+
+        response = self.client.put(
+            self.source_v1.uri,
+            {'released': False, 'description': 'Marked unreleased'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['version'], 'v1')
+        self.assertEqual(self.source.versions.count(), 2)
+        self.assertEqual(self.source.get_latest_released_version(), None)
+        self.source_v1.refresh_from_db()
+        self.assertFalse(self.source_v1.released)
+        index_source_concepts_task_mock.apply_async.assert_called_once_with(
+            (self.source_v1.id, {'is_in_latest_source_version': False}),
+            queue='indexing', persist_args=True, task_id=ANY)
+        index_source_mappings_task_mock.apply_async.assert_called_once_with(
+            (self.source_v1.id, {'is_in_latest_source_version': False}),
+            queue='indexing', persist_args=True, task_id=ANY)
+
+    @patch('core.sources.models.index_source_mappings')
+    @patch('core.sources.models.index_source_concepts')
+    def test_released_version_updated_to_unreleased_should_reindex_children_of_this_and_prev_released_version(
+            self, index_source_concepts_task_mock, index_source_mappings_task_mock
+    ):
+        index_source_concepts_task_mock.__name__ = 'index_source_concepts'
+        index_source_mappings_task_mock.__name__ = 'index_source_mappings'
+
+        self.source_v1.released = True
+        self.source_v1.save()
+
+        source_v2 = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.organization, version='v2', released=True
+        )
+        self.assertTrue(source_v2.is_latest_released)
+        self.assertFalse(self.source_v1.is_latest_released)
+
+        response = self.client.put(
+            source_v2.uri,
+            {'released': False, 'description': 'Marked unreleased'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['version'], 'v2')
+        self.assertEqual(self.source.versions.count(), 3)
+        self.assertEqual(self.source.get_latest_released_version().version, 'v1')
+        source_v2.refresh_from_db()
+        self.source_v1.refresh_from_db()
+        self.assertTrue(self.source_v1.released)
+        self.assertTrue(self.source_v1.is_latest_released)
+        self.assertFalse(source_v2.released)
+        self.assertFalse(source_v2.is_latest_released)
+        self.assertEqual(index_source_concepts_task_mock.apply_async.call_count, 2)
+        self.assertEqual(index_source_mappings_task_mock.apply_async.call_count, 2)
+        self.assertEqual(
+            index_source_concepts_task_mock.apply_async.mock_calls,
+            [
+                call((source_v2.id, {'is_in_latest_source_version': False}),
+                     queue='indexing', persist_args=True, task_id=ANY),
+                call((self.source_v1.id, {'is_in_latest_source_version': True}),
+                     queue='indexing', persist_args=True, task_id=ANY)
+            ]
+        )
+        self.assertEqual(
+            index_source_mappings_task_mock.apply_async.mock_calls,
+            [
+                call((source_v2.id, {'is_in_latest_source_version': False}),
+                     queue='indexing', persist_args=True, task_id=ANY),
+                call((self.source_v1.id, {'is_in_latest_source_version': True}),
+                     queue='indexing', persist_args=True, task_id=ANY)
+            ]
+        )
+
+    @patch('core.sources.models.index_source_mappings')
+    @patch('core.sources.models.index_source_concepts')
+    def test_unreleased_version_updated_to_released_should_reindex_children_of_this_and_prev_released_version(
+            self, index_source_concepts_task_mock, index_source_mappings_task_mock
+    ):
+        index_source_concepts_task_mock.__name__ = 'index_source_concepts'
+        index_source_mappings_task_mock.__name__ = 'index_source_mappings'
+
+        self.source_v1.released = True
+        self.source_v1.save()
+
+        source_v2 = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.organization, version='v2', released=False
+        )
+        self.assertFalse(source_v2.is_latest_released)
+        self.assertTrue(self.source_v1.is_latest_released)
+
+        response = self.client.put(
+            source_v2.uri,
+            {'released': True, 'description': 'Marked released'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['version'], 'v2')
+        self.assertEqual(self.source.versions.count(), 3)
+        self.assertEqual(self.source.get_latest_released_version().version, 'v2')
+        source_v2.refresh_from_db()
+        self.source_v1.refresh_from_db()
+        self.assertTrue(self.source_v1.released)
+        self.assertFalse(self.source_v1.is_latest_released)
+        self.assertTrue(source_v2.released)
+        self.assertTrue(source_v2.is_latest_released)
+        self.assertEqual(index_source_concepts_task_mock.apply_async.call_count, 2)
+        self.assertEqual(index_source_mappings_task_mock.apply_async.call_count, 2)
+        self.assertEqual(
+            index_source_concepts_task_mock.apply_async.mock_calls,
+            [
+                call(
+                    (self.source_v1.id, {'is_in_latest_source_version': False}),
+                    queue='indexing', persist_args=True, task_id=ANY),
+                call(
+                    (source_v2.id, {'is_in_latest_source_version': True}),
+                    queue='indexing', persist_args=True, task_id=ANY)
+            ]
+        )
+        self.assertEqual(
+            index_source_mappings_task_mock.apply_async.mock_calls,
+            [
+                call((self.source_v1.id, {'is_in_latest_source_version': False}),
+                     queue='indexing', persist_args=True, task_id=ANY),
+                call((source_v2.id, {'is_in_latest_source_version': True}),
+                     queue='indexing', persist_args=True, task_id=ANY)
+            ]
+        )
+
+
+class SourceExtraRetrieveUpdateDestroyViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.organization = Organization.objects.first()
+        self.user = UserProfile.objects.filter(is_superuser=True).first()
+        self.token = self.user.get_token()
+        self.extras = {'foo': 'bar', 'tao': 'ching'}
+        self.source = OrganizationSourceFactory(organization=self.organization, extras=self.extras)
+
+    def test_get_200(self):
+        response = self.client.get(
+            self.source.uri + 'extras/foo/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'foo': 'bar'})
+
+    def test_get_404(self):
+        response = self.client.get(
+            self.source.uri + 'extras/bar/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_put_200(self):
+        response = self.client.put(
+            self.source.uri + 'extras/foo/',
+            {'foo': 'foobar'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'foo': 'foobar'})
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.extras, {'foo': 'foobar', 'tao': 'ching'})
+
+    def test_put_400(self):
+        response = self.client.put(
+            self.source.uri + 'extras/foo/',
+            {'tao': 'te-ching'},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data, ['Must specify foo param in body.'])
+
+    def test_delete(self):
+        response = self.client.delete(
+            self.source.uri + 'extras/foo/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.extras, {'tao': 'ching'})
+
+        response = self.client.delete(
+            self.source.uri + 'extras/foo/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.extras, {'tao': 'ching'})
+
+
+class SourceVersionExportViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.admin = UserProfile.objects.get(username='ocladmin')
+        self.admin_token = self.admin.get_token()
+        self.user = UserProfileFactory(username='username')
+        self.token = self.user.get_token()
+        self.source = UserSourceFactory(mnemonic='source1', user=self.user)
+        self.source_v1 = UserSourceFactory(version='v1', mnemonic='source1', user=self.user)
+        self.v1_updated_at = self.source_v1.updated_at.strftime('%Y-%m-%d_%H%M%S')
+        self.HEAD_updated_at = self.source.updated_at.strftime('%Y-%m-%d_%H%M%S')
+
+    def test_get_404(self):
+        response = self.client.get(
+            '/users/foo/sources/source1/v2/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('core.services.storages.cloud.aws.S3.exists')
+    def test_get_204_head(self, s3_exists_mock):
+        s3_exists_mock.return_value = False
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        s3_exists_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.v1_updated_at}.zip")
+
+    @patch('core.services.storages.cloud.aws.S3.has_path')
+    def test_get_204_version(self, s3_has_path_mock):
+        s3_has_path_mock.return_value = False
+
+        response = self.client.get(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        s3_has_path_mock.assert_called_once_with("users/username/username_source1_v1.")
+
+    @patch('core.services.storages.cloud.aws.S3.url_for')
+    @patch('core.services.storages.cloud.aws.S3.exists')
+    def test_get_302_head(self, s3_exists_mock, s3_url_for_mock):
+        s3_url_for_mock.return_value = 'https://signed.example/head.zip'
+        s3_exists_mock.return_value = True
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response['Location'], 'https://signed.example/head.zip')
+        s3_exists_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.HEAD_updated_at}.zip")
+        s3_url_for_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.HEAD_updated_at}.zip")
+
+    @patch('core.services.storages.cloud.aws.S3.url_for')
+    @patch('core.services.storages.cloud.aws.S3.get_last_key_from_path')
+    @patch('core.services.storages.cloud.aws.S3.has_path')
+    def test_get_302_version(self, s3_has_path_mock, s3_get_last_key_from_path_mock, s3_url_for_mock):
+        s3_url_for_mock.return_value = 'https://signed.example/v1.zip'
+        s3_has_path_mock.return_value = True
+        s3_get_last_key_from_path_mock.return_value = f'users/username/username_source1_v1.{self.v1_updated_at}.zip'
+
+        response = self.client.get(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response['Location'], 'https://signed.example/v1.zip')
+        s3_has_path_mock.assert_called_once_with("users/username/username_source1_v1.")
+        s3_get_last_key_from_path_mock.assert_called_once_with("users/username/username_source1_v1.")
+        s3_url_for_mock.assert_called_once_with(f'users/username/username_source1_v1.{self.v1_updated_at}.zip')
+
+    @patch('core.services.storages.cloud.aws.S3.url_for')
+    @patch('core.services.storages.cloud.aws.S3.exists')
+    def test_get_500_head_when_signed_url_generation_fails(self, s3_exists_mock, s3_url_for_mock):
+        s3_exists_mock.return_value = True
+        s3_url_for_mock.return_value = None
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.data, {'detail': 'Export exists but could not generate a download URL.'})
+        s3_exists_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.HEAD_updated_at}.zip")
+        s3_url_for_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.HEAD_updated_at}.zip")
+
+    @patch('core.sources.models.Source.is_exporting', new_callable=PropertyMock)
+    @patch('core.services.storages.cloud.aws.S3.exists')
+    def test_get_208_HEAD(self, s3_exists_mock, is_exporting_mock):
+        is_exporting_mock.return_value = True
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 208)
+        s3_exists_mock.assert_not_called()
+
+    @patch('core.sources.models.Source.is_exporting', new_callable=PropertyMock)
+    @patch('core.services.storages.cloud.aws.S3.has_path')
+    def test_get_208_version(self, s3_has_path_mock, is_exporting_mock):
+        is_exporting_mock.return_value = True
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.admin_token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 208)
+        s3_has_path_mock.assert_not_called()
+
+    def test_get_405(self):
+        random_user = UserProfileFactory()
+        response = self.client.get(
+            f'/users/{self.source.parent.mnemonic}/sources/{self.source.mnemonic}/{"HEAD"}/export/',
+            HTTP_AUTHORIZATION='Token ' + random_user.get_token(),
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+    def test_post_405(self):
+        random_user = UserProfileFactory()
+        response = self.client.post(
+            f'/users/{self.source.parent.mnemonic}/sources/{self.source.mnemonic}/{"HEAD"}/export/',
+            HTTP_AUTHORIZATION='Token ' + random_user.get_token(),
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+    @patch('core.services.storages.cloud.aws.S3.exists')
+    def test_post_303_head(self, s3_exists_mock):
+        s3_exists_mock.return_value = True
+        response = self.client.post(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response['URL'], self.source.uri + 'export/')
+        s3_exists_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.HEAD_updated_at}.zip")
+
+    @patch('core.services.storages.cloud.aws.S3.has_path')
+    def test_post_303_version(self, s3_has_path_mock):
+        s3_has_path_mock.return_value = True
+        response = self.client.post(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response['URL'], self.source_v1.uri + 'export/')
+        s3_has_path_mock.assert_called_once_with("users/username/username_source1_v1.")
+
+    @patch('core.sources.views.export_source')
+    @patch('core.services.storages.cloud.aws.S3.exists')
+    def test_post_202_head(self, s3_exists_mock, export_source_mock):
+        export_source_mock.__name__ = 'export_source'
+        s3_exists_mock.return_value = False
+        response = self.client.post(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        s3_exists_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.HEAD_updated_at}.zip")
+        export_source_mock.apply_async.assert_called_once_with((self.source.id,), queue='default', task_id=ANY)
+
+    @patch('core.sources.views.export_source')
+    @patch('core.services.storages.cloud.aws.S3.has_path')
+    def test_post_202_version(self, s3_has_path_mock, export_source_mock):
+        export_source_mock.__name__ = 'export_source'
+        s3_has_path_mock.return_value = False
+        response = self.client.post(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        s3_has_path_mock.assert_called_once_with("users/username/username_source1_v1.")
+        export_source_mock.apply_async.assert_called_once_with((self.source_v1.id,), queue='default', task_id=ANY)
+
+    @patch('core.sources.views.export_source')
+    @patch('core.services.storages.cloud.aws.S3.has_path')
+    def test_post_401_version_anonymous(self, s3_has_path_mock, export_source_mock):
+        export_source_mock.__name__ = 'export_source'
+        s3_has_path_mock.return_value = False
+        response = self.client.post(
+            self.source_v1.uri + 'export/',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 401)
+        s3_has_path_mock.assert_not_called()
+        export_source_mock.apply_async.assert_not_called()
+
+    @patch('core.sources.views.export_source')
+    @patch('core.services.storages.cloud.aws.S3.exists')
+    def test_post_409_head(self, s3_exists_mock, export_source_mock):
+        export_source_mock.__name__ = 'export_source'
+        export_source_mock.apply_async.side_effect = AlreadyQueued('already-queued')
+        s3_exists_mock.return_value = False
+        response = self.client.post(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 409)
+        s3_exists_mock.assert_called_once_with(f"users/username/username_source1_vHEAD.{self.HEAD_updated_at}.zip")
+        export_source_mock.apply_async.assert_called_once_with((self.source.id,), queue='default', task_id=ANY)
+
+    @patch('core.sources.views.export_source')
+    @patch('core.services.storages.cloud.aws.S3.has_path')
+    def test_post_409_version(self, s3_has_path_mock, export_source_mock):
+        s3_has_path_mock.return_value = False
+        export_source_mock.apply_async.side_effect = AlreadyQueued('already-queued')
+        export_source_mock.__name__ = 'export_source'
+        response = self.client.post(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 409)
+        s3_has_path_mock.assert_called_once_with("users/username/username_source1_v1.")
+        export_source_mock.apply_async.assert_called_once_with((self.source_v1.id,), queue='default', task_id=ANY)
+
+    def test_delete_405(self):
+        random_user = UserProfileFactory()
+        response = self.client.delete(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + random_user.get_token(),
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+    @patch('core.sources.models.Source.version_export_path', new_callable=PropertyMock)
+    @patch('core.sources.models.Source.has_export')
+    @patch('core.services.storages.cloud.aws.S3.remove')
+    def test_delete_204_head(self, s3_remove_mock, has_export_mock, export_path_mock):
+        has_export_mock.return_value = True
+        export_path_mock.return_value = 'head/export/path'
+        response = self.client.delete(
+            self.source.uri + 'HEAD/export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        s3_remove_mock.assert_called_once_with('head/export/path')
+
+    def test_delete_403(self):
+        random_user = UserProfileFactory()
+        response = self.client.delete(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + random_user.get_token(),
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    @patch('core.sources.models.Source.has_export')
+    def test_delete_404_no_export(self, has_export_mock):
+        has_export_mock.return_value = False
+        response = self.client.delete(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('core.sources.models.Source.version_export_path', new_callable=PropertyMock)
+    @patch('core.sources.models.Source.has_export')
+    @patch('core.services.storages.cloud.aws.S3.remove')
+    def test_delete_204(self, s3_remove_mock, has_export_mock, export_path_mock):
+        has_export_mock.return_value = True
+        export_path_mock.return_value = 'v1/export/path'
+        response = self.client.delete(
+            self.source_v1.uri + 'export/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        s3_remove_mock.assert_called_once_with('v1/export/path')
+
+    @patch('core.sources.models.Source.version_export_path', new_callable=PropertyMock)
+    @patch('core.sources.models.Source.has_export')
+    @patch('core.services.storages.cloud.aws.S3.remove')
+    def test_delete_401_anonymous(self, s3_remove_mock, has_export_mock, export_path_mock):
+        has_export_mock.return_value = True
+        export_path_mock.return_value = 'v1/export/path'
+        response = self.client.delete(
+            self.source_v1.uri + 'export/',
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 401)
+        s3_remove_mock.assert_not_called()
+
+
+class SourceVersionExternalExportViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.admin = UserProfile.objects.get(username='ocladmin')
+        self.admin_token = self.admin.get_token()
+        self.user = UserProfileFactory(username='username')
+        self.token = self.user.get_token()
+        self.source_v1 = UserSourceFactory(version='v1', mnemonic='source1', user=self.user)
+
+    def test_get_404_unknown_key(self):
+        response = self.client.get(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('core.services.storages.cloud.aws.S3.remove')
+    @patch('core.services.storages.cloud.aws.S3.upload')
+    def test_post_201_create_then_get_302_and_delete_204(self, s3_upload_mock, s3_remove_mock):
+        uploaded_file = SimpleUploadedFile('openmrs23.sql.zip', b'content', content_type='application/zip')
+
+        response = self.client.post(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            {'file': uploaded_file},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['key'], 'openmrs23-sql')
+        self.assertEqual(response.data['url'], self.source_v1.uri + 'export/openmrs23-sql/')
+        s3_upload_mock.assert_called_once()
+
+        from core.repos.models import RepoExternalExport
+        instance = RepoExternalExport.objects.get(key='openmrs23-sql')
+
+        with patch('core.services.storages.cloud.aws.S3.url_for') as s3_url_for_mock:
+            s3_url_for_mock.return_value = 'https://signed.example/openmrs23.sql.zip'
+            response = self.client.get(
+                self.source_v1.uri + 'export/openmrs23-sql/',
+                HTTP_AUTHORIZATION='Token ' + self.token,
+                format='json'
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response['Location'], 'https://signed.example/openmrs23.sql.zip')
+
+        response = self.client.delete(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        s3_remove_mock.assert_called_once_with(instance.file_path)
+        self.assertFalse(RepoExternalExport.objects.filter(key='openmrs23-sql').exists())
+
+    @patch('core.services.storages.cloud.aws.S3.remove')
+    @patch('core.services.storages.cloud.aws.S3.upload')
+    def test_post_200_update_existing(self, s3_upload_mock, s3_remove_mock):
+        from core.repos.models import RepoExternalExport
+
+        first_file = SimpleUploadedFile('openmrs23.sql.zip', b'v1', content_type='application/zip')
+        response = self.client.post(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            {'file': first_file},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+        self.assertEqual(response.status_code, 201)
+        first_file_path = RepoExternalExport.objects.get(key='openmrs23-sql').file_path
+
+        second_file = SimpleUploadedFile('openmrs23-v2.sql.zip', b'v2-content', content_type='application/zip')
+        response = self.client.post(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            {'file': second_file},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RepoExternalExport.objects.filter(key='openmrs23-sql').count(), 1)
+        s3_remove_mock.assert_called_once_with(first_file_path)
+        s3_upload_mock.assert_called()
+
+    def test_post_400_no_file(self):
+        response = self.client.post(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            {},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_post_403_non_admin(self):
+        random_user = UserProfileFactory()
+        uploaded_file = SimpleUploadedFile('openmrs23.sql.zip', b'content', content_type='application/zip')
+
+        response = self.client.post(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            {'file': uploaded_file},
+            HTTP_AUTHORIZATION='Token ' + random_user.get_token(),
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    @patch('core.services.storages.cloud.aws.S3.upload')
+    def test_export_serializer_includes_external_exports(self, s3_upload_mock):  # pylint: disable=unused-argument
+        uploaded_file = SimpleUploadedFile('openmrs23.sql.zip', b'content', content_type='application/zip')
+        self.client.post(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            {'file': uploaded_file},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        self.source_v1.refresh_from_db()
+        external_exports = SourceVersionExportSerializer(self.source_v1).data['external_exports']
+
+        self.assertEqual(len(external_exports), 1)
+        self.assertEqual(external_exports[0]['key'], 'openmrs23-sql')
+        self.assertEqual(external_exports[0]['url'], self.source_v1.uri + 'export/openmrs23-sql/')
+
+    def test_delete_404_unknown_key(self):
+        response = self.client.delete(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('core.services.storages.cloud.aws.S3.remove')
+    @patch('core.services.storages.cloud.aws.S3.upload')
+    def test_delete_403_non_admin(self, s3_upload_mock, s3_remove_mock):  # pylint: disable=unused-argument
+        uploaded_file = SimpleUploadedFile('openmrs23.sql.zip', b'content', content_type='application/zip')
+        self.client.post(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            {'file': uploaded_file},
+            HTTP_AUTHORIZATION='Token ' + self.token,
+        )
+
+        random_user = UserProfileFactory()
+        response = self.client.delete(
+            self.source_v1.uri + 'export/openmrs23-sql/',
+            HTTP_AUTHORIZATION='Token ' + random_user.get_token(),
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 403)
+        s3_remove_mock.assert_not_called()
+
+
+class ExportSourceTaskTest(OCLAPITestCase):
+    @patch('core.common.utils.get_export_service')
+    def test_export_source(self, export_service_mock):  # pylint: disable=too-many-locals
+        s3_mock = Mock()
+        export_service_mock.return_value = s3_mock
+        s3_mock.url_for = Mock(return_value='https://s3-url')
+        s3_mock.upload_file = Mock()
+        source = OrganizationSourceFactory()
+        concept1 = ConceptFactory(parent=source, names=1)
+        concept2 = ConceptFactory(parent=source, names=1)
+        mapping = MappingFactory(from_concept=concept2, to_concept=concept1, parent=source)
+
+        source_v1 = OrganizationSourceFactory(mnemonic=source.mnemonic, organization=source.organization, version='v1')
+        concept1.sources.add(source_v1)
+        concept2.sources.add(source_v1)
+        mapping.sources.add(source_v1)
+
+        export_source(source_v1.id)  # pylint: disable=no-value-for-parameter
+
+        latest_temp_dir = get_latest_dir_in_path('/tmp/')
+        zipped_file = zipfile.ZipFile(latest_temp_dir + '/export.zip')
+        exported_data = json.loads(zipped_file.read('export.json').decode('utf-8'))
+
+        self.assertEqual(
+            exported_data,
+            {
+                **SourceVersionExportSerializer(source_v1).data,
+                'concepts': ANY,
+                'mappings': ANY,
+                'export_time': ANY
+            }
+        )
+
+        time_taken = exported_data['export_time']
+        self.assertTrue('secs' in time_taken)
+        time_taken = float(time_taken.replace('secs', ''))
+        self.assertTrue(time_taken > 2)
+        source_v1.refresh_from_db()
+        self.assertEqual(source_v1.extras['__export_time'], str(time_taken))
+
+        exported_concepts = exported_data['concepts']
+        expected_concepts = ConceptVersionExportSerializer([concept2, concept1], many=True).data
+
+        self.assertEqual(len(exported_concepts), 2)
+        self.assertIn(expected_concepts[0], exported_concepts)
+        self.assertIn(expected_concepts[1], exported_concepts)
+        self.assertTrue('retire_reason' in exported_concepts[0]['names'][0])
+
+        exported_mappings = exported_data['mappings']
+        expected_mappings = MappingVersionExportSerializer([mapping], many=True).data
+
+        self.assertEqual(len(exported_mappings), 1)
+        self.assertEqual(expected_mappings, exported_mappings)
+
+        s3_upload_key = source_v1.version_export_path
+        s3_mock.upload_file.assert_called_once_with(
+            key=s3_upload_key, file_path=latest_temp_dir + '/export.zip', binary=True,
+            metadata={'ContentType': 'application/zip'}, headers={'content-type': 'application/zip'}
+        )
+        s3_mock.url_for.assert_called_once_with(s3_upload_key)
+
+        import shutil
+        shutil.rmtree(latest_temp_dir)
+
+
+class SourceLogoViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.user = UserProfileFactory(username='username')
+        self.token = self.user.get_token()
+        self.source = UserSourceFactory(mnemonic='source1', user=self.user)
+
+    @patch('core.services.storages.cloud.aws.S3.upload_base64')
+    def test_post_200(self, upload_base64_mock):
+        upload_base64_mock.return_value = 'users/username/sources/source1/logo.png'
+        self.assertIsNone(self.source.logo_url)
+        self.assertIsNone(self.source.logo_path)
+
+        response = self.client.post(
+            self.source.uri + 'logo/',
+            {
+                'base64': 'base64-data'
+            },
+            HTTP_AUTHORIZATION='Token ' + self.token,
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        expected_logo_url = 'http://oclapi2-dev.s3.amazonaws.com/users/username/sources/source1/logo.png'
+        self.assertEqual(response.data['logo_url'].replace('https://', 'http://'), expected_logo_url)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.logo_url.replace('https://', 'http://'), expected_logo_url)
+        self.assertEqual(self.source.logo_path, 'users/username/sources/source1/logo.png')
+        upload_base64_mock.assert_called_once_with(
+            'base64-data', 'users/username/sources/source1/logo.png', False, True
+        )
+
+
+class SourceVersionSummaryViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = OrganizationSourceFactory()
+        self.concept1 = ConceptFactory(parent=self.source)
+        self.concept2 = ConceptFactory(parent=self.source)
+        self.mapping = MappingFactory(from_concept=self.concept1, to_concept=self.concept2, parent=self.source)
+
+    def test_get_200(self):
+        self.source.active_concepts = 2
+        self.source.active_mappings = 1
+        self.source.save()
+
+        response = self.client.get(self.source.url + 'HEAD/summary/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], 'HEAD')
+        self.assertEqual(response.data['active_concepts'], 2)
+        self.assertEqual(response.data['active_mappings'], 1)
+
+    def test_put_200(self):
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.active_mappings, None)
+        self.assertEqual(self.source.active_concepts, None)
+
+        admin_token = UserProfileFactory(is_superuser=True, is_staff=True).get_token()
+
+        response = self.client.put(
+            self.source.url + 'HEAD/summary/',
+            HTTP_AUTHORIZATION=f'Token {admin_token}'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.active_mappings, 1)
+        self.assertEqual(self.source.active_concepts, 2)
+
+
+class SourceSummaryViewTest(OCLAPITestCase):
+    def index(self):
+        self.patch_concept_es_mapping_for_ci()
+        ConceptDocument().update(self.source.concepts_set.all())
+        MappingDocument().update(self.source.mappings_set.all())
+
+    def setUp(self):
+        self.maxDiff = None
+        super().setUp()
+        self.random_key = str(time.time())
+        self.source = OrganizationSourceFactory(mnemonic=self.random_key)
+        self.concept1 = ConceptFactory(
+            parent=self.source, concept_class=self.random_key, datatype=self.random_key,
+        )
+        self.concept2 = ConceptFactory(
+            parent=self.source, concept_class=self.random_key, datatype=self.random_key,
+        )
+        self.mapping = MappingFactory(
+            from_concept=self.concept1, to_concept=self.concept2, parent=self.source,
+            map_type=self.random_key
+        )
+        self.index()
+
+    def test_get_200(self):
+        self.source.active_concepts = 2
+        self.source.active_mappings = 1
+        self.source.save()
+
+        response = self.client.get(self.source.url + 'summary/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], self.source.mnemonic)
+        self.assertEqual(response.data['active_concepts'], 2)
+        self.assertEqual(response.data['active_mappings'], 1)
+
+    def test_get_200_verbose(self):  # pylint: disable=too-many-statements
+        self.source.active_concepts = 2
+        self.source.active_mappings = 1
+        self.source.save()
+
+        response = self.client.get(self.source.url + 'summary/?verbose=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], self.source.mnemonic)
+        self.assertEqual(
+            response.data['concepts'],
+            {
+                'active': 2,
+                'retired': 0,
+                'concept_class': [(self.random_key, 2)],
+                'datatype': [(self.random_key, 2)],
+                'name_type': [],
+                'locale': []
+            }
+        )
+        self.assertEqual(
+            response.data['mappings'],
+            {
+                'active': 1,
+                'retired': 0,
+                'map_type': [(self.random_key, 1)],
+                'from_concept_source': [(self.random_key, 1)],
+                'to_concept_source': [(self.random_key, 1)],
+            }
+        )
+
+        response = self.client.get(
+            self.source.url + 'summary/?verbose=true',
+            HTTP_AUTHORIZATION=f'Token {self.source.created_by.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], self.source.mnemonic)
+        self.assertEqual(
+            response.data['concepts'],
+            {
+                'active': 2,
+                'retired': 0,
+                'concept_class': [(self.random_key, 2)],
+                'datatype': [(self.random_key, 2)],
+                'name_type': [],
+                'locale': [],
+                'contributors': [('ocladmin', 2)]
+            }
+        )
+        self.assertEqual(
+            response.data['mappings'],
+            {
+                'active': 1,
+                'retired': 0,
+                'map_type': [(self.random_key, 1)],
+                'from_concept_source': [(self.random_key, 1)],
+                'to_concept_source': [(self.random_key, 1)],
+                'contributors': [('ocladmin', 1)]
+            }
+        )
+
+        concept3 = ConceptFactory(
+            parent=self.source, datatype=f'FOO-{self.random_key}', concept_class=f'FOOBAR-{self.random_key}',
+            names=[ConceptNameFactory.build(locale='en', type='SHORT')]
+        )
+        concept4 = ConceptFactory(
+            parent=self.source, datatype=f'FOOBAR-{self.random_key}', concept_class=f'FOOBAR-{self.random_key}',
+            names=[ConceptNameFactory.build(locale='en', type='SHORT')]
+        )
+        random_source1 = OrganizationSourceFactory()
+        random_source2 = OrganizationSourceFactory()
+        MappingFactory(
+            map_type=f'FOOBAR-{self.random_key}', parent=self.source, from_concept=concept3, from_source=self.source,
+            to_source=random_source1
+        )
+        MappingFactory(
+            map_type=f'FOOBAR-{self.random_key}', parent=self.source, to_concept=concept4, to_source=self.source,
+            from_source=random_source2
+        )
+        self.index()
+        self.source.active_concepts = 4
+        self.source.active_mappings = 3
+        self.source.save()
+
+        response = self.client.get(self.source.url + 'summary/?verbose=true')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], self.source.mnemonic)
+        self.assertEqual(
+            response.data['concepts'],
+            {
+                'active': 4,
+                'retired': 0,
+                'concept_class': [(self.random_key, 2), (f'FOOBAR-{self.random_key}', 2)],
+                'datatype': [(self.random_key, 2), (f'FOO-{self.random_key}', 1), (f'FOOBAR-{self.random_key}', 1)],
+                'locale': [('en', 2)],
+                'name_type': [('SHORT', 2)]
+            }
+        )
+        self.assertEqual(
+            response.data['mappings'],
+            {
+                'active': 3,
+                'retired': 0,
+                'map_type': [(f'foobar-{self.random_key}', 2), (self.random_key, 1)],
+                'from_concept_source': [(self.random_key, 2), (random_source2.mnemonic, 1)],
+                'to_concept_source': [(self.random_key, 2), (random_source1.mnemonic, 1)],
+            }
+        )
+        response = self.client.get(
+            self.source.url + 'summary/?verbose=true&distribution=from_sources_map_type'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], self.source.mnemonic)
+        self.assertEqual(
+            response.data['distribution']['from_sources_map_type'],
+            [{
+                'id': 'HEAD',
+                'version_url': self.source.url,
+                'type': 'Source Version',
+                'version': 'HEAD',
+                'short_code': self.source.mnemonic,
+                'released': False,
+                'name': ANY,
+                'description': ANY,
+                'distribution': {
+                    'total': 2,
+                    'retired': 0,
+                    'active': 2,
+                    'map_types': [{
+                        'map_type': self.random_key,
+                        'total': 1,
+                        'retired': 0,
+                        'active': 1
+                    }, {
+                        'map_type': f'foobar-{self.random_key}',
+                        'total': 1,
+                        'retired': 0,
+                        'active': 1
+                    }]
+                }
+            }, {
+                'id': 'HEAD',
+                'version_url': random_source2.url,
+                'type': 'Source Version',
+                'version': 'HEAD',
+                'short_code': random_source2.mnemonic,
+                'released': False,
+                'name': ANY,
+                'description': ANY,
+                'distribution': {
+                    'total': 1,
+                    'retired': 0,
+                    'active': 1,
+                    'map_types': [{
+                        'map_type': f'foobar-{self.random_key}',
+                        'total': 1,
+                        'retired': 0,
+                        'active': 1
+                    }]
+                }
+            }]
+        )
+
+        response = self.client.get(
+            self.source.url + 'summary/?verbose=true&distribution=to_sources_map_type'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], self.source.mnemonic)
+        self.assertEqual(
+            response.data['distribution']['to_sources_map_type'],
+            [{
+                'id': 'HEAD',
+                'version_url': self.source.url,
+                'type': 'Source Version',
+                'version': 'HEAD',
+                'short_code': self.source.mnemonic,
+                'released': False,
+                'name': ANY,
+                'description': ANY,
+                'distribution': {
+                    'total': 2,
+                    'retired': 0,
+                    'active': 2,
+                    'map_types': [{
+                        'map_type': self.random_key,
+                        'total': 1,
+                        'retired': 0,
+                        'active': 1
+                    }, {
+                        'map_type': f'foobar-{self.random_key}',
+                        'total': 1,
+                        'retired': 0,
+                        'active': 1
+                    }]
+                }
+            }, {
+                'id': 'HEAD',
+                'version_url': random_source1.url,
+                'type': 'Source Version',
+                'version': 'HEAD',
+                'short_code': random_source1.mnemonic,
+                'released': False,
+                'name': ANY,
+                'description': ANY,
+                'distribution': {
+                    'total': 1,
+                    'retired': 0,
+                    'active': 1,
+                    'map_types': [{
+                        'map_type': f'foobar-{self.random_key}',
+                        'total': 1,
+                        'retired': 0,
+                        'active': 1
+                    }]
+                }
+            }]
+        )
+
+        response = self.client.get(
+            self.source.url + 'summary/?verbose=true&distribution=map_type,concept_class,datatype,name_type,name_locale'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['uuid'], str(self.source.id))
+        self.assertEqual(response.data['id'], self.source.mnemonic)
+        self.assertCountEqual(
+            response.data['distribution']['concept_class'],
+            [
+                {'concept_class': self.random_key, 'count': 2},
+                {'concept_class': f'FOOBAR-{self.random_key}', 'count': 2}
+            ]
+        )
+        self.assertCountEqual(
+            response.data['distribution']['datatype'],
+            [
+                {'count': 2, 'datatype': self.random_key},
+                {'count': 1, 'datatype': f'FOOBAR-{self.random_key}'},
+                {'count': 1, 'datatype': f'FOO-{self.random_key}'}
+            ]
+        )
+        self.assertCountEqual(
+            response.data['distribution']['map_type'],
+            [
+                {'count': 2, 'map_type': f'FOOBAR-{self.random_key}'},
+                {'count': 1, 'map_type': self.random_key}
+            ]
+        )
+        self.assertCountEqual(
+            response.data['distribution']['name_locale'],
+            [
+                {'count': 2, 'locale': 'en'},
+            ]
+        )
+        self.assertCountEqual(
+            response.data['distribution']['name_type'],
+            [
+                {'count': 2, 'type': 'SHORT'},
+            ]
+        )
+
+    def test_put_200(self):
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.active_mappings, None)
+        self.assertEqual(self.source.active_concepts, None)
+
+        admin_token = UserProfileFactory(is_superuser=True, is_staff=True).get_token()
+
+        response = self.client.put(
+            self.source.url + 'summary/',
+            HTTP_AUTHORIZATION=f'Token {admin_token}'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.active_mappings, 1)
+        self.assertEqual(self.source.active_concepts, 2)
+
+
+class SourceHierarchyViewTest(OCLAPITestCase):
+    @patch('core.sources.models.Source.hierarchy')
+    def test_get_200(self, hierarchy_mock):
+        source = OrganizationSourceFactory()
+        hierarchy_mock.return_value = 'hierarchy-response'
+
+        response = self.client.get(source.url + 'hierarchy/?limit=1000&offset=100')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, 'hierarchy-response')
+        hierarchy_mock.assert_called_once_with(offset=100, limit=1000)
+
+
+class SourceMappingsIndexViewTest(OCLAPITestCase):
+    @patch('core.sources.views.index_source_mappings')
+    def test_post_202(self, index_source_mappings_task_mock):
+        index_source_mappings_task_mock.__name__ = 'index_source_mappings'
+        index_source_mappings_task_mock.apply_async = Mock(return_value=Mock(state='PENDING', task_id='task-id-123'))
+        source = OrganizationSourceFactory(id=100)
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.post(
+            source.url + 'mappings/indexes/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            response.data, {
+                'state': 'PENDING',
+                'username': 'soop',
+                'id': ANY,
+                'task': ANY,
+                'queue': 'indexing',
+                'name': 'index_source_mappings'
+            })
+        index_source_mappings_task_mock.apply_async.assert_called_once_with(
+            (100, None, False, True, True, True), queue='indexing', task_id=ANY)
+
+    @patch('core.sources.views.index_source_mappings')
+    def test_post_202_single_batch(self, index_source_mappings_task_mock):
+        index_source_mappings_task_mock.__name__ = 'index_source_mappings'
+        index_source_mappings_task_mock.apply_async = Mock(return_value=Mock(state='PENDING', task_id='task-id-123'))
+        source = OrganizationSourceFactory(id=100)
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.post(
+            source.url + 'mappings/indexes/',
+            {'single_batch': True},
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            response.data, {
+                'state': 'PENDING',
+                'username': 'soop',
+                'id': ANY,
+                'task': ANY,
+                'queue': 'indexing',
+                'name': 'index_source_mappings'
+            })
+        index_source_mappings_task_mock.apply_async.assert_called_once_with(
+            (100, None, True, True, True, True), queue='indexing', task_id=ANY)
+
+
+class SourceConceptsIndexViewTest(OCLAPITestCase):
+    @patch('core.sources.views.index_source_concepts')
+    def test_post_202(self, index_source_concepts_task_mock):
+        index_source_concepts_task_mock.__name__ = 'index_source_concepts'
+        index_source_concepts_task_mock.apply_async = Mock(return_value=Mock(state='PENDING', task_id='task-id-123'))
+        source = OrganizationSourceFactory(id=100)
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.post(
+            source.url + 'concepts/indexes/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            response.data,
+            {
+                'state': 'PENDING',
+                'username': 'soop',
+                'id': ANY,
+                'task': ANY,
+                'queue': 'indexing',
+                'name': 'index_source_concepts',
+            }
+        )
+        index_source_concepts_task_mock.apply_async.assert_called_once_with(
+            (100, None, False, True, True, True), queue='indexing', task_id=ANY)
+
+    @patch('core.sources.views.index_source_concepts')
+    def test_post_202_single_batch(self, index_source_concepts_task_mock):
+        index_source_concepts_task_mock.__name__ = 'index_source_concepts'
+        index_source_concepts_task_mock.apply_async = Mock(return_value=Mock(state='PENDING', task_id='task-id-123'))
+        source = OrganizationSourceFactory(id=100)
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.post(
+            source.url + 'concepts/indexes/',
+            {'single_batch': True},
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}',
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(
+            response.data,
+            {
+                'state': 'PENDING',
+                'username': 'soop',
+                'id': ANY,
+                'task': ANY,
+                'queue': 'indexing',
+                'name': 'index_source_concepts',
+            }
+        )
+        index_source_concepts_task_mock.apply_async.assert_called_once_with(
+            (100, None, True, True, True, True), queue='indexing', task_id=ANY)
+
+
+class SourceVersionConceptsCacheViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = OrganizationSourceFactory()
+        self.source_version = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.source.organization, version='v1')
+
+    @patch('core.sources.models.Source.clear_concepts_cache')
+    def test_delete_204(self, clear_concepts_cache_mock):
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.delete(
+            self.source_version.url + 'concepts/cache/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        clear_concepts_cache_mock.assert_called_once()
+
+    @patch('core.sources.models.Source.clear_concepts_cache')
+    def test_delete_403_for_non_staff_user(self, clear_concepts_cache_mock):
+        user = UserProfileFactory(username='non-staff', organizations=[self.source.organization])
+
+        response = self.client.delete(
+            self.source_version.url + 'concepts/cache/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 403)
+        clear_concepts_cache_mock.assert_not_called()
+
+    def test_delete_401_for_anonymous_user(self):
+        response = self.client.delete(self.source_version.url + 'concepts/cache/')
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_delete_404_for_unknown_version(self):
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.delete(
+            self.source.url + 'unknown-version/concepts/cache/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+
+class SourceVersionMappingsCacheViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = OrganizationSourceFactory()
+        self.source_version = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.source.organization, version='v1')
+
+    @patch('core.sources.models.Source.clear_mappings_cache')
+    def test_delete_204(self, clear_mappings_cache_mock):
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.delete(
+            self.source_version.url + 'mappings/cache/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 204)
+        clear_mappings_cache_mock.assert_called_once()
+
+    @patch('core.sources.models.Source.clear_mappings_cache')
+    def test_delete_403_for_non_staff_user(self, clear_mappings_cache_mock):
+        user = UserProfileFactory(username='non-staff', organizations=[self.source.organization])
+
+        response = self.client.delete(
+            self.source_version.url + 'mappings/cache/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 403)
+        clear_mappings_cache_mock.assert_not_called()
+
+    def test_delete_401_for_anonymous_user(self):
+        response = self.client.delete(self.source_version.url + 'mappings/cache/')
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_delete_404_for_unknown_version(self):
+        user = UserProfileFactory(is_superuser=True, is_staff=True, username='soop')
+
+        response = self.client.delete(
+            self.source.url + 'unknown-version/mappings/cache/',
+            HTTP_AUTHORIZATION=f'Token {user.get_token()}'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+
+class SourceVersionProcessingViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = OrganizationSourceFactory()
+        self.token = self.source.created_by.get_token()
+
+    @patch('core.common.models.AsyncResult.failed')
+    @patch('core.common.models.AsyncResult.successful')
+    def test_get_200(self, async_result_success_mock, async_result_failure_mock):
+        async_result_success_mock.return_value = False
+        async_result_failure_mock.return_value = False
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/processing/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'False')
+
+        self.source.add_processing("Task123")
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/processing/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'True')
+
+        response = self.client.get(
+            self.source.uri + 'HEAD/processing/?debug=true',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, {'is_processing': True, 'process_ids': ['Task123']})
+
+    @patch('core.common.models.AsyncResult.failed')
+    @patch('core.common.models.AsyncResult.successful')
+    def test_post_200(self, async_result_success_mock, async_result_failure_mock):
+        async_result_success_mock.return_value = False
+        async_result_failure_mock.return_value = False
+
+        self.source.add_processing("Task123")
+        self.assertTrue(self.source.is_processing)
+
+        response = self.client.post(
+            self.source.uri + 'HEAD/processing/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.source.refresh_from_db()
+        self.assertFalse(self.source.is_processing)
+
+        response = self.client.post(
+            self.source.uri + 'HEAD/processing/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.source.refresh_from_db()
+        self.assertFalse(self.source.is_processing)
+
+
+class SourceMappedSourcesListViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = OrganizationSourceFactory()
+        self.token = self.source.created_by.get_token()
+
+    def test_get_404(self):
+        response = self.client.get(
+            '/orgs/my/sources/empty/mapped-sources/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('core.sources.views.Source.get_mapped_sources')
+    def test_get_200(self, get_mapped_sources_mock):
+        get_mapped_sources_mock.return_value = Source.objects.none()
+
+        response = self.client.get(
+            self.source.url + 'mapped-sources/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+        get_mapped_sources_mock.assert_called_once()
+
+    @patch('core.sources.views.Source.get_mapped_sources')
+    def test_get_200_with_data(self, get_mapped_sources_mock):
+        source2 = OrganizationSourceFactory(mnemonic='source2')
+        get_mapped_sources_mock.return_value = Source.objects.filter(id=source2.id)
+
+        response = self.client.get(
+            self.source.url + 'mapped-sources/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['url'], source2.url)
+        get_mapped_sources_mock.assert_called_once()
+
+    def test_post_405(self):
+        response = self.client.post(
+            self.source.url + 'mapped-sources/',
+            {'default_locale': 'en'},
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+
+class SourceVersionMappedSourcesListViewTest(OCLAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = OrganizationSourceFactory()
+        self.source_version = OrganizationSourceFactory(
+            mnemonic=self.source.mnemonic, organization=self.source.organization, version='v1')
+        self.token = self.source.created_by.get_token()
+
+    def test_get_404(self):
+        response = self.client.get(
+            '/orgs/my/sources/empty/v1/mapped-sources/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('core.sources.views.Source.get_mapped_sources')
+    def test_get_200(self, get_mapped_sources_mock):
+        get_mapped_sources_mock.return_value = Source.objects.none()
+
+        response = self.client.get(
+            self.source_version.url + 'mapped-sources/',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 0)
+        get_mapped_sources_mock.assert_called_once()
+
+    @patch('core.sources.views.Source.get_mapped_sources')
+    def test_get_200_with_data(self, get_mapped_sources_mock):
+        source2 = OrganizationSourceFactory(mnemonic='source2')
+        get_mapped_sources_mock.return_value = Source.objects.filter(id=source2.id)
+
+        response = self.client.get(
+            self.source_version.url + 'mapped-sources/?excludeSelf=false',
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0]['url'], source2.url)
+        get_mapped_sources_mock.assert_called_once_with(exclude_self=False)
+
+    def test_post_405(self):
+        response = self.client.post(
+            self.source_version.url + 'mapped-sources/',
+            {'default_locale': 'en'},
+            HTTP_AUTHORIZATION=f'Token {self.token}'
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+
+class SourceConceptsCloneViewTest(OCLAPITestCase):
+    def setUp(self):
+        self.concept = ConceptFactory()
+        self.clone_to_source = OrganizationSourceFactory()
+        self.user = UserProfileFactory(organizations=[self.clone_to_source.organization])
+        self.token = self.user.get_token()
+
+    def post_clone(self, expressions, user=None, parameters=None):
+        token = (user or self.user).get_token()
+        return self.client.post(
+            self.clone_to_source.uri + 'concepts/$clone/',
+            {'expressions': expressions, 'parameters': parameters or {'mapTypes': 'Q-AND-A'}},
+            HTTP_AUTHORIZATION=f"Token {token}", format='json')
+
+    @patch('core.bundles.models.Bundle.clone')
+    def test_post_reports_limit_per_expression(self, bundle_clone_mock):
+        bundle_clone_mock.side_effect = CloneLimitExceeded(100, 150)
+        response = self.post_clone([self.concept.uri])
+        self.assertEqual(response.status_code, 200)
+        errors = response.data[self.concept.uri]['errors']
+        self.assertEqual(response.data[self.concept.uri]['status'], 403)
+        self.assertEqual(errors['error_code'], 'clone_resources_per_call_limit_reached')
+        self.assertEqual(errors['limit'], 100)
+        self.assertEqual(errors['requested'], 150)
+        self.assertEqual(bundle_clone_mock.call_args[1]['resource_budget'], 100)  # no group -> preview value
+
+    @patch('core.bundles.models.Bundle.clone')
+    def test_post_budget_is_per_call_across_expressions(self, bundle_clone_mock):
+        other = ConceptFactory(parent=self.concept.parent)
+
+        def fake_clone(*args, **kwargs):  # pylint: disable=unused-argument
+            bundle = Bundle(root=self.concept, repo_version=self.concept.parent, params={}, verbose=False)
+            bundle.concepts = [self.concept] * 60
+            bundle.mappings = []
+            return bundle
+        bundle_clone_mock.side_effect = fake_clone
+
+        response = self.post_clone([self.concept.uri, other.uri])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([call_[1]['resource_budget'] for call_ in bundle_clone_mock.call_args_list], [100, 40])
+
+    @patch('core.bundles.models.Bundle.clone')
+    def test_post_staff_has_no_budget(self, bundle_clone_mock):
+        bundle_clone_mock.return_value = Bundle(
+            root=self.concept, repo_version=self.concept.parent, params={}, verbose=False)
+        self.post_clone([self.concept.uri], user=UserProfileFactory(is_staff=True))
+        self.assertIsNone(bundle_clone_mock.call_args[1]['resource_budget'])
+
+    def test_post_too_many_expressions_403(self):
+        response = self.post_clone([f'/orgs/NoOrg/sources/NoSource/concepts/{index}/' for index in range(101)])
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['error_code'], 'clone_resources_per_call_limit_reached')
+        self.assertEqual(response.data['requested'], 101)
+
+    def test_post_blocked_user_403(self):
+        UserCapabilityOverride.objects.create(
+            user=self.user, capability_id=CLONE_RESOURCES_PER_CALL_CAPABILITY_ID, limit=-1)
+        response = self.post_clone([self.concept.uri])
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['error_code'], 'clone_resources_per_call_not_entitled')
+
+    @override_settings(CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}})
+    def test_post_409_while_another_clone_runs(self):
+        cache.add(f'clone_in_progress:{self.user.id}', 1, timeout=60)
+        try:
+            response = self.post_clone([self.concept.uri])
+        finally:
+            cache.delete(f'clone_in_progress:{self.user.id}')
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['error_code'], 'clone_in_progress')
+
+    def test_post_bad_request(self):
+        response = self.client.post(
+            self.clone_to_source.uri + 'concepts/$clone/',
+            {'foo': 'bar'},
+            HTTP_AUTHORIZATION=f"Token {self.token}",
+            format='json'
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch('core.bundles.models.Bundle.clone')
+    def test_post_success(self, bundle_clone_mock):
+        parameters = {'mapTypes': 'Q-AND-A,CONCEPT-SET'}
+        bundle_clone_mock.return_value = Bundle(
+            root=self.concept, repo_version=self.concept.parent, params=parameters, verbose=False
+        )
+
+        response = self.client.post(
+            self.clone_to_source.uri + 'concepts/$clone/',
+            {'expressions': [self.concept.uri, '/orgs/MyOrg/sources/MySource/concepts/123/'], 'parameters': parameters},
+            HTTP_AUTHORIZATION=f"Token {self.token}",
+            format='json'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data,
+            {
+                self.concept.uri: {
+                    'status': 200,
+                    'bundle': {
+                        'resourceType': 'Bundle',
+                        'type': 'searchset',
+                        'meta': ANY,
+                        'total': None,
+                        'entry': [],
+                        'requested_url': None,
+                        'repo_version_url': self.concept.parent.uri + 'HEAD/'
+                    }
+                },
+                '/orgs/MyOrg/sources/MySource/concepts/123/': {
+                    'status': 404,
+                    'errors': ['Concept to clone with expression /orgs/MyOrg/sources/MySource/concepts/123/ not found.']
+                }
+            }
+        )
+        bundle_clone_mock.assert_called_once_with(
+            self.concept, self.concept.parent, self.clone_to_source, self.user, ANY, False,
+            resource_budget=100, **parameters  # no group: the preview per-call budget (ocl_online#230)
+        )
+
+class SourceVersionsChangelogOutputViewTest(OCLAPITestCase):
+    def _build_changelog_output_fixture(self):  # pylint: disable=too-many-locals
+        source = OrganizationSourceFactory()
+        source_v1 = OrganizationSourceFactory(mnemonic=source.mnemonic, organization=source.organization, version='v1')
+        source_v2 = OrganizationSourceFactory(mnemonic=source.mnemonic, organization=source.organization, version='v2')
+        concept_v1 = ConceptFactory(
+            parent=source,
+            mnemonic='concept-detailed',
+            concept_class='Diagnosis',
+            datatype='None',
+            names=[
+                ConceptNameFactory.build(name='Detailed name v1', locale='en', locale_preferred=True),
+            ],
+            descriptions=[
+                ConceptDescriptionFactory.build(name='Detailed description v1', locale='en'),
+            ],
+        )
+        concept_v2 = ConceptFactory(
+            parent=source,
+            mnemonic=concept_v1.mnemonic,
+            version='v2',
+            concept_class='Drug',
+            datatype='Text',
+            names=[
+                ConceptNameFactory.build(name='Detailed name v2', locale='en', locale_preferred=True),
+                ConceptNameFactory.build(name='Nome detalhado', locale='pt', locale_preferred=False),
+            ],
+            descriptions=[
+                ConceptDescriptionFactory.build(name='Detailed description v2', locale='en'),
+            ],
+        )
+        concept_retired_v1 = ConceptFactory(
+            parent=source,
+            mnemonic='concept-retired',
+            concept_class='Diagnosis',
+            datatype='None',
+            names=[
+                ConceptNameFactory.build(name='Retired name v1', locale='en', locale_preferred=True),
+            ],
+        )
+        concept_retired_v2 = ConceptFactory(
+            parent=source,
+            mnemonic=concept_retired_v1.mnemonic,
+            version='v2',
+            concept_class='Diagnosis',
+            datatype='None',
+            retired=True,
+            names=[
+                ConceptNameFactory.build(name='Retired name v2', locale='en', locale_preferred=True),
+            ],
+        )
+        mapping_from_concept = ConceptFactory(parent=source, mnemonic='mapping-from-concept')
+        mapping_target_v1 = ConceptFactory(parent=source, mnemonic='mapping-target-v1')
+        mapping_target_v2 = ConceptFactory(parent=source, mnemonic='mapping-target-v2')
+        mapping_v1 = MappingFactory(
+            parent=source,
+            mnemonic='mapping-detailed',
+            from_concept=mapping_from_concept,
+            to_concept=mapping_target_v1,
+            external_id='mapping-v1',
+        )
+        mapping_v2 = MappingFactory(
+            parent=source,
+            mnemonic=mapping_v1.mnemonic,
+            version='v2',
+            from_concept=mapping_from_concept,
+            to_concept=mapping_target_v2,
+            map_type='NARROWER-THAN',
+            external_id='mapping-v2',
+        )
+        mapping_retired_v1 = MappingFactory(
+            parent=source,
+            mnemonic='mapping-retired',
+            from_concept=mapping_from_concept,
+            to_concept=mapping_target_v1,
+            external_id='mapping-retired-v1',
+        )
+        mapping_retired_v2 = MappingFactory(
+            parent=source,
+            mnemonic=mapping_retired_v1.mnemonic,
+            version='v2',
+            from_concept=mapping_from_concept,
+            to_concept=mapping_target_v1,
+            external_id='mapping-retired-v2',
+            retired=True,
+        )
+
+        source_v1.concepts.add(concept_v1)
+        source_v1.concepts.add(concept_retired_v1)
+        source_v2.concepts.add(concept_v2)
+        source_v2.concepts.add(concept_retired_v2)
+        source_v1.mappings.add(mapping_v1)
+        source_v1.mappings.add(mapping_retired_v1)
+        source_v2.mappings.add(mapping_v2)
+        source_v2.mappings.add(mapping_retired_v2)
+
+        for concept in Concept.objects.filter(parent=source):
+            concept.set_checksums()
+
+        for mapping in Mapping.objects.filter(parent=source):
+            mapping.set_checksums()
+
+        return {
+            'concept_v1': concept_v1,
+            'concept_v2': concept_v2,
+            'concept_retired_v2': concept_retired_v2,
+            'mapping_v1': mapping_v1,
+            'mapping_v2': mapping_v2,
+            'mapping_retired_v2': mapping_retired_v2,
+            'source': source,
+            'source_v1': source_v1,
+            'source_v2': source_v2,
+        }
+
+    def _post_changelog(self, source_v1, source_v2, token, verbosity, output):  # pylint: disable=too-many-arguments
+        return self.client.post(
+            f'/sources/$changelog/?inline=true&output={output}',
+            {
+                'version1': source_v1.uri,
+                'version2': source_v2.uri,
+                'verbosity': verbosity,
+            },
+            HTTP_AUTHORIZATION=f'Token {token}',
+            format='json'
+        )
+
+    def test_json_output_for_all_verbosity_levels(self):
+        # A persisted changelog is always computed and cached at the richest verbosity (matching
+        # what save_changelog_and_comparison already does for auto-triggered changelogs), so every
+        # request for the same pair gets that same fully-enriched payload regardless of the
+        # verbosity it actually asked for -- including the very first (cache-populating) request.
+        data = self._build_changelog_output_fixture()
+        token = data['source'].created_by.get_token()
+
+        for verbosity in range(1, 5):
+            with self.subTest(output='json', verbosity=verbosity):
+                response = self._post_changelog(
+                    data['source_v1'], data['source_v2'], token, verbosity, output='json'
+                )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn('markdown', response.data)
+                self.assertEqual(response.data['meta']['diff']['concepts']['changed_major'], 1)
+                self.assertEqual(response.data['meta']['diff']['mappings']['changed_major'], 1)
+
+                changed_concept = response.data['concepts']['changed_major']['concept-detailed']
+                changed_mapping = response.data['mappings']['changed_major']['mapping-detailed']
+
+                self.assertEqual(changed_concept['concept_class'], data['concept_v2'].concept_class)
+                self.assertEqual(changed_concept['prev_concept_class'], data['concept_v1'].concept_class)
+                self.assertEqual(changed_concept['datatype'], data['concept_v2'].datatype)
+                self.assertEqual(changed_concept['prev_datatype'], data['concept_v1'].datatype)
+                self.assertIn('Detailed name v2', [name['name'] for name in changed_concept['names']])
+                self.assertIn('Nome detalhado', [name['name'] for name in changed_concept['names']])
+                self.assertIn('Detailed name v1', [name['name'] for name in changed_concept['prev_names']])
+                self.assertIn(
+                    'Detailed description v2',
+                    [description['description'] for description in changed_concept['descriptions']]
+                )
+                self.assertIn(
+                    'Detailed description v1',
+                    [description['description'] for description in changed_concept['prev_descriptions']]
+                )
+                self.assertEqual(changed_mapping['external_id'], data['mapping_v2'].external_id)
+                self.assertEqual(changed_mapping['prev_to_concept'], data['mapping_v1'].to_concept.mnemonic)
+                self.assertEqual(changed_mapping['to_concept'], data['mapping_v2'].to_concept.mnemonic)
+                self.assertEqual(changed_mapping['prev_map_type'], data['mapping_v1'].map_type)
+                self.assertEqual(changed_mapping['map_type'], data['mapping_v2'].map_type)
+                retired_concept = response.data['concepts']['changed_retired']['concept-retired']
+                self.assertEqual(retired_concept['concept_class'], data['concept_retired_v2'].concept_class)
+                self.assertIn('Retired name v2', [name['name'] for name in retired_concept['names']])
+                retired_mapping = response.data['mappings']['changed_retired']['mapping-retired']
+                self.assertEqual(retired_mapping['external_id'], data['mapping_retired_v2'].external_id)
+
+    def test_markdown_output_for_all_verbosity_levels(self):
+        data = self._build_changelog_output_fixture()
+        token = data['source'].created_by.get_token()
+
+        for verbosity in range(1, 5):
+            with self.subTest(output='markdown', verbosity=verbosity):
+                response = self._post_changelog(
+                    data['source_v1'], data['source_v2'], token, verbosity, output='markdown'
+                )
+
+                self.assertEqual(response.status_code, 200)
+                # markdown output returns ONLY the markdown -- no meta/concepts/mappings JSON.
+                self.assertEqual(set(response.data.keys()), {'markdown'})
+
+                markdown_output = response.data['markdown']
+                self.assertIn('# v2 Changelog', markdown_output)
+                self.assertIn('## Concepts', markdown_output)
+                self.assertIn('## Mappings', markdown_output)
+                self.assertNotIn('without enrichment', markdown_output)
+                self.assertIn('## Names', markdown_output)
+                self.assertIn('## Translations', markdown_output)
+                self.assertIn('Detailed name v1', markdown_output)
+                self.assertIn('Detailed name v2', markdown_output)
+                self.assertIn('Nome detalhado', markdown_output)
+                self.assertIn('| From Concept | Previous Mapping | Updated Mapping |', markdown_output)
+                self.assertIn('mapping-target-v1', markdown_output)
+                self.assertIn('mapping-target-v2', markdown_output)
+
+
+class SourceVersionsComparisonViewTest(OCLAPITestCase):
+    def test_post_200(self):  # pylint: disable=too-many-locals,too-many-statements
+        source = OrganizationSourceFactory()
+        source_v1 = OrganizationSourceFactory(mnemonic=source.mnemonic, organization=source.organization, version='v1')
+        source_v2 = OrganizationSourceFactory(mnemonic=source.mnemonic, organization=source.organization, version='v2')
+        concept1 = ConceptFactory(parent=source, mnemonic='concept1')
+        concept2 = ConceptFactory(parent=source, mnemonic='concept2')
+        concept2_v2 = ConceptFactory(parent=source, mnemonic=concept2.mnemonic, version='v2', concept_class='Foobar')
+        concept3 = ConceptFactory(parent=source, mnemonic='concept3')
+        concept3_v2 = ConceptFactory(parent=source, mnemonic=concept3.mnemonic, version='v2', retired=True)
+        concept4 = ConceptFactory(parent=source, mnemonic='concept4')
+        concept4_v2 = ConceptFactory(parent=source, mnemonic=concept4.mnemonic, version='v2', extras={'foo': 'bar'})
+        concept5 = ConceptFactory(parent=source, mnemonic='concept5')
+        concept6 = ConceptFactory(parent=source, mnemonic='concept6')
+        mapping1 = MappingFactory(parent=source, mnemonic='mapping1')
+        mapping2 = MappingFactory(parent=source, mnemonic='mapping2')
+        mapping2_v2 = MappingFactory(
+            parent=source, mnemonic=mapping2.mnemonic, version='v2', map_type='Foobar',
+            to_concept=mapping2.to_concept, from_concept=mapping2.from_concept)
+        mapping3 = MappingFactory(parent=source, mnemonic='mapping3')
+        mapping3_v2 = MappingFactory(parent=source, mnemonic=mapping3.mnemonic, version='v2', retired=True,
+                                     to_concept=mapping3.to_concept, from_concept=mapping3.from_concept)
+        mapping4 = MappingFactory(parent=source, mnemonic='mapping4')
+        mapping4_v2 = MappingFactory(parent=source, mnemonic=mapping4.mnemonic, version='v2', extras={'foo': 'bar'},
+                                     to_concept=mapping4.to_concept, from_concept=mapping4.from_concept)
+        mapping5 = MappingFactory(parent=source, mnemonic='mapping5')
+        mapping6 = MappingFactory(parent=source, mnemonic='mapping6')
+        source_v1.concepts.add(concept1)
+        source_v1.concepts.add(concept2)
+        source_v1.concepts.add(concept3)
+        source_v1.concepts.add(concept4)
+        source_v1.concepts.add(concept5)
+        source_v2.concepts.add(concept1)
+        source_v2.concepts.add(concept2_v2)
+        source_v2.concepts.add(concept3_v2)
+        source_v2.concepts.add(concept4_v2)
+        source_v2.concepts.add(concept6)
+
+        source_v1.mappings.add(mapping1)
+        source_v1.mappings.add(mapping2)
+        source_v1.mappings.add(mapping3)
+        source_v1.mappings.add(mapping4)
+        source_v1.mappings.add(mapping5)
+        source_v2.mappings.add(mapping1)
+        source_v2.mappings.add(mapping2_v2)
+        source_v2.mappings.add(mapping3_v2)
+        source_v2.mappings.add(mapping4_v2)
+        source_v2.mappings.add(mapping6)
+
+        for concept in Concept.objects.filter(parent=source):
+            concept.set_checksums()
+
+        for mapping in Mapping.objects.filter(parent=source):
+            mapping.set_checksums()
+
+        token = source.created_by.get_token()
+        # A persisted comparison is always computed and cached at its richest verbosity
+        # (DIFF_RESOURCE_IDS_VERBOSITY=2: IDs for changed/new/removed, but same_major/same_minor
+        # stay plain counts -- their mnemonic lists aren't exposed by $compare), so once the first
+        # request populates it, every later request for the same pair gets that same payload back
+        # regardless of the verbosity it actually asks for.
+        expected = {
+            'meta': {
+                'version2': {
+                    'uri': source_v2.uri,
+                    'concepts': 4,  # active count
+                    'mappings': 4
+                },
+                'version1': {
+                    'uri': source_v1.uri,
+                    'concepts': 5,
+                    'mappings': 5
+                }
+            },
+            'concepts': {
+                'new': {
+                    'total': 1,
+                    'mnemonic': ['concept6']
+                },
+                'removed': {
+                    'total': 1,
+                    'mnemonic': ['concept5']
+                },
+                'changed_total': 3,
+                'changed_retired': {
+                    'total': 1,
+                    'mnemonic': ['concept3']
+                },
+                'changed_major': {
+                    'total': 1,
+                    'mnemonic': ['concept2']
+                },
+                'changed_minor': {
+                    'total': 1,
+                    'mnemonic': ['concept4']
+                },
+                'same_total': 1,
+                'same_minor': 0,
+                'same_major': 1
+            },
+            'mappings': {
+                'new': {
+                    'total': 1,
+                    'mnemonic': ['mapping6']
+                },
+                'removed': {
+                    'total': 1,
+                    'mnemonic': ['mapping5']
+                },
+                'changed_total': 3,
+                'changed_retired': {
+                    'total': 1,
+                    'mnemonic': ['mapping3']
+                },
+                'changed_major': {
+                    'total': 1,
+                    'mnemonic': ['mapping2']
+                },
+                'changed_minor': {
+                    'total': 1,
+                    'mnemonic': ['mapping4']
+                },
+                'same_total': 1,
+                'same_minor': 0,
+                'same_major': 1
+            }
+        }
+
+        for verbosity in (3, 2, 1, None):
+            with self.subTest(verbosity=verbosity):
+                data = {'version2': source_v2.uri, 'version1': source_v1.uri}
+                if verbosity is not None:
+                    data['verbosity'] = verbosity
+                response = self.client.post(
+                    '/sources/$compare/?inline=true', data, HTTP_AUTHORIZATION=f'Token {token}', format='json'
+                )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data, expected)
+
+
+class SourceVersionsChangelogViewTest(OCLAPITestCase):
+    def test_post_200(self):  # pylint: disable=too-many-statements,too-many-locals
+        source = OrganizationSourceFactory()
+        source_v1 = OrganizationSourceFactory(mnemonic=source.mnemonic, organization=source.organization, version='v1')
+        source_v2 = OrganizationSourceFactory(mnemonic=source.mnemonic, organization=source.organization, version='v2')
+        concept1 = ConceptFactory(parent=source, mnemonic='concept1')
+        concept2 = ConceptFactory(parent=source, mnemonic='concept2')
+        concept2_v2 = ConceptFactory(parent=source, mnemonic=concept2.mnemonic, version='v2', concept_class='Foobar')
+        concept3 = ConceptFactory(parent=source, mnemonic='concept3')
+        concept3_v2 = ConceptFactory(parent=source, mnemonic=concept3.mnemonic, version='v2', retired=True)
+        concept4 = ConceptFactory(parent=source, mnemonic='concept4')
+        concept4_v2 = ConceptFactory(parent=source, mnemonic=concept4.mnemonic, version='v2', extras={'foo': 'bar'})
+        concept5 = ConceptFactory(parent=source, mnemonic='concept5')
+        concept6 = ConceptFactory(parent=source, mnemonic='concept6')
+        concept7 = ConceptFactory(parent=source, mnemonic='concept7')
+        mapping1 = MappingFactory(parent=source, mnemonic='mapping1')
+        mapping2 = MappingFactory(parent=source, mnemonic='mapping2')
+        mapping2_v2 = MappingFactory(
+            parent=source, mnemonic=mapping2.mnemonic, version='v2', map_type='Foobar',
+            from_concept=mapping2.from_concept, to_concept=mapping2.to_concept)
+        mapping3 = MappingFactory(parent=source, mnemonic='mapping3')
+        mapping3_v2 = MappingFactory(
+            parent=source, mnemonic=mapping3.mnemonic, version='v2', retired=True,
+            from_concept=mapping3.from_concept, to_concept=mapping3.to_concept)
+        mapping4 = MappingFactory(parent=source, mnemonic='mapping4')
+        mapping4_v2 = MappingFactory(
+            parent=source, mnemonic=mapping4.mnemonic, version='v2', extras={'foo': 'bar'},
+            from_concept=mapping4.from_concept, to_concept=mapping4.to_concept)
+        mapping5 = MappingFactory(parent=source, mnemonic='mapping5')
+        mapping6 = MappingFactory(parent=source, mnemonic='mapping6')
+        mapping7 = MappingFactory(parent=source, mnemonic='mapping7', from_concept=concept7)
+        mapping7_v2 = MappingFactory(
+            parent=source, mnemonic=mapping7.mnemonic,
+            from_concept=concept7, to_concept=mapping7.to_concept, extras={'foo': 'bar'}, version='v2')
+        source_v1.concepts.add(concept1)
+        source_v1.concepts.add(concept2)
+        source_v1.concepts.add(concept3)
+        source_v1.concepts.add(concept4)
+        source_v1.concepts.add(concept5)
+        source_v1.concepts.add(concept7)
+        source_v2.concepts.add(concept1)
+        source_v2.concepts.add(concept2_v2)
+        source_v2.concepts.add(concept3_v2)
+        source_v2.concepts.add(concept4_v2)
+        source_v2.concepts.add(concept6)
+        source_v2.concepts.add(concept7)
+
+        source_v1.mappings.add(mapping1)
+        source_v1.mappings.add(mapping2)
+        source_v1.mappings.add(mapping3)
+        source_v1.mappings.add(mapping4)
+        source_v1.mappings.add(mapping5)
+        source_v1.mappings.add(mapping7)
+        source_v2.mappings.add(mapping1)
+        source_v2.mappings.add(mapping2_v2)
+        source_v2.mappings.add(mapping3_v2)
+        source_v2.mappings.add(mapping4_v2)
+        source_v2.mappings.add(mapping6)
+        source_v2.mappings.add(mapping7_v2)
+
+        for concept in Concept.objects.filter(parent=source):
+            concept.set_checksums()
+
+        for mapping in Mapping.objects.filter(parent=source):
+            mapping.set_checksums()
+
+        # Simulate legacy production data where one checksum flavor was never persisted.
+        mapping4.refresh_from_db()
+        Mapping.objects.filter(id=mapping4.id).update(checksums={'standard': mapping4.checksums['standard']})
+
+        token = source.created_by.get_token()
+        response = self.client.post(
+            '/sources/$changelog/?inline=true',
+            {
+                'version1': source_v1.uri,
+                'version2': source_v2.uri,
+                'verbosity': 2
+            },
+            HTTP_AUTHORIZATION=f'Token {token}',
+            format='json'
+        )
+
+        # Changelog is always computed and cached at full enrichment (CHANGELOG_ENRICHMENT_VERBOSITY),
+        # regardless of the verbosity actually requested here (2) -- see run_diff.
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data,
+            {
+                'meta': {
+                    'version2': {
+                        'uri': source_v2.uri,
+                        'concepts': 5,
+                        'mappings': 5
+                    },
+                    'version1': {
+                        'uri': source_v1.uri,
+                        'concepts': 6,
+                        'mappings': 6
+                    },
+                    'diff': {
+                        'concepts': {
+                            'new': 1,
+                            'removed': 1,
+                            'changed_total': 3,
+                            'changed_retired': 1,
+                            'changed_major': 1,
+                            'changed_minor': 1
+                        },
+                        'mappings': {
+                            'new': 1,
+                            'removed': 1,
+                            'changed_total': 4,
+                            'changed_retired': 1,
+                            'changed_major': 1,
+                            'changed_minor': 2
+                        }
+                    }
+                },
+                'concepts': {
+                    'new': {
+                        'concept6': {
+                            'id': 'concept6',
+                            'display_name': None,
+                            'concept_class': 'Diagnosis',
+                            'datatype': 'None',
+                            'names': [],
+                            'descriptions': []
+                        }
+                    },
+                    'removed': {
+                        'concept5': {
+                            'id': 'concept5',
+                            'display_name': None,
+                            'concept_class': 'Diagnosis',
+                            'datatype': 'None',
+                            'names': [],
+                            'descriptions': []
+                        }
+                    },
+                    'changed_retired': {
+                        'concept3': {
+                            'id': 'concept3',
+                            'display_name': None,
+                            'concept_class': 'Diagnosis',
+                            'datatype': 'None',
+                            'names': [],
+                            'descriptions': []
+                        }
+                    },
+                    'changed_major': {
+                        'concept2': {
+                            'id': 'concept2',
+                            'display_name': None,
+                            'concept_class': concept2_v2.concept_class,
+                            'datatype': 'None',
+                            'names': [],
+                            'descriptions': [],
+                            'prev_concept_class': concept2.concept_class,
+                            'prev_datatype': 'None',
+                            'prev_names': [],
+                            'prev_descriptions': []
+                        }
+                    },
+                    'changed_minor': {
+                        'concept4': {
+                            'id': 'concept4',
+                            'display_name': None,
+                            'concept_class': 'Diagnosis',
+                            'datatype': 'None',
+                            'names': [],
+                            'descriptions': [],
+                            'prev_concept_class': 'Diagnosis',
+                            'prev_datatype': 'None',
+                            'prev_names': [],
+                            'prev_descriptions': []
+                        }
+                    },
+                    'changed_mappings_only': {
+                        'concept7': {
+                            'id': 'concept7',
+                            'display_name': None,
+                            'mappings': {
+                                'changed_minor': [
+                                    {
+                                        'id': 'mapping7',
+                                        'from_concept': 'concept7',
+                                        'from_source': None,
+                                        'to_concept': mapping7.to_concept.mnemonic,
+                                        'to_source': None,
+                                        'map_type': 'SAME-AS',
+                                        'external_id': None,
+                                        'prev_to_concept': mapping7.to_concept.mnemonic,
+                                        'prev_to_source': None,
+                                        'prev_map_type': mapping7.map_type
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                },
+                'mappings': {
+                    'new': {
+                        'mapping6': {
+                            'id': 'mapping6',
+                            'from_concept': mapping6.from_concept.mnemonic,
+                            'from_source': None,
+                            'to_concept': mapping6.to_concept.mnemonic,
+                            'to_source': None,
+                            'map_type': 'SAME-AS',
+                            'external_id': None
+                        }
+                    },
+                    'removed': {
+                        'mapping5': {
+                            'id': 'mapping5',
+                            'from_concept': mapping5.from_concept.mnemonic,
+                            'from_source': None,
+                            'to_concept': mapping5.to_concept.mnemonic,
+                            'to_source': None,
+                            'map_type': 'SAME-AS',
+                            'external_id': None
+                        }
+                    },
+                    'changed_retired': {
+                        'mapping3': {
+                            'id': 'mapping3',
+                            'from_concept': mapping3.from_concept.mnemonic,
+                            'from_source': None,
+                            'to_concept': mapping3.to_concept.mnemonic,
+                            'to_source': None,
+                            'map_type': 'SAME-AS',
+                            'external_id': None
+                        }
+                    },
+                    'changed_major': {
+                        'mapping2': {
+                            'id': 'mapping2',
+                            'from_concept': mapping2.from_concept.mnemonic,
+                            'from_source': None,
+                            'to_concept': mapping2.to_concept.mnemonic,
+                            'to_source': None,
+                            'map_type': 'Foobar',
+                            'external_id': None,
+                            'prev_to_concept': mapping2.to_concept.mnemonic,
+                            'prev_to_source': None,
+                            'prev_map_type': mapping2.map_type
+                        }
+                    },
+                    'changed_minor': {
+                        'mapping4': {
+                            'id': 'mapping4',
+                            'from_concept': mapping4.from_concept.mnemonic,
+                            'from_source': None,
+                            'to_concept': mapping4.to_concept.mnemonic,
+                            'to_source': None,
+                            'map_type': 'SAME-AS',
+                            'external_id': None,
+                            'prev_to_concept': mapping4.to_concept.mnemonic,
+                            'prev_to_source': None,
+                            'prev_map_type': mapping4.map_type
+                        }
+                    }
+                }
+            }
+        )

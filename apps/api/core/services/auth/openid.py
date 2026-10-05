@@ -1,0 +1,142 @@
+import base64
+
+import requests
+from django.conf import settings
+from mozilla_django_oidc.contrib.drf import OIDCAuthentication
+
+from core.common.backends import OCLOIDCAuthenticationBackend
+from core.services.auth.core import AbstractAuthService
+
+
+class OpenIDAuthService(AbstractAuthService):
+    """
+    Service that interacts with OIDP for:
+    1. exchanging auth_code with token
+    2. migrating user from django to OIDP
+    """
+    token_type = 'Bearer'
+    authentication_class = OIDCAuthentication
+    authentication_backend_class = OCLOIDCAuthenticationBackend
+    USERS_URL = settings.OIDC_SERVER_INTERNAL_URL + f'/admin/realms/{settings.OIDC_REALM}/users'
+    OIDP_ADMIN_TOKEN_URL = settings.OIDC_SERVER_INTERNAL_URL + '/realms/master/protocol/openid-connect/token'
+
+    @staticmethod
+    def get_login_redirect_url(client_id, redirect_uri, state, nonce, code_challenge=None, code_challenge_method=None):  # pylint: disable=line-too-long,too-many-arguments
+        # response_type=code only (no id_token): a pure code flow never puts the id_token in the
+        # callback URL/access logs. scope=openid is requested explicitly so the token-exchange
+        # response still includes id_token in its body, where the frontend now reads it from.
+        url = f"{settings.OIDC_OP_AUTHORIZATION_ENDPOINT}?" \
+              f"response_type=code&" \
+              f"scope=openid profile email&" \
+              f"client_id={client_id}&" \
+              f"state={state}&" \
+              f"nonce={nonce}&" \
+              f"redirect_uri={redirect_uri}"
+        if code_challenge and code_challenge_method:
+            url += f"&code_challenge={code_challenge}&code_challenge_method={code_challenge_method}"
+        return url
+
+    @staticmethod
+    def get_reset_password_redirect_url(client_id, redirect_uri, code_challenge=None, code_challenge_method=None):
+        url = f"{settings.OIDC_OP_AUTHORIZATION_ENDPOINT}?" \
+              f"scope=openid&" \
+              f"kc_action=UPDATE_PASSWORD&" \
+              f"response_type=code&" \
+              f"client_id={client_id}&" \
+              f"redirect_uri={redirect_uri}"
+        if code_challenge and code_challenge_method:
+            url += f"&code_challenge={code_challenge}&code_challenge_method={code_challenge_method}"
+        return url
+
+    @staticmethod
+    def get_registration_redirect_url(client_id, redirect_uri, state, nonce, code_challenge=None, code_challenge_method=None):  # pylint: disable=line-too-long,too-many-arguments
+        # See get_login_redirect_url: pure code flow + explicit openid scope, id_token comes
+        # from the token-exchange response body instead of the callback URL.
+        url = f"{settings.OIDC_OP_REGISTRATION_ENDPOINT}?" \
+              f"response_type=code&" \
+              f"scope=openid profile email&" \
+              f"client_id={client_id}&" \
+              f"state={state}&" \
+              f"nonce={nonce}&" \
+              f"redirect_uri={redirect_uri}"
+        if code_challenge and code_challenge_method:
+            url += f"&code_challenge={code_challenge}&code_challenge_method={code_challenge_method}"
+        return url
+
+    @staticmethod
+    def get_logout_redirect_url(id_token_hint, redirect_uri):
+        return f"{settings.OIDC_OP_LOGOUT_ENDPOINT}?" \
+               f"id_token_hint={id_token_hint}&" \
+               f"post_logout_redirect_uri={redirect_uri}"
+
+    @staticmethod
+    def credential_representation_from_hash(hash_, temporary=False):
+        algorithm, hashIterations, salt, hashedSaltedValue = hash_.split('$')
+
+        return {
+            'type': 'password',
+            'hashedSaltedValue': hashedSaltedValue,
+            'algorithm': algorithm.replace('_', '-'),
+            'hashIterations': int(hashIterations),
+            'salt': base64.b64encode(salt.encode()).decode('ascii').strip(),
+            'temporary': temporary
+        }
+
+    @classmethod
+    def add_user(cls, user, username, password):
+        response = requests.post(
+            cls.USERS_URL,
+            json={
+                'enabled': True,
+                'emailVerified': user.verified,
+                'firstName': user.first_name,
+                'lastName': user.last_name,
+                'email': user.email,
+                'username': user.username,
+                'credentials': [cls.credential_representation_from_hash(hash_=user.password)]
+            },
+            verify=False,
+            headers=OpenIDAuthService.get_admin_headers(username=username, password=password)
+        )
+        if response.status_code == 201:
+            return True
+
+        return response.json()
+
+    @staticmethod
+    def get_admin_token(username, password):
+        response = requests.post(
+            OpenIDAuthService.OIDP_ADMIN_TOKEN_URL,
+            data={
+                'grant_type': 'password',
+                'username': username,
+                'password': password,
+                'client_id': 'admin-cli'
+            },
+            verify=False,
+        )
+        return response.json().get('access_token')
+
+    @staticmethod
+    def exchange_code_for_token(code, redirect_uri, client_id, client_secret=None, code_verifier=None):
+        data = {
+            'grant_type': 'authorization_code',
+            'client_id': client_id,
+            'code': code,
+            'redirect_uri': redirect_uri
+        }
+        if client_secret:
+            data['client_secret'] = client_secret
+        if code_verifier:
+            data['code_verifier'] = code_verifier
+        response = requests.post(settings.OIDC_OP_TOKEN_ENDPOINT, data=data)
+        return response.json()
+
+    @staticmethod
+    def get_admin_headers(**kwargs):
+        return {'Authorization': f'Bearer {OpenIDAuthService.get_admin_token(**kwargs)}'}
+
+    @staticmethod
+    def create_user(_):
+        """In OID auth, user signup needs to happen in OID first"""
+        pass  # pylint: disable=unnecessary-pass

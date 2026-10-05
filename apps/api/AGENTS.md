@@ -1,0 +1,68 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+`core/` contains the apps (e.g., `core/concepts`, `core/mappings`), plus integration helpers like `core/celery.py` and API wiring in `core/urls.py`. Entrypoints live at repo root (`manage.py`, `startup.sh`), environment tooling sits in `docker-compose*.yml`, and CLI helpers/scripts are under `tools/` (imports, releases, versioning). Tests ship alongside each app in `core/*/tests` with cross-cutting suites in `core/integration_tests/`.
+`core/graphql/` hosts the GraphQL service built with Strawberry; `schema.py` wires the root schema, `types.py` defines GraphQL types, and `queries.py` holds resolvers and data loaders. Routes are exposed via `core/graphql/urls.py` and included in `core/urls.py` at `/graphql` with GraphiQL enabled for local exploration. Keep GraphQL tests in `core/graphql/tests/` aligned with the API surface and prefer reusing serializers/query helpers from the owning apps rather than duplicating logic.
+
+## Build, Test, and Development Commands
+- `docker compose up -d` boots the API, Postgres, Elasticsearch, Redis, and workers for local hacking.
+- `docker ps --format '{{.Names}}\t{{.Status}}'` should be your first check before running verification so you can reuse the existing service containers.
+- `docker exec oclapi2-api-1 python manage.py test --keepdb -v3` runs the Django test suite in the already-running API container and is the preferred default for routine verification.
+- `docker exec -it oclapi2-api-1 pylint -j2 core` enforces lint rules.
+- `docker compose -f docker-compose.yml -f docker-compose.ci.yml run --rm api bash coverage.sh` reports coverage and fails under the CI thresholds.
+- `docker exec -it oclapi2-api-1 python manage.py search_index --populate -f --parallel` rebuilds Elasticsearch indexes after model or serializer changes.
+
+Always prefer `docker exec` into the existing `oclapi2-api-1` container over `docker compose run` for tests, lint, and management commands unless the user explicitly asks otherwise or the container is unavailable.
+
+## Coding Style & Naming Conventions
+Use 4-space indentation, `snake_case` for functions/modules, and `PascalCase` for Django models and serializers. Keep imports sorted (stdlib, third-party, local) and lean on `pylint` to catch regressions. Favor explicit settings toggles by extending `core/toggles/` and document feature flags in docstrings above the flag definition. Apply KISS, DRY, and YAGNI: keep views/serializers simple, consolidate helpers per app, and skip speculative features.
+Always comment code, in English only: add concise docstrings for functions, classes, and business rules, and favor descriptive names for variables and resolvers. For GraphQL schema fields, keep `description` attributes accurate and updated when behavior changes. Follow Django principles by centralizing shared logic, avoiding duplication across REST/GraphQL layers, and keeping resolvers thin by delegating to existing services or serializers.
+
+## Testing Guidelines
+Target ≥93% coverage by pairing unit tests with integration cases. Name files `test_<feature>.py` and co-locate fixtures inside the app’s `tests/fixtures/`. Smoke Elasticsearch-dependent tests live in `core/integration_tests/` and should be guarded with `@skipUnless(settings.ES_ENABLED, ...)`. Use `python manage.py test app.tests --keepdb` for focused runs and include representative payloads in `core/samples/` when asserting serialization.
+For any code change, run targeted tests and pylint by default unless the user explicitly narrows verification. When using containers, prefer `docker exec oclapi2-api-1 ...` equivalents for both.
+
+## Commit & Pull Request Guidelines
+Structure commit subjects using Conventional Commits (`feat(core): add repoType filter`) or issue references such as `OpenConceptLab/ocl_issues#2252 repo facets`. Keep one logical change per commit so release tooling can tag accurately. Follow GitFlow branches—start work on `feature/<issue-id>-slug` from `develop`, reserve `hotfix/*` for production fixes, and merge back through PRs only. Every PR must describe the motivation, list verification steps (`docker exec oclapi2-api-1 python manage.py test…`, `docker exec oclapi2-api-1 pylint …`), link the tracked issue, attach evidence when API responses change, and call out migrations, indexing, or env var impacts before requesting review.
+
+## Security & Configuration Tips
+Keep `vm.max_map_count=262144` set before starting Elasticsearch. For SSO, export `OIDC_SERVER_URL`, `OIDC_SERVER_INTERNAL_URL`, and `OIDC_REALM`; omitting them falls back to Django auth. Never commit secrets—use `.env` overrides or Docker compose profiles instead.
+
+<!-- code-review-graph MCP tools -->
+## MCP Tools: code-review-graph
+
+**IMPORTANT: This project has a knowledge graph. ALWAYS use the
+code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
+the codebase.** The graph is faster, cheaper (fewer tokens), and gives
+you structural context (callers, dependents, test coverage) that file
+scanning cannot.
+
+### When to use graph tools FIRST
+
+- **Exploring code**: `semantic_search_nodes` or `query_graph` instead of Grep
+- **Understanding impact**: `get_impact_radius` instead of manually tracing imports
+- **Code review**: `detect_changes` + `get_review_context` instead of reading entire files
+- **Finding relationships**: `query_graph` with callers_of/callees_of/imports_of/tests_for
+- **Architecture questions**: `get_architecture_overview` + `list_communities`
+
+Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
+
+### Key Tools
+
+| Tool | Use when |
+|------|----------|
+| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
+| `get_review_context` | Need source snippets for review — token-efficient |
+| `get_impact_radius` | Understanding blast radius of a change |
+| `get_affected_flows` | Finding which execution paths are impacted |
+| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
+| `semantic_search_nodes` | Finding functions/classes by name or keyword |
+| `get_architecture_overview` | Understanding high-level codebase structure |
+| `refactor_tool` | Planning renames, finding dead code |
+
+### Workflow
+
+1. The graph auto-updates on file changes (via hooks).
+2. Use `detect_changes` for code review.
+3. Use `get_affected_flows` to understand impact.
+4. Use `query_graph` pattern="tests_for" to check coverage.

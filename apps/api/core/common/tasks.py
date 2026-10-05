@@ -1,0 +1,1075 @@
+import json
+import time
+from datetime import datetime
+from json import JSONDecodeError
+
+from billiard.exceptions import WorkerLostError
+from celery import chord, current_task
+from celery.states import STARTED
+from celery.utils.log import get_task_logger
+from celery_once import AlreadyQueued
+from dateutil.relativedelta import relativedelta
+from django.apps import apps
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.mail import EmailMessage
+from django.core.management import call_command
+from django.core.paginator import Paginator
+from django.db.models import Exists, OuterRef
+from django.template.loader import render_to_string
+from django.utils import timezone
+from django_elasticsearch_dsl.registries import registry
+from pydash import get, compact
+
+from core.celery import app
+from core.common import ERRBIT_LOGGER
+from core.common.constants import CONFIRM_EMAIL_ADDRESS_MAIL_SUBJECT, PASSWORD_RESET_MAIL_SUBJECT
+from core.common.exceptions import BatchIndexingError
+from core.common.utils import write_export_file, web_url, get_resource_class_from_resource_name, get_export_service, \
+    get_date_range_label
+from core.reports.models import ResourceUsageReport
+from core.tasks.models import QueueOnceCustomTask, Task
+
+logger = get_task_logger(__name__)
+
+INDEXING_QUEUE = 'indexing'
+INDEXING_JOB_BATCH_SIZE = 5
+INDEXING_JOB_GRACE_PERIOD_MINUTES = 5  # let a freshly picked up job show up in the worker's active set
+INDEXING_JOB_INSPECT_TIMEOUT = 10
+
+
+@app.task(base=QueueOnceCustomTask)
+def delete_organization(org_id):
+    from core.orgs.models import Organization
+    logger.info('Finding org...')
+
+    org = Organization.objects.filter(id=org_id).first()
+
+    if not org:
+        logger.info('Not found org %s', org_id)
+        return
+
+    try:
+        logger.info('Found org %s.  Beginning purge...', org.mnemonic)
+        org.delete(sync=True)
+        logger.info('Purge complete!')
+    except Exception as ex:
+        logger.info('Org delete failed for %s with exception %s', org.mnemonic, ex.args)
+
+
+@app.task(base=QueueOnceCustomTask)
+def delete_source(source_id):
+    from core.sources.models import Source
+    logger.info('Finding source...')
+
+    source = Source.objects.filter(id=source_id).first()
+
+    if not source:
+        logger.info('Not found source %s', source_id)
+        return None
+
+    try:
+        logger.info('Found source %s', source.mnemonic)
+        logger.info('Beginning concepts purge...')
+        source.batch_delete(source.concepts_set)
+        logger.info('Beginning mappings purge...')
+        source.batch_delete(source.mappings_set)
+        logger.info('Beginning versions and self purge...')
+        source.delete(force=True)
+        logger.info('Delete complete!')
+        return True
+    except Exception as ex:
+        logger.info('Source delete failed for %s with exception %s', source.mnemonic, ex.args)
+        ERRBIT_LOGGER.log(ex)
+        return False
+
+
+@app.task(base=QueueOnceCustomTask)
+def delete_collection(collection_id):
+    from core.collections.models import Collection
+    logger.info('Finding collection...')
+
+    collection = Collection.objects.filter(id=collection_id).first()
+
+    if not collection:
+        logger.info('Not found collection %s', collection_id)
+        return None
+
+    try:
+        logger.info('Found collection %s.  Beginning purge...', collection.mnemonic)
+        collection.references.all().delete()
+        collection.expansions.all().delete()
+        collection.delete(force=True)
+        logger.info('Delete complete!')
+        return True
+    except Exception as ex:
+        logger.info('Collection delete failed for %s with exception %s', collection.mnemonic, ex.args)
+        ERRBIT_LOGGER.log(ex)
+        return False
+
+
+@app.task(base=QueueOnceCustomTask, bind=True)
+def export_source(self, version_id):
+    start_time = time.time()
+    from core.sources.models import Source
+    logger.info('Finding source version...')
+
+    version = Source.objects.filter(id=version_id).select_related(
+        'organization', 'user'
+    ).first()
+
+    if not version:  # pragma: no cover
+        logger.info('Not found source version %s', version_id)
+        return
+
+    version.add_processing(self.request.id)
+    try:
+        logger.info('Found source version %s.  Beginning export...', version.version)
+        write_export_file(
+            version,
+            'source', 'core.sources.serializers.SourceVersionExportSerializer',
+            logger,
+            start_time
+        )
+        logger.info('Export complete!')
+    finally:
+        version.remove_processing(self.request.id)
+
+
+@app.task(base=QueueOnceCustomTask, bind=True)
+def export_collection(self, version_id):
+    start_time = time.time()
+    from core.collections.models import Collection
+    logger.info('Finding collection version...')
+
+    version = Collection.objects.filter(id=version_id).select_related(
+        'organization', 'user'
+    ).first()
+
+    if not version:  # pragma: no cover
+        logger.info('Not found collection version %s', version_id)
+        return
+
+    version.add_processing(self.request.id)
+
+    if version.expansion_uri:
+        expansion = version.expansion
+        if expansion:
+            expansion.wait_until_processed()
+    try:
+        logger.info('Found collection version %s.  Beginning export...', version.version)
+        write_export_file(
+            version,
+            'collection', 'core.collections.serializers.CollectionVersionExportSerializer',
+            logger,
+            start_time
+        )
+        logger.info('Export complete!')
+    finally:
+        version.remove_processing(self.request.id)
+
+
+@app.task(bind=True)
+def add_references(  # pylint: disable=too-many-arguments,too-many-locals
+        self, user_id, data, collection_id, cascade=False, transform=False
+):
+    from core.users.models import UserProfile
+    from core.collections.models import Collection
+    user = UserProfile.objects.get(id=user_id)
+    collection = Collection.objects.filter(id=collection_id).first()
+    if not collection:
+        return [], {'error': 'Collection not found'}
+    head = collection.get_head()
+    head.add_processing(self.request.id)
+
+    try:
+        (added_references, errors) = collection.add_expressions(
+            data, user, cascade, transform, True)
+    finally:
+        head.remove_processing(self.request.id)
+
+    if errors:
+        logger.info('Errors while adding references....')
+        logger.info(errors)
+
+    return [reference.id for reference in added_references], errors
+
+
+def __handle_save(instance):
+    if instance:
+        registry.update(instance)
+        registry.update_related(instance)
+
+
+def __handle_pre_delete(instance):
+    if instance:
+        registry.delete_related(instance)
+
+
+@app.task(ignore_result=True)
+def handle_save(app_name, model_name, instance_id):
+    __handle_save(apps.get_model(app_name, model_name).objects.filter(id=instance_id).first())
+
+
+@app.task(ignore_result=True)
+def handle_m2m_changed(app_name, model_name, instance_id, action):
+    instance = apps.get_model(app_name, model_name).objects.filter(id=instance_id).first()
+    if instance:
+        if action in ('post_add', 'post_remove', 'post_clear'):
+            __handle_save(instance)
+        elif action in ('pre_remove', 'pre_clear'):
+            __handle_pre_delete(instance)
+
+
+@app.task(ignore_result=True)
+def handle_pre_delete(app_name, model_name, instance_id):
+    __handle_pre_delete(apps.get_model(app_name, model_name).objects.filter(id=instance_id).first())
+
+
+@app.task(base=QueueOnceCustomTask)
+def populate_indexes(app_names=None):  # app_names has to be an iterable of strings
+    __run_search_index_command('--populate', app_names)
+
+
+@app.task(base=QueueOnceCustomTask)
+def rebuild_indexes(app_names=None):  # app_names has to be an iterable of strings
+    __run_search_index_command('--rebuild', app_names)
+
+
+def __run_search_index_command(command, app_names=None):
+    if not command:
+        return
+
+    if app_names:
+        call_command('search_index', f'{command}', '-f', '--models', *app_names, '--parallel')
+    else:
+        call_command('search_index', command, '-f', '--parallel')
+
+
+@app.task(base=QueueOnceCustomTask, retry_kwargs={'max_retries': 0})
+def bulk_import(to_import, username, update_if_exists):
+    from core.importers.models import BulkImport
+    return BulkImport(content=to_import, username=username, update_if_exists=update_if_exists).run()
+
+
+@app.task(base=QueueOnceCustomTask, bind=True, retry_kwargs={'max_retries': 0})
+def bulk_import_parallel_inline(self, to_import, username, update_if_exists, threads=5, index=None):  # pylint: disable=too-many-arguments
+    from core.importers.models import BulkImportParallelRunner
+    try:
+        importer = BulkImportParallelRunner(
+            content=to_import, username=username, update_if_exists=update_if_exists,
+            parallel=threads, self_task_id=self.request.id, index=index
+        )
+    except JSONDecodeError as ex:
+        return {'error': f"Invalid JSON ({ex.msg})"}
+    except ValidationError as ex:
+        return {'error': f"Invalid Input ({ex.message})"}
+    return importer.run()
+
+
+@app.task(base=QueueOnceCustomTask, retry_kwargs={'max_retries': 0})
+def bulk_import_inline(to_import, username, update_if_exists, index=None):
+    from core.importers.models import BulkImportInline
+    return BulkImportInline(
+        content=to_import, username=username, update_if_exists=update_if_exists, index=index).run()
+
+
+# pylint: disable=too-many-arguments
+@app.task(bind=True, base=QueueOnceCustomTask, retry_kwargs={'max_retries': 0})
+def bulk_import_new(self, path, username, owner_type, owner, import_type='default', index=None):
+    from core.importers.importer import Importer
+    task_id = self.request.id
+    return Importer(task_id, path, username, owner_type, owner, import_type, index).run()
+
+
+# pylint: disable=too-many-arguments
+@app.task(retry_kwargs={'max_retries': 0}, compression='gzip')
+def bulk_import_subtask(path, username, owner_type, owner, resource_type, files, index=True):
+    from core.importers.importer import ImporterSubtask
+    return ImporterSubtask(path, username, owner_type, owner, resource_type, files, index).run()
+
+
+@app.task(retry_kwargs={'max_retries': 0}, compression='gzip')
+def bulk_import_queue(task_queue):
+    tasks = task_queue.pop(0)
+    return chord(tasks, bulk_import_queue.si(task_queue)).apply_async(queue='concurrent')
+
+
+@app.task(retry_kwargs={'max_retries': 0})
+def bulk_import_subtask_empty():
+    """Used if group has only one task to prevent celery from converting the group to a single task"""
+    return []
+
+
+@app.task
+def import_finisher(task_id):
+    """Persist final import results so that they can be retrieved instantly"""
+    from core.importers.importer import ImportTask
+    task = Task.objects.filter(id=task_id).first()
+    if task:
+        if task.result_all:
+            import_task = ImportTask.import_task_from_json(task.result_all)
+            if import_task:
+                # Persist final results
+                import_task.final_summary = import_task.summary
+                import_task.time_finished = timezone.now()
+                return import_task.model_dump(exclude={'summary'})
+
+            task.json_result['time_finished'] = timezone.now()
+            return task.json_result
+
+    return {'time_finished': timezone.now()}
+
+
+@app.task(bind=True, retry_kwargs={'max_retries': 0})
+def bulk_import_parts_inline(self, input_list, username, update_if_exists, index=True):
+    from core.importers.models import BulkImportInline
+    return BulkImportInline(
+        content=None, username=username, update_if_exists=update_if_exists, input_list=input_list,
+        self_task_id=self.request.id, skip_hierarchy_tasks=True, index=index
+    ).run()
+
+
+@app.task
+def send_user_verification_email(user_id):
+    from core.users.models import UserProfile
+    user = UserProfile.objects.filter(id=user_id).first()
+    if not user:
+        return user
+
+    html_body = render_to_string(
+        'verification.html', {
+            'user': user,
+            'url': user.email_verification_url,
+        }
+    )
+    mail = EmailMessage(subject=CONFIRM_EMAIL_ADDRESS_MAIL_SUBJECT, body=html_body, to=[user.email])
+    mail.content_subtype = "html"
+    res = mail.send()
+
+    return mail if get(settings, 'TEST_MODE', False) else res
+
+
+@app.task
+def send_user_reset_password_email(user_id):
+    from core.users.models import UserProfile
+    user = UserProfile.objects.filter(id=user_id).first()
+    if not user:
+        return user
+
+    html_body = render_to_string(
+        'password_reset.html', {
+            'user': user,
+            'url': user.reset_password_url,
+            'web_url': web_url(),
+        }
+    )
+    mail = EmailMessage(subject=PASSWORD_RESET_MAIL_SUBJECT, body=html_body, to=[user.email])
+    mail.content_subtype = "html"
+    res = mail.send()
+
+    return mail if get(settings, 'TEST_MODE', False) else res
+
+
+@app.task(bind=True)
+def seed_children_to_new_version(self, resource, obj_id, export=True, sync=False):  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches,too-many-statements
+    export_task = None
+    changelog_task = None
+    autoexpand = True
+
+    is_source = resource == 'source'
+    is_collection = resource == 'collection'
+
+    klass = get_resource_class_from_resource_name(resource)
+    instance = klass.objects.filter(id=obj_id).first()
+
+    if is_source:
+        export_task = export_source
+        changelog_task = source_version_compare
+    elif is_collection:
+        export_task = export_collection
+        changelog_task = collection_version_compare
+        autoexpand = instance.should_auto_expand
+
+    if instance:  # pylint: disable=too-many-nested-blocks
+        task_id = self.request.id
+        try:
+            instance.add_processing(task_id)
+            # Compute snapshot and checksums async (moved from persist_new_version for faster HTTP response)
+            head = instance.head
+            if head:
+                if is_source:
+                    from core.sources.serializers import SourceDetailSerializer
+                    instance.snapshot = SourceDetailSerializer(head).data
+                elif is_collection:
+                    from core.collections.serializers import CollectionDetailSerializer
+                    instance.snapshot = CollectionDetailSerializer(head).data
+                instance.save(update_fields=['snapshot'])
+            instance.get_checksums(recalculate=True)
+            instance.seed_references()
+            if is_source:
+                instance.seed_concepts(index=False)
+                instance.seed_mappings(index=False)
+                instance.update_children_counts(sync)
+                if instance.released:
+                    instance.index_resources_for_self_as_latest_released()
+                else:
+                    instance.index_children(sync=False, user=instance.created_by)
+            elif autoexpand:
+                instance.cascade_children_to_expansion(index=True, sync=sync)
+                instance.update_children_counts(sync)
+
+            if export:
+                task = Task.new(queue='default', username=instance.updated_by, name=export_task.__name__)
+                try:
+                    export_task.apply_async((obj_id,), queue=task.queue, task_id=task.id, persist_args=True)
+                except AlreadyQueued:
+                    task.delete()
+
+                prev_version = instance.prev_version
+                if prev_version:
+                    _task = Task.new(
+                        queue='default', username=instance.updated_by, name=changelog_task.__name__)
+                    try:
+                        changelog_task.apply_async(
+                            (prev_version.uri, instance.uri, True, 4, 'json', True),
+                            queue=_task.queue, task_id=_task.id, persist_args=True)
+                    except AlreadyQueued:
+                        _task.delete()
+        finally:
+            instance.remove_processing(task_id)
+
+
+@app.task
+def seed_children_to_expansion(expansion_id, index=True, force_reevaluate=False):
+    from core.collections.models import Expansion
+    expansion = Expansion.objects.filter(id=expansion_id).first()
+    if expansion:
+        expansion.seed_children(index=index, force_reevaluate=force_reevaluate)
+        expansion.clear_processing(True)
+
+
+@app.task
+def update_validation_schema(instance_type, instance_id, target_schema):
+    klass = get_resource_class_from_resource_name(instance_type)
+    instance = klass.objects.get(id=instance_id)
+    instance.custom_validation_schema = target_schema
+    errors = {}
+
+    failed_concept_validations = instance.validate_child_concepts() or []
+    if failed_concept_validations:
+        errors.update({'failed_concept_validations': failed_concept_validations})
+
+    if errors:
+        return errors
+
+    instance.save()
+
+    return None
+
+
+@app.task(
+    ignore_result=True, autoretry_for=(Exception, WorkerLostError, ), retry_kwargs={'max_retries': 2, 'countdown': 2},
+    acks_late=True, reject_on_worker_lost=True
+)
+def process_hierarchy_for_new_concept(concept_id, initial_version_id, parent_concept_uris, create_parent_version=True):
+    """
+      Executed when a new concept is created with parent_concept_urls and does following:
+      1. Associates parent concepts to the concept and concept latest (initial) version
+      2. Creates new versions for parent concept (if asked)
+    """
+    from core.concepts.models import Concept
+    concept = Concept.objects.filter(id=concept_id).first()
+
+    initial_version = None
+    if initial_version_id:
+        initial_version = Concept.objects.filter(id=initial_version_id).first()
+
+    parent_concepts = Concept.objects.filter(uri__in=parent_concept_uris)
+    concept._parent_concepts = parent_concepts  # pylint: disable=protected-access
+    concept.set_parent_concepts_from_uris(create_parent_version=create_parent_version)
+
+    if initial_version:
+        initial_version._parent_concepts = parent_concepts  # pylint: disable=protected-access
+        initial_version.set_parent_concepts_from_uris(create_parent_version=False)
+
+
+@app.task(
+    ignore_result=True, autoretry_for=(Exception, WorkerLostError, ), retry_kwargs={'max_retries': 2, 'countdown': 2},
+    acks_late=True, reject_on_worker_lost=True
+)
+def process_hierarchy_for_concept_version(
+        latest_version_id, prev_version_id, parent_concept_uris, create_parent_version):
+    """
+      Executed when a new concept version is created with new, updated or existing hierarchy
+      1. Associates parent concepts to the latest concept version.
+      2. Creates new versions for removed parent concepts from previous versions.
+      3. Creates new versions for parent concept (if asked)
+    """
+    from core.concepts.models import Concept
+    latest_version = Concept.objects.filter(id=latest_version_id).first()
+
+    prev_version = None
+    old_parents = None
+    if prev_version_id:
+        prev_version = Concept.objects.filter(id=prev_version_id).first()
+        old_parents = prev_version.parent_concept_urls
+
+    parent_concepts = Concept.objects.filter(
+        uri__in=parent_concept_uris) if parent_concept_uris else Concept.objects.none()
+    latest_version._parent_concepts = parent_concepts  # pylint: disable=protected-access
+    latest_version.set_parent_concepts_from_uris(create_parent_version)
+    latest_version.versioned_object.parent_concepts.set(latest_version.parent_concepts.all())
+
+    if prev_version:
+        removed_parent_urls = [
+            url for url in old_parents if url not in list(latest_version.parent_concept_urls)
+        ]
+        latest_version.create_new_versions_for_removed_parents(removed_parent_urls)
+
+
+@app.task(
+    ignore_result=True, autoretry_for=(Exception, WorkerLostError, ), retry_kwargs={'max_retries': 2, 'countdown': 2},
+    acks_late=True, reject_on_worker_lost=True
+)
+def process_hierarchy_for_new_parent_concept_version(prev_version_id, latest_version_id):
+    """
+      Associates latest parent version to child concepts
+    """
+    from core.concepts.models import Concept
+    prev_version = Concept.objects.filter(id=prev_version_id).first()
+    latest_version = Concept.objects.filter(id=latest_version_id).first()
+    if prev_version and latest_version:
+        for concept in Concept.objects.filter(parent_concepts__uri=prev_version.uri):
+            concept.parent_concepts.add(latest_version)
+
+
+@app.task
+def delete_concept(concept_id):  # pragma: no cover
+    from core.concepts.models import Concept
+
+    queryset = Concept.objects.filter(id=concept_id)
+    concept = queryset.first()
+    if concept:
+        parent = concept.parent
+        concept.delete()
+        parent.update_concepts_count()
+
+    return 1
+
+
+@app.task(
+    ignore_result=True, autoretry_for=(WorkerLostError, ), retry_kwargs={'max_retries': 2, 'countdown': 2},
+    acks_late=True, reject_on_worker_lost=True
+)
+def batch_index_resources(resource, filters, update_indexed=False, refresh=None):
+    model = get_resource_class_from_resource_name(resource)
+    if isinstance(filters, str):
+        filters = json.loads(filters)
+    if model and filters is not None:
+        queryset = model.objects.filter(**filters)
+        try:
+            model.batch_index(
+                queryset, model.get_search_document(), refresh=refresh, **get_batch_index_relations(model))
+        finally:
+            #  Ends the import's indexing deferral even when a batch failed, so later saves index those resources
+            from core.concepts.models import Concept
+            from core.mappings.models import Mapping
+            if update_indexed and model in [Concept, Mapping]:
+                queryset.update(_index=True)
+
+    return 1
+
+
+def get_batch_index_relations(model):
+    """
+    The relations to load with each batch of concepts or mappings, instead of querying them for every document: the
+    ones document preparation reads through the cache (16 queries per document drop to 12 for concepts and under 1
+    for mappings). `sources` and `descriptions` are read with fresh queries, so prefetching them would only load them.
+    """
+    from core.concepts.models import Concept
+    from core.mappings.models import Mapping
+    select_related = ['parent', 'parent__organization', 'parent__user', 'created_by', 'updated_by']
+    if model is Concept:
+        return {'prefetch': ['names'], 'select_related': select_related}
+    if model is Mapping:
+        return {'select_related': [*select_related, 'from_concept', 'to_concept', 'from_source', 'to_source']}
+    return {}
+
+
+@app.task(
+    ignore_result=True, autoretry_for=(WorkerLostError, ), retry_kwargs={'max_retries': 2, 'countdown': 2},
+    acks_late=True, reject_on_worker_lost=True
+)
+def index_concepts_mapped_codes(concept_ids):
+    from core.concepts.models import Concept
+    Concept.index_mapped_codes(Concept.objects.filter(id__in=concept_ids))
+
+
+def batch_index_with_summary(index_func, *args, **kwargs):
+    """
+    Runs a batch indexing call and records its counts (batches, failed_batches, docs, failed_docs) in the running
+    task's Task.summary -- also when it fails, so a FAILURE says how much failed.
+    """
+    summary = None
+    try:
+        summary = index_func(*args, **kwargs)
+        return summary
+    except BatchIndexingError as ex:
+        summary = ex.summary
+        raise
+    finally:
+        task_id = current_task.request.id if current_task else None
+        if task_id and isinstance(summary, dict):
+            Task.objects.filter(id=task_id).update(summary=summary)
+
+
+@app.task(ignore_result=True, base=QueueOnceCustomTask)
+def index_expansion_concepts(expansion_id, count=None, concept_ids=None):  # pylint: disable=unused-argument
+    from core.collections.models import Expansion
+    expansion = Expansion.objects.filter(id=expansion_id).first()
+    if expansion:
+        from core.concepts.documents import ConceptDocument
+        from core.concepts.models import Concept
+        if concept_ids:
+            queryset = Concept.objects.filter(id__in=concept_ids)
+        else:
+            queryset = expansion.concepts
+        batch_index_with_summary(
+            expansion.batch_index, queryset, ConceptDocument,
+            prefetch=['sources', 'names', 'descriptions'],
+            select_related=['parent', 'parent__organization', 'parent__user', 'created_by', 'updated_by']
+        )
+
+
+@app.task(ignore_result=True, base=QueueOnceCustomTask)
+def index_expansion_mappings(expansion_id, count=None, mapping_ids=None):  # pylint: disable=unused-argument
+    from core.collections.models import Expansion
+    expansion = Expansion.objects.filter(id=expansion_id).first()
+    if expansion:
+        from core.mappings.documents import MappingDocument
+        from core.mappings.models import Mapping
+        if mapping_ids:
+            queryset = Mapping.objects.filter(id__in=mapping_ids)
+        else:
+            queryset = expansion.mappings
+        batch_index_with_summary(
+            expansion.batch_index, queryset, MappingDocument,
+            prefetch=['sources'],
+            select_related=['parent', 'parent__organization', 'parent__user', 'created_by', 'updated_by']
+        )
+
+
+@app.task
+def make_hierarchy(concept_map):  # pragma: no cover
+    from core.concepts.models import Concept
+
+    for parent_concept_uri, child_concept_urls in concept_map.items():
+        parent_concept = Concept.objects.filter(uri=parent_concept_uri).first()
+        if parent_concept:
+            parent_latest = parent_concept.get_latest_version()
+            if parent_latest:
+                for child_concept in Concept.objects.filter(uri__in=child_concept_urls):
+                    child_concept.parent_concepts.add(parent_latest)
+                    child_latest = child_concept.get_latest_version()
+                    if child_latest:
+                        child_latest.parent_concepts.add(parent_latest)
+                        logger.info('Added child %s to parent %s', child_concept.uri, parent_concept_uri)
+                    else:
+                        logger.info('Could not find child %s latest_version', child_concept.uri)
+            else:
+                logger.info('Could not find parent %s latest_version', parent_concept_uri)
+        else:
+            logger.info('Could not find parent %s', parent_concept_uri)
+
+
+@app.task(ignore_result=True, base=QueueOnceCustomTask)
+def index_source_concepts(  # pylint: disable=too-many-arguments,too-many-locals
+        source_id, partial_doc=None, single_batch=False, should_prefetch=True, should_select_related=True,
+        parallel=True, locales=None, exclude_locale=None
+):
+    """
+    Index source concepts, or partially update existing ES documents when `partial_doc` is supplied.
+    A failed partial update falls back to a full reindex -- unless ES was still refusing writes (429 / read-only
+    index) after retries: a full reindex would only fail the same way, slower, so the task fails instead.
+    """
+    from core.sources.models import Source
+    source = Source.objects.filter(id=source_id).first()
+    if source:
+        from core.concepts.documents import ConceptDocument
+        prefetch = ['sources', 'names', 'descriptions'] if should_prefetch else []
+        select_related = [
+            'parent', 'parent__organization', 'parent__user', 'created_by', 'updated_by'
+        ] if should_select_related else []
+        queryset = get_concepts_to_index(source, locales, exclude_locale)
+        if (locales or exclude_locale) and not partial_doc and not source.has_semantic_match_algorithm:
+            batch_index_with_summary(update_concepts_locale_fields, queryset, single_batch, parallel)
+            source.clear_concepts_cache()
+            return
+        try:
+            kwargs = {'partial_doc': partial_doc} if partial_doc else {
+                'prefetch': prefetch, 'select_related': select_related}
+            kwargs['single_batch'] = single_batch
+            kwargs['parallel'] = parallel
+            batch_index_with_summary(source.batch_index, queryset, ConceptDocument, **kwargs)
+        except Exception as ex:  # pragma: no cover
+            if not partial_doc or (isinstance(ex, BatchIndexingError) and ex.rejected):
+                raise
+            logger.exception('Falling back to full concept reindex for source %s', source_id)
+            batch_index_with_summary(
+                source.batch_index, queryset, ConceptDocument, prefetch=prefetch, select_related=select_related,
+                parallel=parallel)
+        finally:
+            source.clear_concepts_cache()
+
+
+def get_concepts_to_index(source, locales=None, exclude_locale=None):
+    from core.concepts.models import ConceptName
+    queryset = source.concepts
+
+    def named_in(**name_filters):
+        return Exists(ConceptName.objects.filter(concept_id=OuterRef('id'), retired=False, **name_filters))
+
+    if locales:
+        queryset = queryset.filter(named_in(locale__in=locales))
+    if exclude_locale:
+        queryset = queryset.filter(~named_in(locale=exclude_locale))
+
+    return queryset
+
+
+def update_concepts_locale_fields(queryset, single_batch=False, parallel=True):
+    from core.common.models import BaseModel
+    from core.concepts.documents import ConceptDocument
+    from core.concepts.models import Concept
+
+    index_name = ConceptDocument()._index._name  # pylint: disable=protected-access
+
+    def get_actions(batch_ids):
+        concepts = Concept.objects.filter(
+            id__in=batch_ids).select_related('parent').prefetch_related('names')
+        for concept in concepts:
+            name = concept.display_name or ''
+            synonyms = compact({
+                n.name for n in concept.names.all() if not n.retired and n.name and n.name != name})
+            yield {
+                '_op_type': 'update',
+                '_index': index_name,
+                '_id': concept.id,
+                'doc': {
+                    'name': name.replace('-', '_'),
+                    '_name': name.lower(),
+                    'synonyms': synonyms,
+                    '_synonyms': synonyms,
+                },
+            }
+
+    return BaseModel.batch_index_partial_by_ids(
+        queryset, ConceptDocument, get_actions, single_batch=single_batch, parallel=parallel)
+
+
+@app.task(ignore_result=True, base=QueueOnceCustomTask)
+def index_source_mappings(
+        source_id, partial_doc=None, single_batch=False, should_prefetch=True, should_select_related=True, parallel=True
+):
+    """
+    Index source mappings, or partially update existing ES documents when `partial_doc` is supplied.
+    A failed partial update falls back to a full reindex -- unless ES was still refusing writes (429 / read-only
+    index) after retries: a full reindex would only fail the same way, slower, so the task fails instead.
+    """
+    from core.sources.models import Source
+    source = Source.objects.filter(id=source_id).first()
+    if source:
+        from core.mappings.documents import MappingDocument
+        prefetch = ['sources'] if should_prefetch else []
+        select_related = [
+            'parent', 'parent__organization', 'parent__user', 'created_by', 'updated_by'
+        ] if should_select_related else []
+        try:
+            kwargs = {'partial_doc': partial_doc} if partial_doc else {
+                'prefetch': prefetch, 'select_related': select_related}
+            kwargs['single_batch'] = single_batch
+            kwargs['parallel'] = parallel
+            batch_index_with_summary(source.batch_index, source.mappings, MappingDocument, **kwargs)
+        except Exception as ex:  # pragma: no cover
+            if not partial_doc or (isinstance(ex, BatchIndexingError) and ex.rejected):
+                raise
+            logger.exception('Falling back to full mapping reindex for source %s', source_id)
+            batch_index_with_summary(
+                source.batch_index, source.mappings, MappingDocument, prefetch=prefetch, select_related=select_related,
+                parallel=parallel)
+        finally:
+            source.clear_mappings_cache()
+
+
+@app.task(base=QueueOnceCustomTask)
+def update_source_active_concepts_count(source_id):
+    from core.sources.models import Source
+    source = Source.objects.filter(id=source_id).first()
+    if source:
+        before_active_concepts = source.active_concepts
+        source.set_active_concepts()
+        if before_active_concepts != source.active_concepts:
+            source.save(update_fields=['active_concepts'])
+
+
+@app.task(base=QueueOnceCustomTask)
+def update_source_active_mappings_count(source_id):
+    from core.sources.models import Source
+    source = Source.objects.filter(id=source_id).first()
+    if source:
+        before_active_mappings = source.active_mappings
+        source.set_active_mappings()
+        if before_active_mappings != source.active_mappings:
+            source.save(update_fields=['active_mappings'])
+
+
+@app.task(base=QueueOnceCustomTask)
+def update_collection_active_concepts_count(collection_id):
+    from core.collections.models import Collection
+    collection = Collection.objects.filter(id=collection_id).first()
+    if collection:
+        before_active_concepts = collection.active_concepts
+        collection.set_active_concepts()
+        if before_active_concepts != collection.active_concepts:
+            collection.save(update_fields=['active_concepts'])
+
+
+@app.task(base=QueueOnceCustomTask)
+def update_collection_active_mappings_count(collection_id):
+    from core.collections.models import Collection
+    collection = Collection.objects.filter(id=collection_id).first()
+    if collection:
+        before_active_mappings = collection.active_mappings
+        collection.set_active_mappings()
+        if before_active_mappings != collection.active_mappings:
+            collection.save(update_fields=['active_mappings'])
+
+
+@app.task
+def delete_s3_objects(path):
+    if path:
+        get_export_service().delete_objects(path)
+
+
+@app.task(ignore_result=True)
+def beat_healthcheck():  # pragma: no cover
+    from core.services.storages.redis import RedisService
+    redis_service = RedisService()
+    redis_service.set(settings.CELERYBEAT_HEALTHCHECK_KEY, str(datetime.now()), ex=120)
+
+
+@app.task()
+def resources_report(start_date=None, end_date=None, email=None):  # pragma: no cover
+    # runs on first of every month
+    # reports usage of prev month
+    now = timezone.now().replace(day=1)
+    start_date = start_date or now - relativedelta(months=1)
+    end_date = end_date or now
+    report = ResourceUsageReport(start_date=start_date, end_date=end_date)
+    buff, file_name = report.generate()
+    date_range_label = get_date_range_label(report.start_date, report.end_date)
+    env = settings.ENV.upper()
+    reports_email = email or settings.REPORTS_EMAIL
+    mail = EmailMessage(
+        subject=f"{env} Monthly Resources Report: {date_range_label}",
+        body=f"Please find attached resources report of {env} for the period of {date_range_label}",
+        to=[reports_email]
+    )
+    mail.attach(file_name, buff.getvalue(), 'text/csv')
+    result = mail.send()
+    logger.info('Resources report sent to %s, result: %s', reports_email, result)
+    return result
+
+
+@app.task(ignore_result=True)
+def vacuum_and_analyze_db():
+    from django.db import connections
+    conn_proxy = connections['default']
+    conn_proxy.cursor()  # init connection field
+    conn = conn_proxy.connection
+    old_isolation_level = conn.isolation_level
+    conn.set_isolation_level(0)
+    conn.cursor().execute('VACUUM ANALYZE')
+    conn.set_isolation_level(old_isolation_level)
+
+
+@app.task(ignore_result=True)
+def post_import_update_resource_counts():
+    from core.sources.models import Source
+    from core.concepts.models import Concept
+    from core.mappings.models import Mapping
+
+    uncounted_concepts = Concept.objects.filter(_counted__isnull=True)
+    sources = Source.objects.filter(id__in=uncounted_concepts.values_list('parent_id', flat=True))
+    for source in sources:
+        source.update_concepts_count(sync=True)
+        try:
+            uncounted_concepts.filter(parent_id=source.id).update(_counted=True)
+        except:  # pylint: disable=bare-except
+            pass
+
+    uncounted_mappings = Mapping.objects.filter(_counted__isnull=True)
+    sources = Source.objects.filter(
+        id__in=uncounted_mappings.values_list('parent_id', flat=True))
+
+    for source in sources:
+        source.update_mappings_count(sync=True)
+        try:
+            uncounted_mappings.filter(parent_id=source.id).update(_counted=True)
+        except:  # pylint: disable=bare-except
+            pass
+
+
+@app.task(ignore_result=True)
+def update_mappings_source(source_id):
+    # Updates mappings where mapping.to_source_url or mapping.from_source_url matches source url or canonical url
+    from core.sources.models import Source
+    source = Source.objects.filter(id=source_id).first()
+    if source:
+        source.update_mappings()
+
+
+@app.task(ignore_result=True)
+def update_mappings_concept(concept_id):
+    # Updates mappings where mapping.to_concept or mapping.from_concepts matches concept's mnemonic and parent
+    from core.concepts.models import Concept
+    concept = Concept.objects.filter(id=concept_id).first()
+    if concept:
+        concept.update_mappings()
+
+
+@app.task(ignore_result=True)
+def calculate_checksums(resource_type, resource_id):
+    model = get_resource_class_from_resource_name(resource_type)
+    if model:
+        is_source_child = model.__name__ in ('Concept', 'Mapping')
+        instance = model.objects.filter(id=resource_id).first()
+        if instance:
+            instance.set_checksums()
+            if is_source_child:
+                if not instance.is_latest_version:
+                    instance.get_latest_version().set_checksums()
+                if not instance.is_versioned_object:
+                    instance.versioned_object.set_checksums()
+
+
+@app.task(ignore_result=True)
+def generate_source_resources_checksums(repo_id, only_latest=False):  # pragma: no cover
+    from core.sources.models import Source
+    repo = Source.objects.filter(id=repo_id).first()
+
+    def set_checksums(queryset):
+        paginator = Paginator(queryset.order_by('-id'), 500)
+        for page_number in paginator.page_range:
+            page = paginator.page(page_number)
+            for resource in page.object_list:
+                resource.set_checksums()
+
+    if repo.is_head and only_latest:
+        from core.concepts.models import Concept
+        from core.mappings.models import Mapping
+        set_checksums(Concept.objects.filter(is_latest_version=True, parent=repo))
+        set_checksums(Mapping.objects.filter(is_latest_version=True, parent=repo))
+    else:
+        set_checksums(repo.get_concepts_queryset())
+        set_checksums(repo.get_mappings_queryset())
+
+
+@app.task(ignore_result=True)
+def readd_references_to_expansion_on_references_removal(expansion_id, removed_reference_ids):
+    from core.collections.models import Expansion
+    expansion = Expansion.objects.filter(id=expansion_id).first()
+    if expansion and removed_reference_ids:
+        reference_to_readd = expansion.collection_version.references.exclude(id__in=removed_reference_ids)
+        expansion.add_references(reference_to_readd, True, True, False)
+
+
+@app.task(ignore_result=True)
+def resolve_url_registry_entries(repo_id, repo_type):
+    repo_klass = get_resource_class_from_resource_name(repo_type)
+    if repo_klass:
+        repo = repo_klass.objects.filter(id=repo_id).first()
+        for entry in repo.active_url_registry_entries:
+            entry.lookup_entry()
+
+
+@app.task(ignore_result=True)
+def expire_old_celery_tasks():
+    Task.objects.filter(updated_at__lt=timezone.now() - timezone.timedelta(days=7)).delete()
+
+
+def get_live_indexing_task_ids():
+    """
+    Task ids currently held by the indexing workers -- executing, prefetched or scheduled.
+    Returns None when no indexing worker answers, i.e. liveness could not be established at all.
+    """
+    inspector = app.control.inspect(timeout=INDEXING_JOB_INSPECT_TIMEOUT)
+    workers = [
+        worker for worker, queues in (inspector.active_queues() or {}).items()
+        if any(queue.get('name') == INDEXING_QUEUE for queue in queues or [])
+    ]
+    if not workers:  # answering active_queues is itself the proof of life
+        return None
+
+    inspector = app.control.inspect(destination=workers, timeout=INDEXING_JOB_INSPECT_TIMEOUT)
+    task_ids = set()
+    for reply in (inspector.active(), inspector.reserved(), inspector.scheduled()):
+        for tasks in (reply or {}).values():
+            for entry in tasks or []:
+                task_id = entry.get('id') or get(entry, 'request.id')  # scheduled nests under request
+                if task_id:
+                    task_ids.add(task_id)
+    return task_ids
+
+
+@app.task(ignore_result=True)
+def rerun_indexing_job():
+    """
+    Re-queues indexing jobs left in STARTED by a worker that died without reporting back (OOM kill,
+    hard restart). Liveness comes from the indexing workers themselves rather than from how long a
+    job has been running -- runtime says nothing about whether anyone still owns it.
+    """
+    live_task_ids = get_live_indexing_task_ids()
+    if live_task_ids is None:
+        #  Broker unreachable or indexing workers all down. Every running job would look stranded.
+        logger.warning('rerun_indexing_job: no indexing worker answered, skipping sweep')
+        return
+
+    stranded = Task.objects.filter(
+        Task.queue_criteria(INDEXING_QUEUE),
+        state=STARTED,
+        started_at__lt=timezone.now() - timezone.timedelta(minutes=INDEXING_JOB_GRACE_PERIOD_MINUTES)
+    ).exclude(id__in=live_task_ids).order_by('started_at')[:INDEXING_JOB_BATCH_SIZE]
+
+    for task in stranded:
+        try:
+            logger.info('rerun_indexing_job: re-queueing %s (%s) started at %s', task.id, task.name, task.started_at)
+            task.rerun(force=True)
+        except Exception as ex:  # pylint: disable=broad-except
+            logger.error('rerun_indexing_job: failed to re-queue %s: %s', task.id, ex)
+
+
+@app.task(base=QueueOnceCustomTask)
+def source_version_compare(version1_uri, version2_uri, is_changelog, verbosity, format_type='json', save_both=False):
+    from core.sources.models import Source
+    if save_both:
+        Source.save_changelog_and_comparison(version1_uri, version2_uri)
+        return 1
+    return Source.run_diff(version1_uri, version2_uri, is_changelog, verbosity, format_type)
+
+
+@app.task(base=QueueOnceCustomTask)
+def collection_version_compare(
+        version1_uri, version2_uri, is_changelog, verbosity, format_type='json', save_both=False):
+    from core.collections.models import Collection
+    if save_both:
+        Collection.save_changelog_and_comparison(version1_uri, version2_uri)
+        return 1
+    return Collection.run_diff(version1_uri, version2_uri, is_changelog, verbosity, format_type)
+
+
+@app.task(base=QueueOnceCustomTask)
+def expansion_compare(expansion1_uri, expansion2_uri, is_changelog, verbosity, format_type='json'):
+    from core.collections.models import Expansion
+    return Expansion.run_diff(expansion1_uri, expansion2_uri, is_changelog, verbosity, format_type)

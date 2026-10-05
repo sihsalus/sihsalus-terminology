@@ -1,0 +1,27 @@
+- model: "orgs.organization"
+  pk: 1
+  fields:
+    name: OCL
+    company: OCL
+    mnemonic: OCL
+    website: "http://openconceptlab.org"
+    created_at: "2020-06-08T08:00:00+00:00"
+    updated_at: "2020-06-08T08:00:00+00:00"
+    created_by: 1
+    updated_by: 1
+- model: "users.userprofile"
+  pk: 1
+  fields:
+    email: "admin@openconceptlab.org"
+    username: "ocladmin"
+    password: "pbkdf2_sha256$180000$YSGItUAkg0Wy$dzSLkkOk9FRFsOQOclMfng95jm9C1ufww0H9LQ/yhAg="
+    first_name: "OCL"
+    last_name: ""
+    company: OCL
+    website: 'openconceptlab.org'
+    is_staff: true
+    is_superuser: true
+    created_at: "2020-06-08T08:00:00+00:00"
+    updated_at: "2020-06-08T08:00:00+00:00"
+    created_by: 1
+    updated_by: 1

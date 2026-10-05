@@ -1,0 +1,35 @@
+- model: "capabilities.capability"
+  pk: 1
+  fields:
+    name: mapper.projects
+    description: Number of map projects a user may create
+- model: "capabilities.capability"
+  pk: 2
+  fields:
+    name: mapper.rows_per_project
+    description: Number of rows a single map project may declare
+- model: "capabilities.capability"
+  pk: 3
+  fields:
+    name: mapper.match_operations
+    description: Number of concept-match operations (rows x algorithms)
+- model: "capabilities.capability"
+  pk: 4
+  fields:
+    name: ai_assistant.calls
+    description: Number of Mapper AI Assistant invocations
+- model: "capabilities.capability"
+  pk: 5
+  fields:
+    name: ai_assistant.change_comments
+    description: Number of AI-generated concept change comments (TermBrowser)
+- model: "capabilities.capability"
+  pk: 6
+  fields:
+    name: imports.file_size_kb
+    description: Largest bulk import a user may send in one request, in KB
+- model: "capabilities.capability"
+  pk: 7
+  fields:
+    name: clone.resources_per_call
+    description: Most concepts + mappings one $clone call may create

@@ -1,0 +1,25 @@
+[run]
+omit =
+    core/settings.py
+    flowerconfig.py
+    core/asgi.py
+    core/celery.py
+    core/common/healthcheck/*
+    core/reports/*
+    */reports.py
+    core/wsgi.py
+    */management/commands/*
+    */migrations/*
+    */tests/factories.py
+    */documents.py
+    core/common/search.py
+    core/common/errbit.py
+    core/common/throttling.py
+    */es_normalizers.py
+    */feeds.py
+    *test*
+    core/middlewares/*
+    *.css
+    *.html
+    generate_checksum.py
+concurrency=multiprocessing

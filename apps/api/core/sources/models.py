@@ -1,0 +1,1112 @@
+import uuid
+from collections import OrderedDict
+
+from celery_once import AlreadyQueued
+from dirtyfields import DirtyFieldsMixin
+from django.conf import settings
+from django.contrib.postgres.fields import ArrayField
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
+from django.db.models import UniqueConstraint, F, Max, Count
+from django.db.models.functions import Cast
+from pydash import get, compact
+
+from core.common.checksums import VersionCompareMixin
+from core.common.constants import HEAD
+from core.common.models import ConceptContainerModel
+from core.common.tasks import update_mappings_source, index_source_concepts, index_source_mappings, \
+    resolve_url_registry_entries
+from core.common.utils import to_camel_case
+from core.common.validators import validate_non_negative
+from core.concepts.models import ConceptName, Concept
+from core.services.storages.postgres import PostgresQL
+from core.sources.constants import SOURCE_TYPE, SOURCE_VERSION_TYPE, HIERARCHY_ROOT_MUST_BELONG_TO_SAME_SOURCE, \
+    HIERARCHY_MEANINGS, AUTO_ID_CHOICES, AUTO_ID_SEQUENTIAL, AUTO_ID_UUID, LOCALE_EXTERNAL_AUTO_ID_CHOICES
+from core.tasks.models import Task
+
+
+class CloneLimitExceeded(Exception):
+    """A $clone would create more concepts + mappings than the caller's remaining per-call budget; nothing written."""
+    def __init__(self, budget, requested):
+        super().__init__(f'Clone would create {requested} resources, over the budget of {budget}.')
+        self.budget = budget
+        self.requested = requested
+
+
+class CloneError(Exception):
+    def __init__(self, errors):
+        super().__init__('Clone failed.')
+        self.errors = errors
+
+
+class Source(DirtyFieldsMixin, VersionCompareMixin, ConceptContainerModel):
+    DEFAULT_AUTO_ID_START_FROM = 1
+    TOKEN_MATCH_ALGORITHM = 'es'
+    SEMANTIC_MATCH_ALGORITHM = 'llm'
+    MATCH_ALGORITHMS = [TOKEN_MATCH_ALGORITHM, SEMANTIC_MATCH_ALGORITHM]
+
+    es_fields = {
+        'source_type': {'sortable': True, 'filterable': True, 'facet': True, 'exact': True},
+        'mnemonic': {'sortable': False, 'filterable': True, 'exact': True},
+        '_mnemonic': {'sortable': True, 'filterable': False, 'exact': False},
+        'name': {'sortable': False, 'filterable': True, 'exact': True},
+        '_name': {'sortable': True, 'filterable': False, 'exact': False},
+        'last_update': {'sortable': True, 'filterable': False, 'default': 'desc'},
+        'updated_by': {'sortable': False, 'filterable': False, 'facet': True},
+        'locale': {'sortable': False, 'filterable': True, 'facet': True},
+        'property_codes': {'sortable': False, 'filterable': True, 'facet': True},
+        'filter_codes': {'sortable': False, 'filterable': True, 'facet': True},
+        'owner': {'sortable': True, 'filterable': True, 'facet': True, 'exact': True},
+        'owner_type': {'sortable': False, 'filterable': True, 'facet': True},
+        'custom_validation_schema': {'sortable': False, 'filterable': True, 'facet': True},
+        'canonical_url': {'sortable': False, 'filterable': True, 'exact': True},
+        'experimental': {'sortable': False, 'filterable': False, 'facet': False},
+        'hierarchy_meaning': {'sortable': False, 'filterable': True, 'facet': True},
+        'external_id': {'sortable': False, 'filterable': True, 'facet': False, 'exact': True},
+        'match_algorithm': {'sortable': False, 'filterable': True, 'facet': True, 'exact': False},
+        'retired': {'sortable': False, 'filterable': True, 'facet': True},
+    }
+
+    class Meta:
+        db_table = 'sources'
+        constraints = [
+            UniqueConstraint(
+                fields=['mnemonic', 'version', 'organization'],
+                name="org_source_unique",
+                condition=models.Q(user=None),
+            ),
+            UniqueConstraint(
+                fields=['mnemonic', 'version', 'user'],
+                name="user_source_unique",
+                condition=models.Q(organization=None),
+            )
+        ]
+        indexes = [
+                      models.Index(fields=['uri']), models.Index(fields=['public_access']),
+                      models.Index(
+                          name='source_org_released',
+                          fields=['mnemonic', 'organization', '-created_at'],
+                          condition=(models.Q(user__isnull=True, is_active=True, released=True))
+                      ),
+                      models.Index(
+                          name='source_user_released',
+                          fields=['mnemonic', 'user', '-created_at'],
+                          condition=(models.Q(organization__isnull=True, is_active=True, released=True))
+                      ),
+                  ] + ConceptContainerModel.Meta.indexes
+        # + index on UPPER(mnemonic) in custom migration 0022
+
+    source_type = models.TextField(blank=True, null=True)
+    content_type = models.TextField(blank=True, null=True, choices=[('not-present', 'not-present'),
+                                                                    ('example', 'example'), ('fragment', 'fragment'),
+                                                                    ('complete', 'complete'),
+                                                                    ('supplement', 'supplement')])
+    collection_reference = models.CharField(null=True, blank=True, max_length=100)
+    hierarchy_meaning = models.CharField(null=True, blank=True, max_length=50, choices=HIERARCHY_MEANINGS)
+    case_sensitive = models.BooleanField(null=True, blank=True, default=None)
+    compositional = models.BooleanField(null=True, blank=True, default=None)
+    version_needed = models.BooleanField(null=True, blank=True, default=None)
+    hierarchy_root = models.ForeignKey('concepts.Concept', null=True, blank=True, on_delete=models.SET_NULL)
+    # auto-id
+    autoid_concept_mnemonic = models.CharField(null=True, blank=True, choices=AUTO_ID_CHOICES, max_length=10)
+    autoid_concept_external_id = models.CharField(null=True, blank=True, choices=AUTO_ID_CHOICES, max_length=10)
+    autoid_mapping_mnemonic = models.CharField(
+        null=True, blank=True, choices=AUTO_ID_CHOICES, max_length=10, default=AUTO_ID_SEQUENTIAL)
+    autoid_mapping_external_id = models.CharField(null=True, blank=True, choices=AUTO_ID_CHOICES, max_length=10)
+    autoid_concept_mnemonic_start_from = models.IntegerField(
+        default=DEFAULT_AUTO_ID_START_FROM, validators=[validate_non_negative])
+    autoid_concept_external_id_start_from = models.IntegerField(
+        default=DEFAULT_AUTO_ID_START_FROM, validators=[validate_non_negative])
+    autoid_mapping_mnemonic_start_from = models.IntegerField(
+        default=DEFAULT_AUTO_ID_START_FROM, validators=[validate_non_negative])
+    autoid_mapping_external_id_start_from = models.IntegerField(
+        default=DEFAULT_AUTO_ID_START_FROM, validators=[validate_non_negative])
+    autoid_concept_name_external_id = models.CharField(
+        null=True, blank=True, choices=LOCALE_EXTERNAL_AUTO_ID_CHOICES, max_length=10)
+    autoid_concept_description_external_id = models.CharField(
+        null=True, blank=True, choices=LOCALE_EXTERNAL_AUTO_ID_CHOICES, max_length=10)
+
+    properties = ArrayField(models.JSONField(), default=list, null=True, blank=True)
+    filters = ArrayField(models.JSONField(), default=list, null=True, blank=True)
+    match_algorithms = ArrayField(
+        models.CharField(max_length=50), default=list, null=True, blank=True)
+
+    OBJECT_TYPE = SOURCE_TYPE
+    OBJECT_VERSION_TYPE = SOURCE_VERSION_TYPE
+
+    @property
+    def has_semantic_match_algorithm(self):
+        return self.match_algorithms and self.SEMANTIC_MATCH_ALGORITHM in self.match_algorithms
+
+    @property
+    def is_sequential_concept_mnemonic(self):
+        return self.autoid_concept_mnemonic == AUTO_ID_SEQUENTIAL
+
+    @property
+    def is_sequential_concept_external_id(self):
+        return self.autoid_concept_external_id == AUTO_ID_SEQUENTIAL
+
+    @property
+    def is_sequential_mapping_mnemonic(self):
+        return self.autoid_mapping_mnemonic == AUTO_ID_SEQUENTIAL
+
+    @property
+    def is_sequential_mapping_external_id(self):
+        return self.autoid_mapping_external_id == AUTO_ID_SEQUENTIAL
+
+    @property
+    def concept_mnemonic_next(self):
+        return self.get_resource_next_attr_id(self.autoid_concept_mnemonic, self.concepts_mnemonic_seq_name)
+
+    @property
+    def concept_external_id_next(self):
+        return self.get_resource_next_attr_id(self.autoid_concept_external_id, self.concepts_external_id_seq_name)
+
+    @property
+    def concept_name_external_id_next(self):
+        return self.get_resource_next_attr_id(self.autoid_concept_name_external_id, None)
+
+    @property
+    def concept_description_external_id_next(self):
+        return self.get_resource_next_attr_id(self.autoid_concept_description_external_id, None)
+
+    @property
+    def mapping_mnemonic_next(self):
+        try:
+            return self.get_resource_next_attr_id(self.autoid_mapping_mnemonic, self.mappings_mnemonic_seq_name)
+        except:  # pylint: disable=bare-except
+            return None
+
+    @property
+    def mapping_external_id_next(self):
+        return self.get_resource_next_attr_id(self.autoid_mapping_external_id, self.mappings_external_id_seq_name)
+
+    @staticmethod
+    def get_resource_next_attr_id(attr_type, seq):
+        if attr_type == AUTO_ID_UUID:
+            return uuid.uuid4()
+        if attr_type == AUTO_ID_SEQUENTIAL:
+            return str(PostgresQL.next_value(seq))
+        return None
+
+    @staticmethod
+    def get_search_document():
+        from core.sources.documents import SourceDocument
+        return SourceDocument
+
+    @classmethod
+    def get_base_queryset(cls, params):
+        source = params.pop('source', None)
+        queryset = super().get_base_queryset(params)
+        if source:
+            queryset = queryset.filter(cls.get_exact_or_criteria('mnemonic', source))
+
+        return queryset
+
+    @staticmethod
+    def get_resource_url_kwarg():
+        return 'source'
+
+    @property
+    def source(self):
+        return self.mnemonic
+
+    @classmethod
+    def get_first_or_head(cls, url):
+        queryset = cls.objects.filter(models.Q(uri=url) | models.Q(canonical_url=url))
+        if queryset.count() > 1:
+            return queryset.filter(version=HEAD).first() or queryset.first()
+        return queryset.first()
+
+    def update_version_data(self, head):
+        super().update_version_data(head)
+        self.source_type = head.source_type
+        self.content_type = head.content_type
+        self.collection_reference = head.collection_reference
+        self.hierarchy_meaning = head.hierarchy_meaning
+        self.hierarchy_root_id = head.hierarchy_root_id
+        self.case_sensitive = head.case_sensitive
+        self.compositional = head.compositional
+        self.version_needed = head.version_needed
+
+    def get_concept_name_locales(self):
+        return ConceptName.objects.filter(concept__in=self.get_active_concepts())
+
+    def is_validation_necessary(self):
+        origin_source = self.get_latest_version()
+
+        if origin_source and origin_source.custom_validation_schema == self.custom_validation_schema:
+            return False
+
+        return self.custom_validation_schema is not None and self.active_concepts
+
+    def update_mappings(self):
+        # Updates mappings where mapping.to_source_url or mapping.from_source_url matches source url or canonical url
+        from core.mappings.models import Mapping
+        from core.mappings.documents import MappingDocument
+
+        uris = self.identity_uris
+
+        to_queryset = Mapping.objects.filter(to_source_url__in=uris)
+        from_queryset = Mapping.objects.filter(from_source_url__in=uris)
+
+        to_queryset.filter(to_source_id__isnull=True).update(to_source=self)
+        from_queryset.filter(from_source_id__isnull=True).update(from_source=self)
+
+        Mapping.batch_index(to_queryset.filter(to_source=self), MappingDocument)
+        Mapping.batch_index(from_queryset.filter(to_source=self), MappingDocument)
+
+    def is_hierarchy_root_belonging_to_self(self):
+        hierarchy_root = self.hierarchy_root
+        if self.is_head:
+            return hierarchy_root.parent_id == self.id
+        return hierarchy_root.parent_id == self.head.id
+
+    def clean(self):
+        self.hierarchy_meaning = self.hierarchy_meaning or None
+
+        self.clean_properties()
+        self.clean_filters()
+        self.clean_match_algorithms()
+
+        super().clean()
+        if self.hierarchy_root_id and not self.is_hierarchy_root_belonging_to_self():
+            raise ValidationError({'hierarchy_root': [HIERARCHY_ROOT_MUST_BELONG_TO_SAME_SOURCE]})
+
+    def clean_match_algorithms(self):
+        self.match_algorithms = self.match_algorithms or []
+
+        if not self.match_algorithms:
+            self.match_algorithms = [self.TOKEN_MATCH_ALGORITHM]
+            return
+
+        self.match_algorithms = compact(set(self.match_algorithms))
+
+        if any(algorithm not in self.MATCH_ALGORITHMS for algorithm in self.match_algorithms):
+            raise ValidationError({'match_algorithms': [f'Match algorithms must be among {self.MATCH_ALGORITHMS}']})
+
+    @property
+    def concept_summary_properties(self):
+        return get(self.meta, 'display.concept_summary_properties') or []
+
+    @property
+    def property_types(self):
+        return {
+            prop['code']: prop.get('type') for prop in (self.properties or []) if prop.get('code')
+        }
+
+    @property
+    def concept_filter_order(self):
+        return get(self.meta, 'display.concept_filter_order') or []
+
+    @property
+    def concept_filter_default(self):
+        return get(self.meta, 'display.default_filter') or None
+
+    @property
+    def filters_ordered(self):
+        if not self.filters:
+            return []
+
+        ordered = []
+        ordered_code = [
+            *(self.concept_filter_order or []),
+            *sorted([
+                f['code'] for f in self.filters if f.get('code', None) and f['code'] not in self.concept_filter_order
+            ], key=str.lower)
+        ]
+        for code in ordered_code:
+            filter_obj = next((f for f in self.filters if f.get('code') == code), None)
+            if filter_obj:
+                ordered.append(filter_obj)
+        return ordered
+
+    def clean_properties(self):
+        if not self.properties:
+            self.properties = []
+            return
+        fields = {'code', 'uri', 'description', 'type', 'display'}
+        allowed_types = {'code', 'Coding', 'string', 'integer', 'boolean', 'dateTime', 'decimal'}
+        cleaned_properties = []
+        # code: required string
+        # uri: optional URI
+        # description: optional string
+        # display: optional string
+        # "type": required string code | Coding | string | integer | boolean | dateTime | decimal, defaults string
+
+        for idx, prop in enumerate(self.properties or []):
+            if not isinstance(prop, dict):
+                raise ValidationError({'properties': [f'Property at index {idx} must be a dictionary']})
+            extra_keys = set(prop.keys()) - fields
+            if extra_keys:
+                raise ValidationError({'properties': [f'Invalid keys in property at index {idx}: {extra_keys}']})
+            if not prop.get('code') or not isinstance(prop['code'], str):
+                raise ValidationError({'properties': [f"'code' is required and must be a string at index {idx}"]})
+            if 'uri' in prop and prop['uri'] is not None and not isinstance(prop['uri'], str):
+                raise ValidationError({'properties': [f"'uri' must be a string if provided at index {idx}"]})
+            if 'description' in prop and prop['description'] is not None and not isinstance(prop['description'], str):
+                raise ValidationError({'properties': [f"'description' must be a string if provided at index {idx}"]})
+            if 'display' in prop and prop['display'] is not None and not isinstance(prop['display'], str):
+                raise ValidationError({'properties': [f"'display' must be a string if provided at index {idx}"]})
+            prop_type = prop.get('type', 'string')
+            if not isinstance(prop_type, str) or prop_type not in allowed_types:
+                raise ValidationError({'properties': [f"'type' must be one of {allowed_types} at index {idx}"]})
+            prop['type'] = prop_type
+            cleaned_properties.append(prop)
+
+        self.properties = cleaned_properties
+
+    def clean_filters(self):
+        if not self.filters:
+            self.filters = []
+            return
+
+        fields = {'code', 'description', 'operator', 'value'}
+        allowed_operators = {'=', 'is-a', 'descendent-of', 'is-not-a', 'regex', 'in', 'not-in', 'generalizes',
+                             'child-of', 'descendent-leaf', 'exists'}
+        cleaned_filters = []
+
+        # code: required string
+        # description: optional string
+        # value: #required string
+        # operator: required list = | is-a | descendent-of | is-not-a | regex | in | not-in | generalizes
+        #                           | child-of | descendent-leaf | exists
+
+        for idx, _filter in enumerate(self.filters or []):
+            if not isinstance(_filter, dict):
+                raise ValidationError({'filters': [f'Filter at index {idx} must be a dictionary']})
+            extra_keys = set(_filter.keys()) - fields
+            if extra_keys:
+                raise ValidationError({'filters': [f'Invalid keys in filter at index {idx}: {extra_keys}']})
+            if not _filter.get('code') or not isinstance(_filter['code'], str):
+                raise ValidationError({'filters': [f"'code' is required and must be a string at index {idx}"]})
+            if 'description' in _filter and _filter['description'] is not None and not isinstance(
+                    _filter['description'], str):
+                raise ValidationError({'filters': [f"'description' must be a string if provided at index {idx}"]})
+            operators = _filter.get('operator')
+            if not operators or not isinstance(operators, list) or not all(isinstance(op, str) for op in operators):
+                raise ValidationError({'filters': [f"'operator' must be a list of strings at index {idx}"]})
+            invalid_ops = set(operators) - allowed_operators
+            if invalid_ops:
+                raise ValidationError({'filters': [f"Invalid operators at index {idx}: {invalid_ops}"]})
+            if 'value' not in _filter or not isinstance(_filter['value'], str) or not _filter['value']:
+                raise ValidationError(
+                    {'filters': [f"'value' is required and must be a non-empty string at index {idx}"]})
+            cleaned_filters.append(_filter)
+
+        self.filters = cleaned_filters
+
+    def get_parentless_concepts(self):
+        return self.concepts.filter(parent_concepts__isnull=True, id=F('versioned_object_id'))
+
+    def hierarchy(self, offset=0, limit=100):
+        from core.concepts.serializers import ConceptHierarchySerializer
+        hierarchy_root = None
+        if offset == 0:
+            hierarchy_root = self.hierarchy_root
+
+        parent_less_children = self.get_parentless_concepts()
+        if hierarchy_root:
+            parent_less_children = parent_less_children.exclude(mnemonic=hierarchy_root.mnemonic)
+
+        total_count = parent_less_children.count()
+        adjusted_limit = limit
+        if hierarchy_root:
+            adjusted_limit -= 1
+        parent_less_children = parent_less_children.order_by('mnemonic')[offset:adjusted_limit+offset]
+
+        children = []
+        if parent_less_children.exists():
+            children = ConceptHierarchySerializer(parent_less_children, many=True).data
+
+        if hierarchy_root:
+            children.append({**ConceptHierarchySerializer(hierarchy_root).data, 'root': True})
+
+        return {
+            'id': self.mnemonic,
+            'children': children,
+            'count': total_count + (1 if hierarchy_root else 0),
+            'offset': offset,
+            'limit': limit
+        }
+
+    def set_active_concepts(self):
+        queryset = self.concepts
+        if self.is_head:
+            queryset = self.concepts_set.filter(id=F('versioned_object_id'))
+        self.active_concepts = queryset.filter(retired=False, is_active=True).count()
+
+    def set_active_mappings(self):
+        queryset = self.mappings
+        if self.is_head:
+            queryset = self.mappings_set.filter(id=F('versioned_object_id'))
+        self.active_mappings = queryset.filter(retired=False, is_active=True).count()
+
+    def index_resources_for_self_as_latest_released(self, only_update=False):
+        """
+        1. Assumes self is the latest released version
+        2. indexes prev released version's (if exists) concepts and mappings
+        3. indexes this new released version's concepts and mappings
+        """
+        if self.is_latest_released:
+            user = self.created_by
+
+            prev_released_version = self.get_prev_released_version()
+            if prev_released_version:
+                prev_released_version.index_children_async(user, {'is_in_latest_source_version': False})
+
+            if only_update:
+                self.index_children_async(user, {'is_in_latest_source_version': True})
+            else:
+                self.index_children_async(
+                    user, {'_append_source_version': self.version, 'is_in_latest_source_version': True}
+                )
+
+    def index_resources_for_self_as_unreleased(self):
+        """
+        1. Assumes self moved from released to unreleased
+        2. indexes this unreleased version's concepts and mappings
+        3. indexes latest released version's (if exists) concepts and mappings
+        """
+        if not self.released:
+            user = self.updated_by
+            self.index_children_async(user, {'is_in_latest_source_version': False})
+
+            latest_released = self.get_latest_released_version()
+            if latest_released:
+                latest_released.index_children_async(user, {'is_in_latest_source_version': True})
+
+    def seed_concepts(self, index=True):
+        head = self.head
+        if head:
+            through_model = Concept.sources.through
+            through_model.objects.filter(source_id=self.id).delete()
+            concept_ids = list(head.concepts.filter(is_latest_version=True).values_list('id', flat=True))
+            through_objects = [through_model(source_id=self.id, concept_id=cid) for cid in concept_ids]
+            through_model.objects.bulk_create(through_objects, batch_size=5000)
+            if index:
+                from core.concepts.documents import ConceptDocument
+                self.batch_index(self.concepts, ConceptDocument)
+
+    def seed_mappings(self, index=True):
+        from core.mappings.models import Mapping
+        head = self.head
+        if head:
+            through_model = Mapping.sources.through
+            through_model.objects.filter(source_id=self.id).delete()
+            mapping_ids = list(head.mappings.filter(is_latest_version=True).values_list('id', flat=True))
+            through_objects = [through_model(source_id=self.id, mapping_id=mid) for mid in mapping_ids]
+            through_model.objects.bulk_create(through_objects, batch_size=5000)
+            if index:
+                from core.mappings.documents import MappingDocument
+                self.batch_index(self.mappings, MappingDocument)
+
+    def index_children(self, sync=True, user=None):
+        if sync:
+            from core.concepts.documents import ConceptDocument
+            from core.mappings.documents import MappingDocument
+
+            self.batch_index(self.concepts, ConceptDocument)
+            self.batch_index(self.mappings, MappingDocument)
+        else:
+            self.index_children_async(user, {'_append_source_version': self.version})
+
+    def index_children_async(self, user=None, partial_doc=None):
+        user = user or self.updated_by
+
+        self.index_concepts_async(user, partial_doc)
+        self.index_mappings_async(user, partial_doc)
+
+    def index_mappings_async(self, user, partial_doc=None):
+        user = user or self.updated_by
+
+        task = Task.new(queue='indexing', user=user, name=index_source_mappings.__name__)
+        try:
+            index_source_mappings.apply_async(
+                (self.id, partial_doc), queue='indexing', persist_args=True, task_id=task.id
+            )
+        except AlreadyQueued:
+            pass
+
+    def index_concepts_async(self, user, partial_doc=None, locales=None, exclude_locale=None):
+        user = user or self.updated_by
+
+        task = Task.new(queue='indexing', user=user, name=index_source_concepts.__name__)
+        narrowing = {key: value for key, value in {
+            'locales': locales, 'exclude_locale': exclude_locale}.items() if value}
+        celery_args = [(self.id, partial_doc)]
+        if narrowing:
+            celery_args.append(narrowing)
+        try:
+            index_source_concepts.apply_async(
+                *celery_args, queue='indexing', persist_args=True, task_id=task.id
+            )
+        except AlreadyQueued:
+            pass
+
+    def get_concepts_reindex_filters(self, original):
+        if bool(self.has_semantic_match_algorithm) != bool(original.has_semantic_match_algorithm):
+            return {}
+
+        old_supported, new_supported = original.supported_locales, self.supported_locales
+        default_changed = self.default_locale != original.default_locale
+        nullness_changed = (old_supported is None) != (new_supported is None)
+        entered_or_left = set(old_supported or []) ^ set(new_supported or [])
+
+        if not default_changed and not nullness_changed and not entered_or_left:
+            return None
+
+        filters = {}
+        if default_changed:
+            if not nullness_changed:
+                filters['locales'] = sorted(
+                    entered_or_left | set(compact([original.default_locale, self.default_locale])))
+        else:
+            if not nullness_changed:
+                filters['locales'] = sorted(entered_or_left)
+            if self.default_locale:
+                filters['exclude_locale'] = self.default_locale
+
+        return filters
+
+    def get_export_task(self):
+        return Task.find(name__iendswith='export_source', args__contains=[self.id])
+
+    def get_index_concepts_task(self):
+        return Task.find(name__iendswith='index_source_concepts', args__contains=[self.id])
+
+    def get_index_mappings_task(self):
+        return Task.find(name__iendswith='index_source_mappings', args__contains=[self.id])
+
+    def get_seed_new_version_task(self):
+        return Task.find(name__iendswith='seed_children_to_new_version', args__contains=['source', self.id])
+
+    def get_changelog_task(self):
+        return self.get_changelog_task_by_name('source_version_compare')
+
+    def __get_resource_db_sequence_prefix(self):
+        return self.uri.replace('/', '_').replace('-', '_').replace('.', '_').replace('@', '_')
+
+    @property
+    def concepts_mnemonic_seq_name(self):
+        prefix = self.__get_resource_db_sequence_prefix()
+        return f"{prefix}_concepts_mnemonic_seq"
+
+    @property
+    def concepts_external_id_seq_name(self):
+        prefix = self.__get_resource_db_sequence_prefix()
+        return f"{prefix}_concepts_external_id_seq"
+
+    @property
+    def is_sequential_concepts_mnemonic(self):
+        return self.autoid_concept_mnemonic == AUTO_ID_SEQUENTIAL
+
+    @property
+    def is_sequential_mappings_mnemonic(self):
+        return self.autoid_mapping_mnemonic == AUTO_ID_SEQUENTIAL
+
+    @property
+    def mappings_mnemonic_seq_name(self):
+        prefix = self.__get_resource_db_sequence_prefix()
+        return f"{prefix}_mappings_mnemonic_seq"
+
+    @property
+    def mappings_external_id_seq_name(self):
+        prefix = self.__get_resource_db_sequence_prefix()
+        return f"{prefix}_mappings_external_id_seq"
+
+    def save(
+        self, *args, force_insert=False, force_update=False, using=None, update_fields=None
+    ):
+        is_new = not self.id
+        dirty_fields = self.get_dirty_fields()
+
+        super().save(*args, force_insert=force_insert, force_update=force_update, using=using,
+                     update_fields=update_fields)
+
+        if self.id and self.is_head:
+            if is_new:
+                self.__create_sequences()
+            else:
+                self.__update_sequences(dirty_fields)
+
+        if self.id and 'canonical_url' in dirty_fields and self.active_url_registry_entries.exists():
+            resolve_url_registry_entries.apply_async((self.id, self.resource_type), queue='default', permanent=False)
+
+    def __update_sequences(self, dirty_fields=[]):  # pylint: disable=dangerous-default-value
+        def should_update(is_seq, field):
+            start_from = get(self, field)
+            return field in dirty_fields and is_seq and start_from and start_from > 0
+
+        def should_create(is_seq, field):
+            return field in dirty_fields and dirty_fields.get(field) != AUTO_ID_SEQUENTIAL and is_seq
+
+        def to_seq(start_from):
+            return int(start_from) - 1
+
+        if should_create(self.is_sequential_concept_mnemonic, 'autoid_concept_mnemonic'):
+            PostgresQL.create_seq(
+                self.concepts_mnemonic_seq_name, 'sources.uri', 0, self.autoid_concept_mnemonic_start_from)
+        elif should_update(self.is_sequential_concept_mnemonic, 'autoid_concept_mnemonic_start_from'):
+            PostgresQL.update_seq(self.concepts_mnemonic_seq_name, to_seq(self.autoid_concept_mnemonic_start_from))
+
+        if should_create(self.is_sequential_mapping_mnemonic, 'autoid_mapping_mnemonic'):
+            PostgresQL.create_seq(
+                self.mappings_mnemonic_seq_name, 'sources.uri', 0, self.autoid_mapping_mnemonic_start_from
+            )
+        elif should_update(self.is_sequential_mapping_mnemonic, 'autoid_mapping_mnemonic_start_from'):
+            PostgresQL.update_seq(self.mappings_mnemonic_seq_name, to_seq(self.autoid_mapping_mnemonic_start_from))
+
+        if should_create(self.is_sequential_mapping_external_id, 'autoid_mapping_external_id'):
+            PostgresQL.create_seq(
+                self.mappings_external_id_seq_name, 'sources.uri', 0, self.autoid_mapping_external_id_start_from
+            )
+        elif should_update(self.is_sequential_mapping_external_id, 'autoid_mapping_external_id_start_from'):
+            PostgresQL.update_seq(
+                self.mappings_external_id_seq_name, to_seq(self.autoid_mapping_external_id_start_from))
+
+        if should_create(self.is_sequential_concept_external_id, 'autoid_concept_external_id'):
+            PostgresQL.create_seq(
+                self.concepts_external_id_seq_name, 'sources.uri', 0, self.autoid_concept_external_id_start_from
+            )
+        elif should_update(self.is_sequential_concept_external_id, 'autoid_concept_external_id_start_from'):
+            PostgresQL.update_seq(
+                self.concepts_external_id_seq_name, to_seq(self.autoid_concept_external_id_start_from))
+
+    def __create_sequences(self):
+        if self.is_sequential_concept_mnemonic:
+            PostgresQL.create_seq(
+                self.concepts_mnemonic_seq_name, 'sources.uri', 0, self.autoid_concept_mnemonic_start_from
+            )
+        if self.is_sequential_mapping_mnemonic:
+            PostgresQL.create_seq(
+                self.mappings_mnemonic_seq_name, 'sources.uri', 0, self.autoid_mapping_mnemonic_start_from
+            )
+        if self.is_sequential_concept_external_id:
+            PostgresQL.create_seq(
+                self.concepts_external_id_seq_name, 'sources.uri', 0, self.autoid_concept_external_id_start_from
+            )
+        if self.is_sequential_mapping_external_id:
+            PostgresQL.create_seq(
+                self.mappings_external_id_seq_name, 'sources.uri', 0, self.autoid_mapping_external_id_start_from
+            )
+
+    def post_delete_actions(self):
+        if self.is_head:
+            PostgresQL.drop_seq(self.concepts_mnemonic_seq_name)
+            PostgresQL.drop_seq(self.concepts_external_id_seq_name)
+            PostgresQL.drop_seq(self.mappings_mnemonic_seq_name)
+            PostgresQL.drop_seq(self.mappings_external_id_seq_name)
+
+        super().post_delete_actions()
+
+    def post_create_actions(self):
+        if get(settings, 'TEST_MODE', False):
+            update_mappings_source(self.id)
+        else:
+            update_mappings_source.apply_async((self.id,), queue='default', permanent=False)
+
+    def get_max_concept_attribute(self, attribute):
+        return get(self.get_concepts_queryset().aggregate(max_val=Max(attribute)), 'max_val', None)
+
+    def get_max_mapping_attribute(self, attribute):
+        return get(self.get_mappings_queryset().aggregate(max_val=Max(attribute)), 'max_val', None)
+
+    def get_max_concept_mnemonic(self):
+        return self.get_max_mnemonic_for_resource(self.get_concepts_queryset())
+
+    def get_max_mapping_mnemonic(self):
+        return self.get_max_mnemonic_for_resource(self.get_mappings_queryset())
+
+    @staticmethod
+    def get_max_mnemonic_for_resource(queryset):
+        return get(
+            queryset.filter(
+                mnemonic__regex=r'^\d+$'
+            ).annotate(
+                mnemonic_int=Cast('mnemonic', models.IntegerField())
+            ).aggregate(
+                max_val=Max('mnemonic_int')), 'max_val', None
+        )
+
+    @property
+    def last_concept_update(self):
+        if self.is_head:
+            return Concept.objects.filter(
+                parent_id=self.id, id=F('versioned_object_id')
+            ).order_by('-updated_at').values_list('updated_at', flat=True).first()
+        return self.get_max_concept_attribute('updated_at')
+
+    @property
+    def last_mapping_update(self):
+        if self.is_head:
+            from core.mappings.models import Mapping
+            return Mapping.objects.filter(
+                parent_id=self.id, id=F('versioned_object_id')
+            ).order_by('-updated_at').values_list('updated_at', flat=True).first()
+        return self.get_max_mapping_attribute('updated_at')
+
+    def get_mapped_sources(self, exclude_self=True):
+        mapped_source_ids = (
+            self.get_mappings_queryset()
+            .values_list('to_source_id', flat=True)
+            .distinct()
+        )
+        queryset = Source.objects.filter(id__in=mapped_source_ids)
+        if exclude_self:
+            queryset = queryset.exclude(id=self.id)
+        return queryset
+
+    def clone_resources(self, user, concepts, mappings, **kwargs):  # pylint: disable=too-many-locals,too-many-branches
+        from core.mappings.models import Mapping
+        with transaction.atomic():
+            added_concepts, added_mappings = [], []
+            concept_errors, mapping_errors = [], []
+            equivalency_map_types = compact((kwargs.get('equivalency_map_types') or '').split(','))
+            _concepts_to_add_mappings_for = []
+            for concept in concepts:
+                if self.get_equivalent_concept(concept, equivalency_map_types):
+                    continue
+
+                cloned_concept = concept.versioned_object.clone()
+                self.clone_concepts([cloned_concept], user, False)
+                if cloned_concept.id:
+                    added_concepts.append(cloned_concept)
+                else:
+                    concept_errors.append(self.get_clone_concept_error(cloned_concept, concept))
+                    continue
+
+                if equivalency_map_types:
+                    equivalency_mapping = Mapping.build(
+                        map_type=equivalency_map_types[0], from_concept=cloned_concept, to_concept=concept,
+                        parent=self
+                    )
+                    self.clone_mappings([equivalency_mapping], user, False)
+                    if equivalency_mapping.id:
+                        added_mappings.append(equivalency_mapping)
+                    else:
+                        mapping_errors.append(self.get_clone_mapping_error(equivalency_mapping))
+                _concepts_to_add_mappings_for.append([concept, cloned_concept])
+
+            for concept_pair in _concepts_to_add_mappings_for:
+                concept, cloned_concept = concept_pair
+                for mapping in mappings.filter(from_concept__versioned_object_id=concept.versioned_object_id):
+                    existing_to_concept = self.get_equivalent_concept(mapping.to_concept, equivalency_map_types)
+                    cloned_mapping = mapping.clone(user, cloned_concept, existing_to_concept)
+                    self.clone_mappings([cloned_mapping], user, False)
+                    if cloned_mapping.id:
+                        added_mappings.append(cloned_mapping)
+                    else:
+                        mapping_errors.append(self.get_clone_mapping_error(cloned_mapping, mapping))
+
+            errors = {}
+            if concept_errors:
+                errors['concepts'] = concept_errors
+            if mapping_errors:
+                errors['mappings'] = mapping_errors
+            if errors:
+                raise CloneError(errors)
+
+            if added_concepts or added_mappings:
+                self.update_children_counts()
+
+            return added_concepts, added_mappings
+
+    @staticmethod
+    def get_clone_concept_error(cloned_concept, original_concept=None):
+        source_concept = original_concept or cloned_concept
+        return {
+            'mnemonic': get(source_concept, 'mnemonic'),
+            'source_url': get(source_concept, 'uri'),
+            'errors': get(cloned_concept, 'errors') or {'__all__': ['Failed to clone concept.']}
+        }
+
+    @staticmethod
+    def get_clone_mapping_error(cloned_mapping, original_mapping=None):
+        source_mapping = original_mapping or cloned_mapping
+        return {
+            'map_type': get(source_mapping, 'map_type'),
+            'from_concept_code': (
+                get(source_mapping, 'from_concept_code') or get(source_mapping, 'from_concept.mnemonic')
+            ),
+            'to_concept_code': get(source_mapping, 'to_concept_code') or get(source_mapping, 'to_concept.mnemonic'),
+            'from_source_url': get(source_mapping, 'from_source_url') or get(source_mapping, 'from_source.uri'),
+            'to_source_url': get(source_mapping, 'to_source_url') or get(source_mapping, 'to_source.uri'),
+            'errors': get(cloned_mapping, 'errors') or {'__all__': ['Failed to clone mapping.']}
+        }
+
+    def get_equivalent_concept(self, concept, equivalency_map_type):
+        equivalent_mapping = self.get_equivalent_mapping(concept, equivalency_map_type)
+        return get(equivalent_mapping, 'from_concept')
+
+    def get_equivalent_mapping(self, concept, equivalency_map_type):
+        return self.mappings_set.filter(
+            map_type__in=equivalency_map_type, to_concept__versioned_object_id=concept.versioned_object_id,
+            from_concept__parent_id=self.id, retired=False, id=F('versioned_object_id')
+        ).first() if equivalency_map_type and concept else None
+
+    def clone_with_cascade(self, concept_to_clone, user, resource_budget=None, **kwargs):
+        """
+        `resource_budget`: most concepts + mappings this clone may create (None = unlimited). The cascade stops
+        as soon as it passes the budget, and CloneLimitExceeded is raised before anything is written.
+        Unlimited callers get the whole cascade: no silent 1,000 cut-off.
+        """
+        from core.mappings.models import Mapping
+        mappings = Mapping.objects.none()
+        concepts = Concept.objects.filter(id=concept_to_clone.id)
+        if kwargs:
+            kwargs.pop('view', None)
+            kwargs['repo_version'] = kwargs.get('repo_version') or concept_to_clone.parent
+            result = concept_to_clone.cascade(
+                **kwargs, omit_if_exists_in=self.uri, include_self=False,
+                max_results=None if resource_budget is None else resource_budget + 1,
+                max_results_strict=resource_budget is not None,
+            )
+            concepts = result['concepts']
+            mappings = result['mappings']
+        if resource_budget is not None:
+            concepts_count = concepts.count()
+            requested = concepts_count + mappings.count()
+            if compact((kwargs.get('equivalency_map_types') or '').split(',')):
+                requested += concepts_count  # clone_resources adds one equivalency mapping per cloned concept
+            if requested > resource_budget:
+                raise CloneLimitExceeded(resource_budget, requested)
+        return self.clone_resources(user, concepts, mappings, **kwargs)
+
+    def clone_mappings(self, cloned_mappings, user, update_count=True):
+        _update_count = False
+        added = []
+        for mapping in cloned_mappings:
+            to_concept = get(mapping, 'to_concept')
+            from_concept = get(mapping, 'from_concept')
+            if not get(from_concept, 'id'):
+                from_concept = self.find_concept_by_mnemonic(from_concept.mnemonic)
+            if not get(to_concept, 'id') and get(to_concept, 'mnemonic'):
+                to_concept = self.find_concept_by_mnemonic(to_concept.mnemonic)
+            mapping.from_concept_code = get(from_concept, 'mnemonic') or mapping.from_concept_code
+            mapping.from_concept_id = get(from_concept, 'id')
+            mapping.to_concept_id = get(to_concept, 'id')
+            mapping.to_concept_code = get(to_concept, 'mnemonic') or mapping.to_concept_code
+            mapping.to_source_id = get(to_concept, 'parent_id') or mapping.to_source_id
+            mapping.from_source_id = get(from_concept, 'parent_id') or mapping.from_source_id
+            self._clone_resource(mapping, user)
+            if mapping.id:
+                added.append(mapping)
+                if update_count:
+                    _update_count = True
+        if _update_count:
+            self.update_mappings_count()
+        return added
+
+    def clone_concepts(self, cloned_concepts, user, update_count=True):
+        _update_count = False
+        added = []
+        for concept in cloned_concepts:
+            concept._parent_concepts = None  # pylint: disable=protected-access
+            self._clone_resource(concept, user)
+            if concept.id:
+                added.append(concept)
+                if update_count:
+                    _update_count = True
+        if _update_count:
+            self.update_concepts_count()
+        return added
+
+    def _clone_resource(self, resource, user):
+        resource.parent = self
+        resource.parent_id = self.id
+        resource.uri = None
+        resource.created_by = user
+        resource.updated_by = user
+        resource.save_cloned()
+
+    def find_concept_by_mnemonic(self, mnemonic):
+        queryset = self.concepts_set if self.is_head else self.concepts
+        queryset = queryset.filter(mnemonic=mnemonic).order_by('-created_at')
+        return (
+                queryset.filter(
+                    id=F('versioned_object_id')
+                ) or queryset.filter(is_latest_version=True) or queryset.filter(retired=False) or queryset
+        ).first()
+
+    def _get_map_type_distribution(self, filters, concept_field):
+        _result = {'total': 0, 'retired': 0, 'active': 0, 'concepts': 0}
+        result = {**_result, 'map_types': []}
+
+        queryset = self.get_mappings_queryset().filter(**filters)
+        queryset = queryset.values(
+            'map_type').annotate(
+            total=Count('id')).annotate(
+            retired=Count('id', filter=models.Q(retired=True))).annotate(
+            concepts=Count(concept_field, distinct=True))
+        for info in queryset.values('map_type', 'total', 'retired', 'concepts').order_by('-total'):
+            active = info['total'] - info['retired']
+            result['total'] += info['total']
+            result['retired'] += info['retired']
+            result['active'] += active
+            result['concepts'] += info['concepts']
+            result['map_types'].append({
+                'map_type': info['map_type'],
+                'concepts': info['concepts'],
+                'total': info['total'],
+                'retired': info['retired'],
+                'active': active
+            })
+        return result
+
+    def get_from_source_map_type_distribution(self, from_source):
+        return self._get_map_type_distribution({'from_source_id': from_source.id}, 'to_concept__versioned_object_id')
+
+    def get_to_source_map_type_distribution(self, to_source):
+        return self._get_map_type_distribution({'to_source_id': to_source.id}, 'from_concept__versioned_object_id')
+
+    @property
+    def from_sources(self):
+        return Source.objects.filter(id__in=self.referenced_from_sources().values_list('id', flat=True))
+
+    @property
+    def to_sources(self):
+        return Source.objects.filter(id__in=self.referenced_to_sources().values_list('id', flat=True))
+
+    def get_to_sources_map_type_distribution(self, source_names=None):
+        sources = self.to_sources
+        if source_names:
+            sources = sources.filter(mnemonic__in=source_names)
+        return self._get_sources_map_type_distribution(sources, 'toConceptSource')
+
+    def get_from_sources_map_type_distribution(self, source_names=None):
+        sources = self.from_sources
+        if source_names:
+            sources = sources.filter(mnemonic__in=source_names)
+        return self._get_sources_map_type_distribution(sources, 'fromConceptSource')
+
+    @staticmethod
+    def __to_distribution(map_types, is_retired, result, total, active, retired):  # pylint: disable=too-many-arguments
+        for map_type in map_types:
+            if map_type[0] not in result:
+                result[map_type[0]] = {
+                    'total': 0,
+                    'active': 0,
+                    'retired': 0,
+                    'map_type': map_type[0]
+                }
+            result[map_type[0]]['total'] += map_type[1]
+            if is_retired:
+                result[map_type[0]]['retired'] += map_type[1]
+                retired += map_type[1]
+            else:
+                result[map_type[0]]['active'] += map_type[1]
+                active += map_type[1]
+            total += map_type[1]
+
+        return result, total, active, retired
+
+    def _get_sources_map_type_distribution(self, sources, facet_source_key):
+        from core.sources.serializers import SourceVersionMinimalSerializer
+        distribution = []
+        for source in sources:
+            active_mapping_facets = self.get_mapping_facets({facet_source_key: source.mnemonic})
+            retired_mapping_facets = self.get_mapping_facets({facet_source_key: source.mnemonic, 'retired': True})
+
+            result, total, active, retired = {}, 0, 0, 0
+
+            result, total, active, retired = self.__to_distribution(
+                active_mapping_facets.mapType, False, result, total, active, retired)
+            result, total, active, retired = self.__to_distribution(
+                retired_mapping_facets.mapType, True, result, total, active, retired)
+
+            distribution.append(
+                {
+                    'distribution': {
+                        'active': active,
+                        'retired': retired,
+                        'total': total,
+                        'map_types': list(result.values())
+                    },
+                    **SourceVersionMinimalSerializer(source).data
+                }
+            )
+        return sorted(distribution, key=lambda dist: dist['distribution']['total'], reverse=True)
+
+    def referenced_from_sources(self):
+        return Source.objects.filter(id__in=self.get_mappings_queryset().values_list('from_source_id', flat=True))
+
+    def referenced_to_sources(self):
+        return Source.objects.filter(id__in=self.get_mappings_queryset().values_list('to_source_id', flat=True))
+
+    def get_concepts_queryset(self):
+        if self.is_head:
+            return self.concepts_set.filter(id=F('versioned_object_id'))
+
+        return Concept.objects.filter(
+            id__in=Concept.sources.through.objects.filter(source_id=self.id).values_list('concept_id', flat=True)
+        )
+
+    def get_mappings_queryset(self):
+        if self.is_head:
+            return self.mappings_set.filter(id=F('versioned_object_id'))
+
+        from core.mappings.models import Mapping
+        return Mapping.objects.filter(
+            id__in=Mapping.sources.through.objects.filter(source_id=self.id).values_list('mapping_id', flat=True)
+        )
+
+    @property
+    def mappings_distribution(self):
+        facets = self.get_mapping_facets()
+
+        return {
+            'active': self.active_mappings,
+            'retired': self.retired_mappings_count,
+            'map_type': self._to_clean_facets(facets.mapType or []),
+            'to_concept_source': self._to_clean_facets(facets.toConceptSource or []),
+            'from_concept_source': self._to_clean_facets(facets.fromConceptSource or []),
+            'contributors': self._to_clean_facets(facets.updatedBy or [])
+        }
+
+    def _get_resource_facet_filters(self, filters=None):
+        _filters = {
+            'source': self.mnemonic,
+            'ownerType': self.parent.resource_type,
+            'owner': self.parent.mnemonic,
+            'retired': False
+        }
+        if self.is_head:
+            _filters['is_latest_version'] = True
+        else:
+            _filters['source_version'] = self.version
+
+        return {**_filters, **(filters or {})}
+
+    def get_brief_serializer(self):
+        from core.sources.serializers import SourceVersionMinimalSerializer, SourceMinimalSerializer
+        return SourceMinimalSerializer if self.is_head else SourceVersionMinimalSerializer
+
+    def get_ordered_concept_facets_by_filter_order(self, facets):
+        sorted_facets = OrderedDict()
+        filter_order = self.concept_filter_order or []
+
+        traversed_keys = set()
+        for key in filter_order:
+            property_key = f'properties__{key}'
+            if property_key in facets:
+                sorted_facets[property_key] = facets[property_key]
+                traversed_keys.update({property_key, key, to_camel_case(key)})
+
+        properties_facets = {}
+        other_facets = {}
+        for k, v in facets.items():
+            if k in traversed_keys:
+                continue
+            if k.startswith("properties__"):
+                properties_facets[k] = v
+            else:
+                other_facets[k] = v
+
+        for k in sorted(properties_facets.keys()):
+            sorted_facets[k] = properties_facets[k]
+
+        for k in sorted(other_facets.keys()):
+            sorted_facets[k] = other_facets[k]
+
+        return sorted_facets

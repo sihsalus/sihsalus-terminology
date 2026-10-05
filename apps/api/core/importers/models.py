@@ -1,0 +1,1434 @@
+import json
+import time
+from collections import deque
+from datetime import datetime
+
+from celery import group
+from celery.utils.log import get_task_logger
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db.models import F
+from ocldev.oclfleximporter import OclFlexImporter
+from pydash import compact, get
+
+from core.celery import app
+from core.collections.models import Collection
+from core.common import ERRBIT_LOGGER
+from core.common.constants import HEAD, ALL
+from core.common.tasks import bulk_import_parts_inline, delete_organization, batch_index_resources, \
+    post_import_update_resource_counts, make_hierarchy, index_concepts_mapped_codes
+from core.common.utils import drop_version, is_url_encoded_string, encode_string, to_parent_uri, chunks
+from core.concepts.models import Concept
+from core.mappings.models import Mapping
+from core.orgs.models import Organization
+from core.sources.models import Source
+from core.tasks.models import Task
+from core.users.models import UserProfile
+
+logger = get_task_logger(__name__)
+
+
+class ImportResults:
+    def __init__(self, importer):
+        self.json = json.loads(importer.import_results.to_json())
+        self.detailed_summary = importer.import_results.get_detailed_summary()
+        self.report = importer.import_results.display_report()
+
+    def to_dict(self):
+        return {
+            'json': self.json,
+            'detailed_summary': self.detailed_summary,
+            'report': self.report
+        }
+
+
+class BaseImporter:
+    def __init__(
+            self, content, username, update_if_exists, user=None, parse_data=True, set_user=True
+    ):  # pylint: disable=too-many-arguments
+        self.task = None
+        self.input_list = []
+        self.user = None
+        self.result = None
+        self.importer = None
+        self.content = content
+        self.username = username
+        self.update_if_exists = update_if_exists
+        if parse_data:
+            self.populate_input_list()
+
+        if set_user:
+            self.set_user()
+        if user:
+            self.user = user
+
+    def populate_input_list(self):
+        if isinstance(self.content, list):
+            self.input_list = self.content
+        else:
+            for line in self.content.splitlines():
+                self.input_list.append(line if isinstance(line, dict) else json.loads(line))
+
+    def set_user(self):
+        self.user = UserProfile.objects.get(username=self.username)
+
+    def run(self):
+        raise NotImplementedError()
+
+
+class BulkImport(BaseImporter):
+    def __init__(self, content, username, update_if_exists):
+        super().__init__(content, username, update_if_exists)
+        self.initialize_importer()
+
+    def initialize_importer(self):
+        self.importer = OclFlexImporter(
+            input_list=self.input_list,
+            api_url_root=settings.API_BASE_URL,
+            api_token=self.user.get_token(),
+            do_update_if_exists=self.update_if_exists
+        )
+
+    def run(self):
+        self.importer.process()
+        self.result = ImportResults(self.importer)
+
+        return self.result.to_dict()
+
+
+CREATED = 1
+UPDATED = 2
+FAILED = 3
+DELETED = 4
+NOT_FOUND = 5
+PERMISSION_DENIED = 6
+UNCHANGED = 7
+
+
+class BaseResourceImporter:
+    mandatory_fields = set()
+    allowed_fields = []
+
+    def __init__(self, data, user, update_if_exists=False, cache=None):
+        self.user = user
+        self.data = data
+        self.update_if_exists = update_if_exists
+        self.queryset = None
+        self.index_resources = False
+        self.cache = cache if cache is not None else {}
+
+    @classmethod
+    def can_handle(cls, obj):
+        return isinstance(obj, dict) and obj.get('type', '').lower() == cls.get_resource_type().lower()
+
+    @staticmethod
+    def get_resource_type():
+        raise NotImplementedError()
+
+    def get(self, attr, default_value=None):
+        return self.data.get(attr, default_value)
+
+    def get_cached_parent_source(self):
+        cache = self.cache.setdefault('source_by_owner', {})
+        key = (self.get_owner_type_filter(), self.get('owner'), self.get('source'))
+        if key not in cache:
+            cache[key] = Source.objects.filter(
+                **{self.get_owner_type_filter(): self.get('owner')}, mnemonic=self.get('source'), version=HEAD
+            ).first()
+        return cache[key]
+
+    def parse(self):
+        self.data = self.get_filter_allowed_fields()
+        self.data['created_by'] = self.data['updated_by'] = self.user
+
+    def get_filter_allowed_fields(self):
+        return {k: v for k, v in self.data.items() if k in self.allowed_fields}
+
+    def is_valid(self):
+        return self.mandatory_fields.issubset(self.data.keys())
+
+    def get_owner_type(self):
+        return (self.get('owner_type', '') or '').lower()
+
+    def is_user_owner(self):
+        return self.get_owner_type() == 'user'
+
+    def is_org_owner(self):
+        return self.get_owner_type() == 'organization'
+
+    def get_owner_type_filter(self):
+        if self.is_user_owner():
+            return 'user__username'
+
+        return 'organization__mnemonic'
+
+    def get_owner(self):
+        owner = self.get('owner')
+
+        if self.is_org_owner():
+            return Organization.objects.filter(mnemonic=owner).first()
+
+        return UserProfile.objects.filter(username=owner).first()
+
+    def exists(self):
+        return False
+
+    def clean(self):
+        if not self.is_valid():
+            return False
+        if self.exists():
+            return None
+
+        self.parse()
+        return True
+
+    def run(self):
+        is_clean = self.clean()
+        if not is_clean:
+            return is_clean
+
+        return self.process()
+
+    def process(self):
+        raise NotImplementedError()
+
+    def retire_resource(self, resource):
+        """
+        Retires a concept or mapping and keeps the version the retire saved as the instance, marked with the one it
+        superseded, as process() keeps what it saves. The retire clones the latest version, so both are left deferred
+        (_index=False) when the latest version was.
+        """
+        prev_latest = resource.get_latest_version()
+        resource.retire(
+            self.user, self.data.get('update_comment') or self.data.get('comment'), self.data.get('retire_reason'))
+        self.instance = resource.get_latest_version()
+        if self.instance:
+            self.instance.prev_latest_version_id = get(prev_latest, 'id')
+
+
+class OrganizationImporter(BaseResourceImporter):
+    mandatory_fields = {'id', 'name'}
+    allowed_fields = ["id", "company", "extras", "location", "name", "public_access", "website"]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Organization'
+
+    def exists(self):
+        return self.get_queryset().exists()
+
+    def get_queryset(self):
+        return Organization.objects.filter(mnemonic=self.get('id'))
+
+    def parse(self):
+        super().parse()
+        self.data['mnemonic'] = self.data.pop('id')
+
+    def process(self):
+        if not self.exists():
+            org = Organization.objects.create(**self.data)
+            org.members.add(org.created_by)
+            if org:
+                return CREATED
+            return FAILED
+        return None
+
+    def delete(self):
+        if self.exists():
+            org = self.get_queryset().first()
+            if self.user and (self.user.is_staff or org.is_member(self.user)):
+                org.updated_by = self.user
+                org.save(update_fields=['updated_by'])
+                delete_organization(org.id)
+                return DELETED
+            return PERMISSION_DENIED
+        return NOT_FOUND
+
+
+class SourceImporter(BaseResourceImporter):
+    mandatory_fields = {'id', 'name', 'owner_type', 'owner'}
+    allowed_fields = [
+        "id", "short_code", "name", "full_name", "description", "source_type", "custom_validation_schema",
+        "public_access", "default_locale", "supported_locales", "website", "extras", "external_id",
+        'canonical_url', 'identifier', 'contact', 'jurisdiction', 'publisher', 'purpose', 'copyright',
+        'revision_date', 'text', 'content_type', 'experimental', 'case_sensitive', 'collection_reference',
+        'hierarchy_meaning', 'compositional', 'version_needed', 'meta', 'properties', 'filters'
+    ]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Source'
+
+    def exists(self):
+        return self.get_queryset().exists()
+
+    def get_queryset(self):
+        return Source.objects.filter(
+            **{self.get_owner_type_filter(): self.get('owner'), 'mnemonic': self.get('id')}
+        )
+
+    def parse(self):
+        owner_type = self.get('owner_type').lower()
+        owner = self.get_owner()
+
+        super().parse()
+
+        self.data['mnemonic'] = self.data.pop('id')
+        self.data[owner_type] = owner
+        self.data['version'] = HEAD
+
+        supported_locales = self.get('supported_locales')
+        if isinstance(supported_locales, str):
+            self.data['supported_locales'] = supported_locales.split(',')
+
+        self.data.pop('short_code', None)
+
+    def process(self):
+        source = Source(**self.data)
+        if source.has_parent_edit_access(self.user):
+            errors = Source.persist_new(source, self.user)
+            return errors or CREATED
+        return PERMISSION_DENIED
+
+    def delete(self):
+        if self.exists():
+            source = self.get_queryset().first()
+            try:
+                if source.has_parent_edit_access(self.user):
+                    source.delete()
+                    return DELETED
+                return PERMISSION_DENIED
+            except Exception as ex:
+                return {'errors': ex.args}
+
+        return NOT_FOUND
+
+
+class SourceVersionImporter(BaseResourceImporter):
+    mandatory_fields = {"id"}
+    allowed_fields = ["id", "external_id", "description", "released"]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Source Version'
+
+    def exists(self):
+        return Source.objects.filter(
+            **{self.get_owner_type_filter(): self.get('owner'),
+               'mnemonic': self.get('source'), 'version': self.get('id')}
+        ).exists()
+
+    def parse(self):
+        owner_type = self.get('owner_type').lower()
+        owner = self.get_owner()
+        source = self.get('source')
+
+        super().parse()
+
+        self.data['version'] = self.data.pop('id')
+        self.data['mnemonic'] = source
+        self.data[owner_type] = owner
+
+    def process(self):
+        source = Source(**self.data)
+        if source.has_parent_edit_access(self.user):
+            errors = Source.persist_new_version(source, self.user)
+            return errors or CREATED
+        return PERMISSION_DENIED
+
+
+class CollectionImporter(BaseResourceImporter):
+    mandatory_fields = {'id', 'name', 'owner_type', 'owner'}
+    allowed_fields = [
+        "id", "short_code", "name", "full_name", "description", "collection_type", "custom_validation_schema",
+        "public_access", "default_locale", "supported_locales", "website", "extras", "external_id",
+        'canonical_url', 'identifier', 'contact', 'jurisdiction', 'publisher', 'purpose', 'copyright',
+        'revision_date', 'text', 'immutable', 'experimental', 'locked_date', 'meta',
+    ]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Collection'
+
+    def exists(self):
+        return self.get_queryset().exists()
+
+    def get_queryset(self):
+        return Collection.objects.filter(
+            **{self.get_owner_type_filter(): self.get('owner'), 'mnemonic': self.get('id')}
+        )
+
+    def parse(self):
+        owner_type = self.get('owner_type').lower()
+        owner = self.get_owner()
+
+        super().parse()
+
+        self.data['mnemonic'] = self.data.pop('id')
+        self.data[owner_type] = owner
+        self.data['version'] = HEAD
+
+        supported_locales = self.get('supported_locales')
+        if isinstance(supported_locales, str):
+            self.data['supported_locales'] = supported_locales.split(',')
+
+        self.data.pop('short_code', None)
+
+    def process(self):
+        coll = Collection(**self.data)
+        if coll.has_parent_edit_access(self.user):
+            errors = Collection.persist_new(coll, self.user)
+            return errors or CREATED
+        return PERMISSION_DENIED
+
+    def delete(self):
+        if self.exists():
+            collection = self.get_queryset().first()
+            try:
+                if collection.has_parent_edit_access(self.user):
+                    collection.delete()
+                    return DELETED
+                return PERMISSION_DENIED
+            except Exception as ex:
+                return {'errors': ex.args}
+
+        return NOT_FOUND
+
+
+class CollectionVersionImporter(BaseResourceImporter):
+    mandatory_fields = {"id"}
+    allowed_fields = ["id", "external_id", "description", "released"]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Collection Version'
+
+    def exists(self):
+        return Collection.objects.filter(
+            **{self.get_owner_type_filter(): self.get('owner'),
+               'mnemonic': self.get('collection'), 'version': self.get('id')}
+        ).exists()
+
+    def parse(self):
+        owner_type = self.get('owner_type').lower()
+        owner = self.get_owner()
+        collection = self.get('collection')
+
+        super().parse()
+
+        self.data['version'] = self.data.pop('id')
+        self.data['mnemonic'] = collection
+        self.data[owner_type] = owner
+
+    def process(self):
+        coll = Collection(**self.data)
+        if coll.has_parent_edit_access(self.user):
+            errors = Collection.persist_new_version(obj=coll, user=self.user, sync=True)
+            return errors or CREATED
+        return PERMISSION_DENIED
+
+
+class ConceptImporter(BaseResourceImporter):
+    mandatory_fields = {"concept_class"}
+    allowed_fields = [
+        "id", "external_id", "concept_class", "datatype", "names", "descriptions", "retired", "extras",
+        "parent_concept_urls", 'update_comment', 'comment', 'retire_reason', 'mappings'
+    ]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Concept'
+
+    def __init__(self, data, user, update_if_exists, skip_hierarchy_tasks=False, cache=None):  # pylint: disable=too-many-arguments
+        super().__init__(data, user, update_if_exists, cache=cache)
+        self.skip_hierarchy_tasks = skip_hierarchy_tasks
+        self.version = False
+        self.instance = None
+
+    def exists(self):
+        return self.get_queryset().exists()
+
+    def get_queryset(self):
+        if self.queryset:
+            return self.queryset
+
+        parent_uri = f'/{"users" if self.is_user_owner() else "orgs"}/{self.get("owner")}/sources/{self.get("source")}/'
+        mnemonic = self.get('id')
+        if mnemonic and not is_url_encoded_string(mnemonic):
+            mnemonic = encode_string(mnemonic, safe='')
+        self.queryset = Concept.objects.filter(
+            parent__uri=parent_uri, mnemonic=mnemonic, id=F('versioned_object_id')
+        )
+        return self.queryset
+
+    def parse(self):
+        source = self.get_cached_parent_source()
+        super().parse()
+        self.data['mappings_payload'] = self.data.pop('mappings', [])
+        self.data['parent'] = source
+        self.data['mnemonic'] = str(self.data.pop('id', ''))
+        if not is_url_encoded_string(self.data['mnemonic']):
+            self.data['mnemonic'] = encode_string(self.data['mnemonic'], safe='')
+        for locale in [*(self.data.get('names', []) or []), *(self.data.get('descriptions', []) or [])]:
+            locale.pop('checksum', None)
+
+    def clean(self):
+        if not self.is_valid():
+            return False
+        if self.exists() and self.update_if_exists:
+            self.version = True
+
+        self.parse()
+        return True
+
+    def process(self):
+        parent = self.data.get('parent')
+        errors = {}
+        if not parent:
+            errors['source'] = 'Not Found'
+            return errors
+        if parent.has_edit_access(self.user):
+            if self.version:
+                self.instance = self.get_queryset().first().clone()
+                self.instance._counted = None  # pylint: disable=protected-access
+                self.instance._index = False  # pylint: disable=protected-access
+                errors = Concept.create_new_version_for(
+                    instance=self.instance, data=self.data, user=self.user, create_parent_version=False,
+                    add_prev_version_children=False
+                )
+                if errors and Concept.is_standard_checksum_error(errors):
+                    return UNCHANGED
+                return errors or UPDATED
+
+            if 'update_comment' in self.data:
+                self.data['comment'] = self.data['update_comment']
+                self.data.pop('update_comment')
+            persist_data = {**self.data, '_counted': None, '_index': False}
+            if self.skip_hierarchy_tasks:
+                persist_data['_skip_hierarchy_tasks'] = True
+            self.instance = Concept.persist_new(
+                data=persist_data,
+                user=self.user, create_parent_version=False)
+            if self.instance.id:
+                return CREATED
+            return self.instance.errors or errors or FAILED
+
+        return PERMISSION_DENIED
+
+    def delete(self):
+        is_clean = self.clean()
+        if not is_clean:
+            return is_clean
+        if self.exists():
+            parent = self.data.get('parent')
+            try:
+                if parent.has_edit_access(self.user):
+                    self.retire_resource(self.get_queryset().first())
+                    return DELETED
+                return PERMISSION_DENIED
+            except Exception as ex:
+                return {'errors': ex.args}
+
+        return NOT_FOUND
+
+
+class MappingImporter(BaseResourceImporter):
+    mandatory_fields = {"map_type", "from_concept_url"}
+    allowed_fields = [
+        "id", "map_type", "from_concept_url", "to_source_url", "to_concept_url", "to_concept_code",
+        "to_concept_name", "extras", "external_id", "retired", 'update_comment', 'comment', 'sort_weight',
+        'retire_reason'
+    ]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Mapping'
+
+    def __init__(self, data, user, update_if_exists, cache=None):
+        super().__init__(data, user, update_if_exists, cache=cache)
+        self.version = False
+        self.instance = None
+
+    def exists(self):
+        return self.get_queryset().exists()
+
+    def get_cached_versioned_concept_id_by_uri(self, uri):
+        # Only versioned_object_id is ever read from the resolved concept here, so cache just that
+        # (and fetch just that) instead of retaining full Concept instances for the chunk's lifetime.
+        cache = self.cache.setdefault('concept_versioned_id_by_uri', {})
+        if uri not in cache:
+            cache[uri] = Concept.objects.filter(id=F('versioned_object_id'), uri=uri).values_list(
+                'versioned_object_id', flat=True).first()
+        return cache[uri]
+
+    def get_cached_source_exists_by_uri(self, uri):
+        cache = self.cache.setdefault('source_exists_by_uri', {})
+        if uri not in cache:
+            cache[uri] = Source.objects.filter(uri=uri).exists()
+        return cache[uri]
+
+    def get_queryset(self):  # pylint: disable=too-many-branches
+        if self.queryset:
+            return self.queryset
+
+        from_concept_url = self.get('from_concept_url')
+        to_concept_url = self.get('to_concept_url')
+        to_concept_code = self.get('to_concept_code')
+        from_concept_code = self.get('from_concept_code')
+        to_source_url = self.get('to_source_url')
+        parent_uri = f'/{"users" if self.is_user_owner() else "orgs"}/{self.get("owner")}/sources/{self.get("source")}/'
+        filters = {
+            'parent__uri': parent_uri,
+            'id': F('versioned_object_id'),
+            'map_type': self.get('map_type'),
+        }
+        if from_concept_code:
+            filters['from_concept_code'] = [
+                *Concept.get_encoded_str_variations(from_concept_code), from_concept_code.replace(' ', '+')
+            ]
+
+        versionless_from_concept_url = drop_version(from_concept_url)
+        from_concept_id = self.get_cached_versioned_concept_id_by_uri(versionless_from_concept_url)
+        if from_concept_id is not None:
+            filters['from_concept__versioned_object_id'] = from_concept_id
+        elif not from_concept_code:
+            filters['from_concept_code'] = compact(versionless_from_concept_url.split('/'))[-1]
+        if to_concept_url:
+            versionless_to_concept_url = drop_version(to_concept_url)
+            to_concept_id = self.get_cached_versioned_concept_id_by_uri(versionless_to_concept_url)
+            if to_concept_id is not None:
+                filters['to_concept__versioned_object_id'] = to_concept_id
+            else:
+                filters['to_concept_code'] = compact(versionless_to_concept_url.split('/'))[-1]
+                if not to_source_url:
+                    to_source_uri = to_parent_uri(versionless_to_concept_url)
+                    if self.get_cached_source_exists_by_uri(drop_version(to_source_uri)):
+                        filters['to_source__uri'] = to_source_uri
+
+        if self.get('id'):
+            filters['mnemonic'] = self.get('id')
+
+        if to_source_url:
+            to_source_uri = drop_version(to_source_url)
+            filters['to_source_url'] = to_source_uri
+
+        if to_concept_code:
+            filters['to_concept_code__in'] = [
+                *Concept.get_encoded_str_variations(to_concept_code), to_concept_code.replace(' ', '+')]
+
+        self.queryset = Mapping.objects.filter(**filters)
+
+        return self.queryset
+
+    def parse(self):
+        source = self.get_cached_parent_source()
+        self.data = self.get_filter_allowed_fields()
+        self.data['parent'] = source
+
+        if self.get('id'):
+            self.data['mnemonic'] = self.data.pop('id')
+
+        from_concept_code = self.data.get('from_concept_code')
+        to_concept_code = self.data.get('to_concept_code')
+        if from_concept_code and not is_url_encoded_string(from_concept_code):
+            self.data['from_concept_code'] = encode_string(from_concept_code, safe='')
+        if to_concept_code and not is_url_encoded_string(to_concept_code):
+            self.data['to_concept_code'] = encode_string(to_concept_code, safe='')
+
+    def clean(self):
+        if not self.is_valid():
+            return False
+        if self.exists() and self.update_if_exists:
+            self.version = True
+
+        self.parse()
+        return True
+
+    def process(self):
+        parent = self.data.get('parent')
+        errors = {}
+        if not parent:
+            errors['source'] = 'Not Found'
+            return errors
+        if parent.has_edit_access(self.user):
+            if self.version:
+                queryset = self.get_queryset()
+                if queryset.count() > 1:
+                    if queryset.filter(retired=False).exists():
+                        queryset = queryset.filter(retired=False)
+                    else:
+                        queryset = queryset.order_by('-id')
+                self.instance = queryset.first().clone()
+                self.instance._counted = None  # pylint: disable=protected-access
+                self.instance._index = False  # pylint: disable=protected-access
+                errors = Mapping.create_new_version_for(self.instance, self.data, self.user, cache=self.cache)
+                if errors and Mapping.is_standard_checksum_error(errors):
+                    return UNCHANGED
+                return errors or UPDATED
+            if 'update_comment' in self.data:
+                self.data['comment'] = self.data['update_comment']
+                self.data.pop('update_comment')
+            self.instance = Mapping.persist_new(
+                {**self.data, '_counted': None, '_index': False}, self.user, cache=self.cache)
+            if self.instance.id:
+                return CREATED
+            return self.instance.errors or errors or FAILED
+
+        return PERMISSION_DENIED
+
+    def delete(self):
+        is_clean = self.clean()
+        if not is_clean:
+            return is_clean
+        if self.exists():
+            parent = self.data.get('parent')
+            try:
+                if parent.has_edit_access(self.user):
+                    self.retire_resource(self.get_queryset().first())
+                    return DELETED
+                return PERMISSION_DENIED
+            except Exception as ex:
+                return {'errors': ex.args}
+
+        return NOT_FOUND
+
+
+class ReferenceImporter(BaseResourceImporter):
+    mandatory_fields = {"data"}
+    allowed_fields = ["data", "collection", "owner", "owner_type", "__cascade", "collection_url", "__transform"]
+
+    @staticmethod
+    def get_resource_type():
+        return 'Reference'
+
+    def exists(self):
+        return False
+
+    def get_queryset(self):
+        if self.queryset:
+            return self.queryset
+
+        if self.get('collection', None):
+            self.queryset = Collection.objects.filter(
+                **{self.get_owner_type_filter(): self.get('owner')}, mnemonic=self.get('collection'), version=HEAD
+            )
+        elif self.get('collection_url', None):
+            self.queryset = Collection.objects.filter(uri=self.get('collection_url'))
+
+        return self.queryset
+
+    def process(self):
+        queryset = self.get_queryset()
+        collection = queryset.first() if queryset is not None else None
+
+        if collection:
+            if collection.has_edit_access(self.user):
+                added_references, errors = collection.add_expressions(
+                    self.get('data'), self.user, self.get('__cascade', False),
+                    self.get('__transform', False)
+                )
+                # Stays off: the expansion already indexes the members these references add (Expansion.add_references)
+                if self.index_resources and not get(settings, 'TEST_MODE', False):  # pragma: no cover
+                    concept_ids = []
+                    mapping_ids = []
+                    for ref in added_references:
+                        concept_ids += list(ref.concepts.values_list('id', flat=True))
+                        mapping_ids += list(ref.mappings.values_list('id', flat=True))
+
+                    if concept_ids:
+                        batch_index_resources.apply_async(
+                            ('concept', {'id__in': concept_ids}), queue='indexing', permanent=False)
+                    if mapping_ids:
+                        batch_index_resources.apply_async(
+                            ('mapping', {'id__in': mapping_ids}), queue='indexing', permanent=False)
+                if errors:
+                    return {
+                        'errors': errors,
+                        'added_references_expressions': [ref.expression for ref in
+                                                         added_references] if added_references else []
+                    }
+                return CREATED
+            return PERMISSION_DENIED
+        return NOT_FOUND
+
+    def delete(self):  # pylint: disable=too-many-locals,too-many-branches
+        collection = self.get_queryset().first()
+        if collection:  # pylint: disable=too-many-nested-blocks
+            if collection.has_edit_access(self.user):
+                expressions = self.get('references', None) or self.get(
+                    'data', {}).get('expressions', [])
+                if expressions == [ALL]:
+                    expressions = ALL
+
+                if expressions == ALL:
+                    if not collection.references.exists():
+                        return NOT_FOUND
+                    collection.delete_references(ALL)
+                    return DELETED
+
+                cascade = self.get('__cascade', False)
+                transform = self.get('transform', False)
+                to_delete = []
+                if isinstance(expressions, list):
+                    for expression in expressions:
+                        references = collection.references.filter(expression=expression)
+                        if cascade:
+                            references = references.filter(cascade=cascade)
+                        if transform:
+                            references = references.filter(transform=transform)
+                        to_delete += references
+
+                if to_delete:
+                    references = collection.references.filter(id__in=[ref.id for ref in to_delete])
+                    if collection.expansion_uri:
+                        collection.expansion.delete_references(references)
+                    references.delete()
+                    return DELETED
+                return NOT_FOUND
+            return PERMISSION_DENIED
+        return NOT_FOUND
+
+
+def should_index_import(index, lines):
+    """`index` as the request gave it; otherwise whether an import of this many lines is small enough to index."""
+    return lines <= settings.IMPORT_INDEX_MAX_LINES if index is None else index
+
+
+class ImportIndexer:
+    """
+    Ends the indexing deferral for the concepts and mappings an import saved with _index=False: the versions it
+    created or retired, their versioned objects and the versions they superseded. finish() resets their _index,
+    whether or not they get indexed, so later saves index them again. Unless the import doesn't index, it then queues
+    their batch indexing, without forcing a refresh per batch, and an update of the mapped codes in the documents of
+    the concepts the imported mappings come from.
+    """
+    CHUNK_SIZE = 5000
+
+    def __init__(self, index=True):
+        self.index = index
+        self.ids = {'concept': set(), 'mapping': set()}
+        self.mapped_concept_ids = set()
+
+    def add(self, instance):
+        resource = {Concept: 'concept', Mapping: 'mapping'}.get(type(instance))
+        if not resource or not instance.id or instance.should_index:
+            return  # nothing saved, or saved with _index=True, which indexes it
+        self.ids[resource].update(compact([
+            instance.versioned_object_id,
+            get(instance, 'prev_latest_version_id'),
+            get(instance, 'latest_version_id'),
+            instance.id,
+        ]))
+        if resource == 'mapping' and instance.from_concept_id and instance.from_source_id == instance.parent_id:
+            self.mapped_concept_ids.add(instance.from_concept_id)
+
+    def finish(self):
+        # every row first, so that a failure to queue can't leave any deferred
+        for resource, model in (('concept', Concept), ('mapping', Mapping)):
+            for chunk in chunks(sorted(self.ids[resource]), self.CHUNK_SIZE):
+                model.objects.filter(id__in=chunk, _index=False).update(_index=True)
+        if self.index:
+            for resource in ('concept', 'mapping'):
+                for chunk in chunks(sorted(self.ids[resource]), self.CHUNK_SIZE):
+                    batch_index_resources.apply_async(
+                        (resource, {'id__in': chunk}, True, False), queue='indexing', permanent=False)
+            for chunk in chunks(sorted(self.get_mapped_concept_ids() - self.ids['concept']), self.CHUNK_SIZE):
+                index_concepts_mapped_codes.apply_async((chunk,), queue='indexing', permanent=False)
+
+    def get_mapped_concept_ids(self):
+        """
+        The concepts the imported mappings come from, with their versioned objects and latest versions. Older versions
+        are left as they were indexed, as their releases were.
+        """
+        ids = set()
+        for chunk in chunks(sorted(self.mapped_concept_ids), self.CHUNK_SIZE):
+            # plain id lists, since an OR of subqueries can't use an index and reads the whole concepts table
+            rows = list(Concept.objects.filter(id__in=chunk).values_list('id', 'versioned_object_id'))
+            versioned_ids = {versioned_id for _, versioned_id in rows if versioned_id}
+            ids.update(concept_id for concept_id, _ in rows)
+            ids.update(versioned_ids)
+            ids.update(Concept.objects.filter(
+                versioned_object_id__in=versioned_ids, is_latest_version=True).values_list('id', flat=True))
+        return ids
+
+
+class BulkImportInline(BaseImporter):
+    PROGRESS_NOTIFY_INTERVAL_SECONDS = 2
+
+    def __init__(  # pylint: disable=too-many-arguments
+            self, content, username, update_if_exists=False, input_list=None, user=None, set_user=True,
+            self_task_id=None, skip_hierarchy_tasks=False, index=None
+    ):
+        super().__init__(content, username, update_if_exists, user, not bool(input_list), set_user)
+        self.self_task_id = self_task_id
+        self.skip_hierarchy_tasks = skip_hierarchy_tasks
+        # Lookup cache shared across this run's items (see ConceptImporter/MappingImporter).
+        # It caches misses too (None/False), so it's only safe because a chunk is single-resource-type
+        # in the production parallel path (BulkImportParallelRunner.make_parts splits concepts and
+        # mappings into separate chunks) -- a mapping chunk never creates the concepts it resolves, and
+        # a concept chunk's parent source already exists. If a future change interleaves resource types
+        # within one BulkImportInline run (e.g. the deprecated BulkImportInlineView), a mapping could
+        # cache a "not found" for a concept created earlier in the same run. Don't share this cache
+        # across resource types unless that invariant is re-verified.
+        self.cache = {}
+        self.set_task()
+        if input_list:
+            self.input_list = input_list
+        self.unknown = []
+        self.invalid = []
+        self.exists = []
+        self.created = []
+        self.updated = []
+        self.deleted = []
+        self.not_found = []
+        self.failed = []
+        self.exception = []
+        self.permission_denied = []
+        self.unchanged = []
+        self.others = []
+        self.processed = 0
+        self.total = len(self.input_list)
+        self.start_time = time.time()
+        self.last_progress_notified_at = 0
+        self.elapsed_seconds = 0
+        self.index = should_index_import(index, self.total)
+
+    def set_task(self):
+        self.task = Task.objects.filter(id=self.self_task_id).first()
+
+    def handle_item_import_result(self, result, item):  # pylint: disable=too-many-return-statements
+        if result is None:
+            self.exists.append(item)
+            return
+        if result is False:
+            self.invalid.append(item)
+            return
+        if result == FAILED:
+            self.failed.append(item)
+            return
+        if result == DELETED:
+            self.deleted.append(item)
+            return
+        if result == NOT_FOUND:
+            self.not_found.append(item)
+            return
+        if isinstance(result, dict):
+            item['errors'] = result
+            self.failed.append(item)
+            return
+        if result == CREATED:
+            self.created.append(item)
+            return
+        if result == UPDATED:
+            self.updated.append(item)
+            return
+        if result == PERMISSION_DENIED:
+            self.permission_denied.append(item)
+            return
+        if result == UNCHANGED:
+            self.unchanged.append(item)
+            return
+
+        print("****Unexpected Result****", result)
+        self.others.append(item)
+
+    def notify_progress(self, force=False):
+        if not self.task:
+            return
+        now = time.time()
+        if not force and (now - self.last_progress_notified_at) < self.PROGRESS_NOTIFY_INTERVAL_SECONDS:
+            return
+        self.last_progress_notified_at = now
+        self.task.summary = {  # pragma: no cover
+            'total': self.total,
+            'processed': self.processed,
+            'created': len(self.created),
+            'updated': len(self.updated),
+            'invalid': len(self.invalid),
+            'failed': len(self.failed),
+            'deleted': len(self.deleted),
+            'not_found': len(self.not_found),
+            'permission_denied': len(self.permission_denied),
+            'unchanged': len(self.unchanged),
+        }
+        self.task.save()
+
+    def run(self):  # pylint: disable=too-many-branches,too-many-statements,too-many-locals
+        if self.self_task_id:  # pragma: no cover
+            print("****STARTED SUBPROCESS****")
+            print(f"TASK ID: {self.self_task_id}")
+            print("***************")
+        indexer = ImportIndexer(self.index)
+        try:
+            for original_item in self.input_list:
+                self.processed += 1
+                logger.info('Processing %s of %s', str(self.processed), str(self.total))
+                self.notify_progress()
+                item = original_item.copy()
+                item_type = item.pop('type', '').lower()
+                action = item.pop('__action', '').lower()
+                if not item_type:
+                    self.unknown.append(original_item)
+                if item_type == 'organization':
+                    org_importer = OrganizationImporter(item, self.user, self.update_if_exists)
+                    self.handle_item_import_result(
+                        org_importer.delete() if action == 'delete' else org_importer.run(), original_item
+                    )
+                    continue
+                if item_type == 'source':
+                    source_importer = SourceImporter(item, self.user, self.update_if_exists)
+                    self.handle_item_import_result(
+                        source_importer.delete() if action == 'delete' else source_importer.run(), original_item
+                    )
+                    continue
+                if item_type == 'source version':
+                    self.handle_item_import_result(
+                        SourceVersionImporter(item, self.user, self.update_if_exists).run(), original_item
+                    )
+                    continue
+                if item_type == 'collection':
+                    collection_importer = CollectionImporter(item, self.user, self.update_if_exists)
+                    self.handle_item_import_result(
+                        collection_importer.delete() if action == 'delete' else collection_importer.run(), original_item
+                    )
+                    continue
+                if item_type == 'collection version':
+                    self.handle_item_import_result(
+                        CollectionVersionImporter(item, self.user, self.update_if_exists).run(), original_item
+                    )
+                    continue
+                if item_type == 'concept':
+                    try:
+                        concept_importer = ConceptImporter(
+                            item, self.user, self.update_if_exists,
+                            skip_hierarchy_tasks=self.skip_hierarchy_tasks and bool(item.get('id')),
+                            cache=self.cache
+                        )
+                        _result = concept_importer.delete() if action == 'delete' else concept_importer.run()
+                        indexer.add(concept_importer.instance)
+                    except Exception as ex:
+                        ERRBIT_LOGGER.log(ex)
+                        _result = {'__all__': str(ex)}
+                    self.handle_item_import_result(_result, original_item)
+                    continue
+                if item_type == 'mapping':
+                    try:
+                        mapping_importer = MappingImporter(item, self.user, self.update_if_exists, cache=self.cache)
+                        _result = mapping_importer.delete() if action == 'delete' else mapping_importer.run()
+                        indexer.add(mapping_importer.instance)
+                    except Exception as ex:
+                        ERRBIT_LOGGER.log(ex)
+                        _result = {'__all__': str(ex)}
+                    self.handle_item_import_result(_result, original_item)
+                    continue
+                if item_type == 'reference':
+                    reference_importer = ReferenceImporter(item, self.user, self.update_if_exists)
+                    self.handle_item_import_result(
+                        reference_importer.delete() if action == 'delete' else reference_importer.run(), original_item
+                    )
+                    continue
+
+            self.notify_progress(force=True)
+        finally:
+            indexer.finish()
+        self.elapsed_seconds = round(time.time() - self.start_time, 4)
+
+        self.make_result()
+
+        return self.result
+
+    @property
+    def detailed_summary(self):
+        return f"Processed: {self.processed}/{self.total} | Created: {len(self.created)} | " \
+            f"Updated: {len(self.updated)} | DELETED: {len(self.deleted)} | Existing: {len(self.exists)} | " \
+            f"Permission Denied: {len(self.permission_denied)} | Failed: {len(self.failed)} | " \
+            f"Unchanged (standard checksum): {len(self.unchanged)} | " \
+            f"Time: {self.elapsed_seconds}secs"
+
+    @property
+    def json_result(self):
+        return {
+            'total': self.total,
+            'processed': self.processed,
+            'created': self.created,
+            'updated': self.updated,
+            'invalid': self.invalid,
+            'exists': self.exists,
+            'failed': self.failed,
+            'deleted': self.deleted,
+            'not_found': self.not_found,
+            'exception': self.exception,
+            'permission_denied': self.permission_denied,
+            'unchanged': self.unchanged,
+            'others': self.others,
+            'unknown': self.unknown,
+            'elapsed_seconds': self.elapsed_seconds
+        }
+
+    @property
+    def report(self):
+        return {
+            k: len(v) if isinstance(v, list) else v for k, v in self.json_result.items()
+        }
+
+    def make_result(self):
+        self.result = {
+            'json': self.json_result,
+            'detailed_summary': self.detailed_summary,
+            'report': self.report
+        }
+
+
+class BulkImportParallelRunner(BaseImporter):  # pragma: no cover
+    def __init__(
+            self, content, username, update_if_exists, parallel=None, self_task_id=None, index=None
+    ):  # pylint: disable=too-many-arguments
+        super().__init__(content, username, update_if_exists, None, False)
+        self.start_time = time.time()
+        self.self_task_id = self_task_id
+        self.set_task()
+        self.username = username
+        self.total = 0
+        self.resource_distribution = {}
+        self.parallel = int(parallel) if parallel else 5
+        self.tasks = []
+        self.groups = []
+        self.results = []
+        self.elapsed_seconds = 0
+        self.resource_wise_time = {}
+        self.parts = deque([])
+        self.result = None
+        self._json_result = None
+        self.concept_hierarchy_map = {}  # child_uri -> [parent_uris], built before input_list is cleared
+        self.hierarchy_reconciliation_done = False
+        if self.content:
+            self.populate_input_list()
+            self.total = len(self.input_list)
+        self.index = should_index_import(index, self.total)
+        self.make_resource_distribution()
+        self.make_parts()
+        self.collect_concept_hierarchy_map()
+        self.content = None  # memory optimization
+        self.input_list = []  # memory optimization
+
+    def set_task(self):
+        self.task = Task.objects.filter(id=self.self_task_id).first()
+
+    def make_resource_distribution(self):
+        for line in self.input_list:
+            data_type = line.get('type', None)
+            if not data_type or data_type.lower() not in ['organization', 'source', 'collection']:
+                continue
+            if data_type not in self.resource_distribution:
+                self.resource_distribution[data_type] = []
+            self.resource_distribution[data_type].append(line)
+
+    def make_parts(self):
+        prev_line = None
+        orgs = self.resource_distribution.pop('Organization', None)
+        sources = self.resource_distribution.pop('Source', None)
+        collections = self.resource_distribution.pop('Collection', None)
+        if orgs:
+            self.parts = deque([orgs])
+        if sources:
+            self.parts.append(sources)
+        if collections:
+            self.parts.append(collections)
+
+        self.parts.append([])
+
+        for line in self.input_list:
+            data_type = line.get('type', '').lower()
+            if not data_type:
+                raise ValidationError('"type" should be present in each line')
+            if data_type not in ['organization', 'source', 'collection']:
+                if prev_line:
+                    prev_type = prev_line.get('type').lower()
+                    children_data_types = ['concept', 'mapping', 'reference']
+                    if prev_type == data_type or (
+                            data_type not in children_data_types and prev_type not in children_data_types
+                    ):
+                        self.parts[-1].append(line)
+                    else:
+                        self.parts.append([line])
+                else:
+                    self.parts[-1].append(line)
+                prev_line = line
+
+    def collect_concept_hierarchy_map(self):
+        for line in self.input_list:
+            if line.get('type', '').lower() != 'concept':
+                continue
+            parent_urls = line.get('parent_concept_urls') or []
+            concept_id = line.get('id')
+            owner = line.get('owner')
+            source = line.get('source')
+            if parent_urls and concept_id and owner and source:
+                owner_type = line.get('owner_type', '').lower()
+                owner_prefix = 'users' if owner_type in ['user', 'users'] else 'orgs'
+                # P2: normalize concept_id the same way ConceptImporter.parse() does,
+                # so the URI matches what was actually persisted in the database.
+                if not is_url_encoded_string(concept_id):
+                    concept_id = encode_string(concept_id, safe='')
+                child_uri = f'/{owner_prefix}/{owner}/sources/{source}/concepts/{concept_id}/'
+                self.concept_hierarchy_map[child_uri] = parent_urls
+
+    @staticmethod
+    def get_resource_id(resource):
+        """Normalized (lowercased string) "id" of an input line, '' when absent/blank/null.
+
+        Input lines are user supplied, so "id" can be missing, null or a non-string (e.g. a number coming from a
+        CSV/JSON conversion). A missing "id" is legitimate -- the mnemonic is then assigned by Concept.persist_new,
+        exactly like for mappings -- so chunking must pass those lines through instead of failing the whole import.
+        """
+        return str(get(resource, 'id', '') or '').lower()
+
+    @staticmethod
+    def chunker_list(seq, size, is_child):  # pylint: disable=too-many-locals
+        """
+            1. returns n number of sequential chunks from l.
+            2. makes sure concept versions are grouped in single list
+        """
+        sorted_seq = seq
+        is_source_child = False
+        if is_child:
+            part_type = get(seq, '0.type', '').lower()
+            is_source_child = part_type in ['concept']
+            if is_source_child:
+                sorted_seq = sorted(seq, key=BulkImportParallelRunner.get_resource_id)
+        quotient, remainder = divmod(len(sorted_seq), size)
+        result = []
+        for i in range(size):
+            si = (quotient+1)*(i if i < remainder else remainder) + quotient*(0 if i < remainder else i - remainder)
+            current = list(sorted_seq[si:si + (quotient + 1 if i < remainder else quotient)])
+            if not is_source_child or not get(result, '-1', None):
+                if current:
+                    result.append(current)
+                continue
+            prev = get(result, '-1', None)
+            prev_last_id = BulkImportParallelRunner.get_resource_id(get(prev, '-1', None))
+            current_first_id = BulkImportParallelRunner.get_resource_id(get(current, '0', None))
+            shift = 0
+            # id-less lines are not versions of one another, so they must not be pulled into a single chunk
+            if prev_last_id and prev_last_id == current_first_id:
+                for resource in current:
+                    if BulkImportParallelRunner.get_resource_id(resource) == prev_last_id:
+                        shift += 1
+                        result[-1].append(resource)
+                    else:
+                        break
+            if shift:
+                current = current[shift:]
+            if current:
+                result.append(current)
+        return result
+
+    def is_any_process_alive(self):
+        if not self.groups:
+            return False
+
+        result = False
+
+        try:
+            for grp in self.groups:
+                if result:
+                    return result
+                if grp.ready():  # all tasks in that group are done
+                    result = False
+                else:
+                    workers = list(set(compact([task.worker for task in self.tasks if task.status == 'STARTED'])))
+                    workers_status = app.control.ping(destination=workers)  # check if workers are up
+                    result = len(workers_status) != 0
+        except:  # pylint: disable=bare-except
+            result = True
+
+        return result
+
+    def get_sub_tasks(self):
+        if self.tasks:
+            return Task.objects.filter(id__in=[task.task_id for task in self.tasks])
+        return Task.objects.none()
+
+    def get_overall_tasks_progress(self):
+        return sum(compact(self.get_sub_tasks().values_list('summary__processed', flat=True)))
+
+    def has_hierarchy_reconciliation_step(self):
+        return bool(self.concept_hierarchy_map)
+
+    def get_total_progress_target(self):
+        return self.total + int(self.has_hierarchy_reconciliation_step())
+
+    def get_completed_progress(self):
+        return self.get_overall_tasks_progress() + int(
+            self.has_hierarchy_reconciliation_step() and self.hierarchy_reconciliation_done
+        )
+
+    def get_details_to_notify(self):
+        summary = f"Started: {self.start_time_formatted} | " \
+            f"Processed: {self.get_completed_progress()}/{self.get_total_progress_target()} | " \
+            f"Time: {self.elapsed_seconds}secs"
+
+        return {'summary': summary}
+
+    def notify_progress(self):
+        if self.task:
+            self.task.summary = {'processed': self.get_completed_progress(), 'total': self.get_total_progress_target()}
+            self.task.save()
+
+    def wait_till_tasks_alive(self):
+        while self.is_any_process_alive():
+            time.sleep(5)
+            self.update_elapsed_seconds()
+            self.notify_progress()
+
+    def run(self):
+        if self.self_task_id:
+            print("****STARTED MAIN****")
+            print(f"TASK ID: {self.self_task_id}")
+            print("***************")
+        while len(self.parts) > 0:
+            part_list = self.parts.popleft()
+            if part_list:
+                part_type = get(part_list, '0.type', '').lower()
+                if part_type:
+                    is_child = part_type in ['concept', 'mapping', 'reference']
+                    start_time = time.time()
+                    self.queue_tasks(part_list, is_child)
+                    self.wait_till_tasks_alive()
+                    if is_child:
+                        if part_type not in self.resource_wise_time:
+                            self.resource_wise_time[part_type] = 0
+                        self.resource_wise_time[part_type] += round(time.time() - start_time, 4)
+
+        self.notify_progress()
+        if self.concept_hierarchy_map:
+            # P1: restrict reconciliation to concepts the importing user can actually edit,
+            # mirroring the has_edit_access guard in ConceptImporter.process(). This excludes
+            # PERMISSION_DENIED rows and prevents hierarchy changes on sources the user does
+            # not own, even when those concepts already exist in the database.
+            user = UserProfile.objects.filter(username=self.username).first()
+            accessible_uris = set(
+                concept.uri
+                for concept in Concept.objects.filter(
+                    uri__in=self.concept_hierarchy_map.keys(), id=F('versioned_object_id')
+                ).select_related('parent')
+                if concept.parent.has_edit_access(user)
+            )
+            viewable_parent_uris = set(Concept.get_viewable_parent_uris(
+                list({uri for uris in self.concept_hierarchy_map.values() for uri in uris}), user))
+            inverted = {}
+            for child_uri, parent_uris in self.concept_hierarchy_map.items():
+                if child_uri not in accessible_uris:
+                    continue
+                for parent_uri in [uri for uri in parent_uris if uri in viewable_parent_uris]:
+                    if parent_uri not in inverted:
+                        inverted[parent_uri] = []
+                    inverted[parent_uri].append(child_uri)
+            if inverted:
+                make_hierarchy(inverted)
+            self.hierarchy_reconciliation_done = True
+            self.notify_progress()
+
+        post_import_update_resource_counts.apply_async(queue='default', permanent=False)
+
+        self.update_elapsed_seconds()
+
+        self.make_result()
+
+        return self.result
+
+    def update_elapsed_seconds(self):
+        self.elapsed_seconds = round(time.time() - self.start_time, 4)
+
+    @property
+    def detailed_summary(self):
+        result = self.json_result
+        message = f"Started: {self.start_time_formatted} | Processed: {result.get('processed')}/{result.get('total')}"
+        if len(result.get('created')):
+            message += f" | Created: {len(result.get('created'))}"
+        if len(result.get('updated')):
+            message += f" | Updated: {len(result.get('updated'))}"
+        if len(result.get('deleted')):
+            message += f" | Deleted: {len(result.get('deleted'))}"
+        if len(result.get('exists')):
+            message += f" | Existing: {len(result.get('exists'))}"
+        if len(result.get('permission_denied')):
+            message += f" | Permission Denied: {len(result.get('permission_denied'))}"
+        if len(result.get('unchanged')):
+            message += f" | Unchanged: {len(result.get('unchanged'))}"
+        message += f" | Time: {self.elapsed_seconds}secs"
+
+        return message
+
+    @property
+    def start_time_formatted(self):
+        return datetime.fromtimestamp(self.start_time)
+
+    @property
+    def json_result(self):
+        if self._json_result:
+            return self._json_result
+
+        total_result = {
+            'total': 0,
+            'processed': 0,
+            'created': [],
+            'updated': [],
+            'invalid': [],
+            'exists': [],
+            'failed': [],
+            'exception': [],
+            'deleted': [],
+            'others': [],
+            'unknown': [],
+            'permission_denied': [],
+            'unchanged': [],
+            'elapsed_seconds': self.elapsed_seconds
+        }
+        for task in self.tasks:
+            if task.result:
+                try:
+                    result = task.result.get('json')
+                    for key in total_result:
+                        if result:
+                            total_result[key] += result.get(key)
+                except:  # pylint: disable=bare-except
+                    pass
+
+        total_result['start_time'] = self.start_time_formatted
+        total_result['elapsed_seconds'] = self.elapsed_seconds
+        total_result['child_resource_time_distribution'] = self.resource_wise_time
+        self._json_result = total_result
+        return self._json_result
+
+    @property
+    def report(self):
+        data = {
+            k: len(v) if isinstance(v, list) else v for k, v in self.json_result.items()
+        }
+
+        data['child_resource_time_distribution'] = self.resource_wise_time
+
+        return data
+
+    def make_result(self):
+        self.result = {
+            'json': self.json_result,
+            'detailed_summary': self.detailed_summary,
+            'report': self.report
+        }
+
+    def queue_tasks(self, part_list, is_child):
+        has_delete_action = not is_child and any(line.get('__action') == 'DELETE' for line in part_list)
+        chunked_lists = [part_list] if has_delete_action else compact(
+            self.chunker_list(part_list, self.parallel, is_child))
+        jobs = group(
+            bulk_import_parts_inline.s(_list, self.username, self.update_if_exists, self.index)
+            for _list in chunked_lists
+        )
+        group_result = jobs.apply_async(queue='concurrent')
+        self.groups.append(group_result)
+        self.tasks += group_result.results
+        self.task.children += list({task.task_id for task in self.tasks})
+        self.task.children = list(set(self.task.children))
+        self.task.save()
