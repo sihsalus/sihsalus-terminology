@@ -1,0 +1,264 @@
+import React from 'react'
+import { useHistory } from 'react-router-dom'
+import moment from 'moment'
+import { useTranslation } from 'react-i18next';
+import Table from '@mui/material/Table';
+import TableBody from '@mui/material/TableBody';
+import TableCell from '@mui/material/TableCell';
+import TableContainer from '@mui/material/TableContainer';
+import TableHead from '@mui/material/TableHead';
+import TableRow from '@mui/material/TableRow';
+import Checkbox from '@mui/material/Checkbox';
+import Tooltip from '@mui/material/Tooltip';
+import Skeleton from '@mui/material/Skeleton';
+import MuiButton from '@mui/material/Button';
+import ReleaseIcon from '@mui/icons-material/VerifiedOutlined';
+import DraftIcon from '@mui/icons-material/EditOutlined';
+import isNumber from 'lodash/isNumber'
+import without from 'lodash/without'
+import find from 'lodash/find'
+import ConceptIcon from '../concepts/ConceptIcon'
+import AccessIcon from '../common/AccessIcon'
+import MappingIcon from '../mappings/MappingIcon';
+import { formatDate, hasAccessToURL } from '../../common/utils'
+import { SURFACE_COLORS, BLACK } from '../../common/colors'
+import Button from '../common/Button';
+import ProcessingFlag from './ProcessingFlag';
+import { isSameVersion, hasMultipleExpansions, isCollectionURL } from './versionsTab.styles';
+
+const normalizeVersions = versions => {
+  if (Array.isArray(versions))
+    return versions
+
+  return []
+}
+
+const Row = ({ version, disabled, checkbox, bodyCellStyle, onCheck, checked, onVersionChange, originVersion }) => {
+  const { t } = useTranslation()
+  const isPublic = ['view', 'edit'].includes(version.public_access?.toLowerCase())
+  const tooltip = originVersion ? t('repo.compare_origin_version_disabled_tooltip') : t('repo.compare_destination_version_disabled_tooltip')
+  const isPrivateAndHasNoAccess = !isPublic && !hasAccessToURL(version.version_url || version.url)
+  const isDisabled = disabled || isPrivateAndHasNoAccess
+  return (
+    <Tooltip title={disabled ? tooltip : undefined} placement='right'>
+      <TableRow key={version.id} id={version.id} sx={[isDisabled ? {
+        cursor: 'not-allowed'
+      } : {
+        cursor: 'pointer'
+      }]} disabled={isDisabled}>
+        {
+          checkbox &&
+            <TableCell padding="checkbox" sx={{...bodyCellStyle, borderTopLeftRadius: '50px', borderBottomLeftRadius: '50px'}} onClick={() => !isDisabled && onCheck(version)}>
+              <Checkbox color="primary" size='small' checked={!isDisabled && checked.includes(version.version_url)} onChange={() => onCheck(version)} disabled={isDisabled} />
+            </TableCell>
+        }
+        <TableCell sx={[{
+          ...bodyCellStyle
+        }, (checkbox ? {} : {borderTopLeftRadius: '50px', borderBottomLeftRadius: '50px'})]} onClick={isDisabled ? undefined : () => onVersionChange(version)}>
+          {version.id}
+          <ProcessingFlag entity={version} showLabel={false} sx={{ ml: 1 }} />
+          {
+            version?.match_algorithms?.includes('llm') &&
+              <Tooltip title={t('repo.version.vectorized_for_mapper')}>
+                <i style={{fontSize: '0.8rem', marginLeft: '8px'}} className="fa-solid fa-diagram-project"></i>
+              </Tooltip>
+          }
+        </TableCell>
+        <TableCell sx={{...bodyCellStyle}} onClick={isDisabled ? undefined : () => onVersionChange(version)}>
+        {moment(version.created_on).fromNow()}
+      </TableCell>
+        <TableCell sx={{...bodyCellStyle}} onClick={isDisabled ? undefined : () => onVersionChange(version)}>
+        <span style={{display: 'flex', alignItems: 'center'}}>
+          {
+            isNumber(version?.summary?.active_concepts) &&
+              <span style={{marginRight: '8px', display: 'flex', alignItems: 'center'}}>
+                <ConceptIcon selected color='secondary' sx={{width: '1rem', height: '1rem', marginRight: '4px'}} />
+                {version.summary.active_concepts.toLocaleString()}
+              </span>
+          }
+          {
+            isNumber(version?.summary?.active_mappings) &&
+              <span style={{display: 'flex', alignItems: 'center'}}>
+                <MappingIcon width="15px" height='13px' fill='secondary.main' color='secondary' sx={{width: '15px', height: '13px', marginRight: '4px'}} />
+                {version.summary.active_mappings.toLocaleString()}
+              </span>
+          }
+        </span>
+      </TableCell>
+        <TableCell sx={{...bodyCellStyle}} onClick={isDisabled ? undefined : () => onVersionChange(version)}>
+          <span style={{display: 'flex', alignItems: 'center'}}>
+            <AccessIcon sx={{width: '17px', height: '17px', marginRight: '4px'}} public_access={version.public_access} /> {isPublic ? t('common.public') : t('common.private')}
+            </span>
+      </TableCell>
+        <TableCell sx={{...bodyCellStyle, borderTopRightRadius: '50px', borderBottomRightRadius: '50px'}} onClick={isDisabled ? undefined : () => onVersionChange(version)}>
+          {
+            version.id === 'HEAD' &&
+              <span style={{display: 'flex', alignItems: 'center'}}>
+                <DraftIcon  sx={{width: '17px', height: '17px', marginRight: '4px'}} />
+                {t('common.draft')}
+              </span>
+          }
+        {
+          version.released && version.id !== 'HEAD' ?
+            <span style={{display: 'flex', alignItems: 'center'}}>
+              <ReleaseIcon  sx={{width: '17px', height: '17px', marginRight: '4px'}} />
+              {formatDate(version.updated_on)}
+            </span> :
+          ''
+        }
+      </TableCell>
+    </TableRow>
+    </Tooltip>
+  );
+}
+
+const SkeletonRow = ({ checkbox, bgColor }) => (
+  <TableRow>
+    {
+      checkbox &&
+        <TableCell padding="checkbox" sx={{background: bgColor}}>
+          <Skeleton variant="circular" width={18} height={18} />
+        </TableCell>
+    }
+    <TableCell sx={{background: bgColor}}><Skeleton variant="text" width={50} /></TableCell>
+    <TableCell sx={{background: bgColor}}><Skeleton variant="text" width={80} /></TableCell>
+    <TableCell sx={{background: bgColor}}><Skeleton variant="text" width={70} /></TableCell>
+    <TableCell sx={{background: bgColor}}><Skeleton variant="text" width={60} /></TableCell>
+    <TableCell sx={{background: bgColor}}><Skeleton variant="text" width={90} /></TableCell>
+  </TableRow>
+)
+
+const VersionsTable = ({ selected, versions, onChange, bgColor, checkbox, disabledFrom, disabledUntil, originVersion, loading, hasMore, loadingMore, onLoadMore }) => {
+  const { t } = useTranslation()
+  const history = useHistory()
+  const [checked, setChecked] = React.useState([])
+  const versionList = normalizeVersions(versions)
+  const selectedColor = SURFACE_COLORS.s90
+  const getBodyCellStyle = (isSelected, disabled) =>  {
+    let backgroundColor = isSelected ? selectedColor : bgColor
+    return {
+      fontSize: '14px',
+      background: backgroundColor,
+      color: isSelected ? BLACK : 'secondary.main',
+      borderBottom: 'none',
+      fontWeight: isSelected ? 'bold': 'normal',
+      opacity: disabled ? 0.5 : 1
+    }
+  }
+  const onCheck = version => {
+    const url = version.version_url || version.url
+    setChecked(checked.includes(url) ? without(checked, url) : [...checked, url])
+  }
+
+  const isDisabled = version => {
+    const other = disabledFrom || disabledUntil
+    if(isSameVersion(version, other) && hasMultipleExpansions(version))
+      return false
+
+    if(version.id === 'HEAD')
+      return disabledFrom?.id === version.id || disabledUntil?.id === version.id
+
+    let disabled = false
+    if(disabledFrom)
+      disabled = (version.id || version.version !== 'HEAD') && moment(version.created_on) >= moment(disabledFrom.created_on)
+    if(!disabled && disabledUntil)
+      disabled = moment(version.created_on) <= moment(disabledUntil.created_on)
+
+    return disabled
+  }
+
+  return (
+    <React.Fragment>
+      <TableContainer sx={{height: '220px'}}>
+        <Table
+          stickyHeader
+          sx={{ minWidth: 650 }}
+          size='small'
+        >
+          <TableHead>
+            <TableRow>
+              {
+                checkbox &&
+                  <TableCell padding="checkbox" sx={{background: bgColor}} />
+              }
+              <TableCell sx={{fontSize: '12px', fontWeight: 'bold', background: bgColor}}>
+                {t('common.version')}
+              </TableCell>
+              <TableCell sx={{fontSize: '12px', fontWeight: 'bold', background: bgColor}}>
+                {t('common.created')}
+              </TableCell>
+              <TableCell sx={{fontSize: '12px', fontWeight: 'bold', background: bgColor}}>
+                {t('common.content_summary')}
+              </TableCell>
+              <TableCell sx={{fontSize: '12px', fontWeight: 'bold', background: bgColor}}>
+                {t('repo.visibility')}
+              </TableCell>
+              <TableCell sx={{fontSize: '12px', fontWeight: 'bold', background: bgColor}}>
+                {t('repo.release_status')}
+              </TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {
+              versionList.map(version => {
+                const isSelected = version?.version_url == (selected?.version_url || selected?.url)
+                const disabled = isDisabled(version)
+                const bodyCellStyle = getBodyCellStyle(isSelected, disabled)
+                return (
+                  <Row
+                    key={version.id}
+                    id={version.id}
+                    version={version}
+                    disabled={disabled}
+                    checkbox={checkbox}
+                    bodyCellStyle={bodyCellStyle}
+                    onCheck={onCheck}
+                    checked={checked}
+                    onVersionChange={disabled ? () => {} : onChange}
+                    originVersion={originVersion}
+                  />
+                )
+              })
+            }
+            {
+              loading &&
+                [0, 1, 2].map(key => <SkeletonRow key={`skeleton-${key}`} checkbox={checkbox} bgColor={bgColor} />)
+            }
+            {
+              !loading && hasMore &&
+                <TableRow>
+                  <TableCell colSpan={checkbox ? 6 : 5} sx={{background: bgColor, borderBottom: 'none', textAlign: 'center'}}>
+                    <MuiButton sx={{textTransform: 'none'}} variant='text' size='small' disabled={loadingMore} onClick={onLoadMore}>
+                      {loadingMore ? t('common.loading') : t('common.load_more')}
+                    </MuiButton>
+                  </TableCell>
+                </TableRow>
+            }
+          </TableBody>
+        </Table>
+      </TableContainer>
+      {
+        checked?.length == 2 &&
+          <Button
+            sx={{marginTop: '16px', display: 'flex'}}
+            onClick={() => history.push(`${selected?.url + 'compare-versions'}?version1=${checked[0]}&version2=${checked[1]}`)}
+            label={isCollectionURL(checked[0]) ? t('repo.compare_versions_and_expansions') : t('repo.compare_versions')}
+            color='primary'
+            variant='outlined'
+          />
+      }
+      {
+        checked?.length == 1 && hasMultipleExpansions(find(versionList, version => (version.version_url || version.url) === checked[0])) &&
+          <Button
+            sx={{marginTop: '16px', display: 'flex'}}
+            onClick={() => history.push(`${selected?.url + 'compare-versions'}?version1=${checked[0]}&version2=${checked[0]}`)}
+            label={t('repo.compare_expansions_of_version')}
+            color='primary'
+            variant='outlined'
+          />
+      }
+    </React.Fragment>
+  )
+}
+
+export default VersionsTable

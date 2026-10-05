@@ -1,0 +1,21 @@
+$black: #000;
+$white: #FFF;
+footer.footer-container {
+    bottom: 0;
+    left: 0;
+    right: 0;
+    position: absolute;
+    background: transparent;
+    height: 30px;
+    padding: 8px 26px;
+    font-size: 12px;
+    justify-content: flex-end;
+    .footer-company {
+        padding: 0 2px;
+    }
+    .footer-divider-vertical {
+        margin: 0 5px;
+        background: $black;
+        width: 1px;
+    }
+}

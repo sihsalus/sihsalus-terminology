@@ -1,0 +1,876 @@
+import React from 'react';
+import get from 'lodash/get'
+import { useLocation, useHistory } from 'react-router-dom';
+import { useTranslation } from 'react-i18next'
+import Tabs from '@mui/material/Tabs';
+import Tab from '@mui/material/Tab';
+import Button from '@mui/material/Button';
+import Tooltip from '@mui/material/Tooltip';
+import Menu from '@mui/material/Menu';
+import MenuItem from '@mui/material/MenuItem';
+import ListItemIcon from '@mui/material/ListItemIcon';
+import ListItemText from '@mui/material/ListItemText';
+import OrgIcon from '@mui/icons-material/AccountBalance';
+import UserIcon from '@mui/icons-material/Person';
+import DeleteForeverIcon from '@mui/icons-material/DeleteForever';
+import TransformIcon from '@mui/icons-material/Transform';
+import DownIcon from '@mui/icons-material/KeyboardArrowDown';
+import { forEach, keys, pickBy, isEmpty, find, uniq, has, orderBy as sortBy, uniqBy, omit, max, isEqual, isBoolean } from 'lodash';
+import { COLORS } from '../../common/colors';
+import { dropVersion, highlightTexts, isLoggedIn, getCurrentUserUsername } from '../../common/utils';
+import usePins, { PIN_RESOURCES, MAX_PINS_ALLOWED } from '../../hooks/usePins';
+import PinActionButton from '../common/PinActionButton';
+import APIService from '../../services/APIService';
+import RepoIcon from '../repos/RepoIcon';
+import ConceptIcon from '../concepts/ConceptIcon';
+import ConceptHome from '../concepts/ConceptHome';
+import SearchResults from './SearchResults';
+import SearchFilters from './SearchFilters'
+import { OperationsContext } from '../app/LayoutContext';
+import ReferenceFilters from '../repos/ReferenceFilters'
+import { EXCLUDE_FILTER_KEY } from './ResultConstants'
+import DeleteReferencesDialog from '../collections/DeleteReferencesDialog'
+import RemoveFromCollectionDialog from '../collections/RemoveFromCollectionDialog'
+import TransformReferencesDialog from '../collections/TransformReferencesDialog'
+import { getTransformAddGroups } from '../collections/referenceTransformUtils'
+import RemoveCircleOutlineIcon from '@mui/icons-material/RemoveCircleOutlined'
+import GAService from '../../services/GAService'
+import QuotaDialog from '../common/QuotaDialog'
+import { getQuotaError } from '../common/quotaErrors'
+
+const DEFAULT_LIMIT = 25;
+const FILTERS_WIDTH = 250
+const FILTERABLE_RESOURCES = ['concepts', 'mappings', 'repos', 'sources', 'collections', 'references']
+
+const getBaseCollectionUrl = url => {
+  const match = (url || '').match(/^(.*\/collections\/[^/]+\/)(?:[^/]+\/)?(?:concepts|mappings|references)\/?$/)
+  return match ? match[1] : dropVersion(url)
+}
+
+const getCollectionLookupUrl = url => (url || '').replace(/\/(concepts|mappings|references)\/?$/, '/')
+
+
+const Search = props => {
+  const { setAlert, contextRepo } = React.useContext(OperationsContext);
+
+  // Pins: the owning page (org/user home) supplies them; a standalone search pins to the current user.
+  const hasPinsFromProps = Boolean(props.onPinToggle)
+  const currentUsername = getCurrentUserUsername()
+  const ownPins = usePins((hasPinsFromProps || props.nested || !currentUsername) ? false : {type: 'user', id: currentUsername})
+  const pins = hasPinsFromProps ? props.pins : ownPins.pins
+  const canPin = hasPinsFromProps ? props.canPin : ownPins.canPin
+  const onPinToggle = hasPinsFromProps ? props.onPinToggle : ownPins.togglePin
+  const { t } = useTranslation()
+  const history = useHistory();
+  const location = useLocation();
+  const [loading, setLoading] = React.useState(true)
+  const [quotaError, setQuotaError] = React.useState(null)
+  const [loadingFacets, setLoadingFacets] = React.useState(true)
+  const [openFilters, setOpenFilters] = React.useState(has(props, 'defaultFiltersOpen') ? props.defaultFiltersOpen : true)
+  const [input, setInput] = React.useState('');
+  const [page, setPage] = React.useState(0);
+  const [pageSize, setPageSize] = React.useState(DEFAULT_LIMIT);
+  const [resource, setResource] = React.useState(false)
+  const [result, setResult] = React.useState({})
+  const [filters, setFilters] = React.useState({})
+  const [selected, setSelected] = React.useState([])
+  const [showItem, setShowItem] = React.useState(false)
+  const [order, setOrder] = React.useState('desc');
+  const [orderBy, setOrderBy] = React.useState('score');
+  const [isMatchOp, setIsMatchOp] = React.useState(false)
+  const [deleteReferencesOpen, setDeleteReferencesOpen] = React.useState(false)
+  const [deletingReferences, setDeletingReferences] = React.useState(false)
+  const [referenceActionsAnchor, setReferenceActionsAnchor] = React.useState(null)
+  const [transformReferencesOpen, setTransformReferencesOpen] = React.useState(false)
+  const [transformingReferences, setTransformingReferences] = React.useState(false)
+  const [bulkRemoveOpen, setBulkRemoveOpen] = React.useState(false)
+  const [bulkRemoving, setBulkRemoving] = React.useState(false)
+  const [hierarchy, setHierarchy] = React.useState(false)
+
+  const didMount = React.useRef(false);
+  const isFilterable = _resource => FILTERABLE_RESOURCES.includes(_resource)
+  const isHierarchySupported = Boolean(props.nested && props.repo?.hierarchy_root_url && (resource || props.resource) === 'concepts')
+
+  React.useEffect(() => {
+    if(!props.url)
+      setQueryParamsInState(true)
+  }, [])
+
+  React.useEffect(() => {
+    if(props.url && !props.loading)
+      setQueryParamsInState(true, true)
+  }, [props.url, props.loading])
+
+  React.useEffect(() => {
+    if(didMount.current)
+      setQueryParamsInState()
+    else
+      didMount.current = true
+  }, [decodeURIComponent(location.search)])
+
+  React.useEffect(() => {
+    highlight()
+  }, [result])
+
+  const onDisplayChange = newDisplay => {
+    if(isHierarchySupported) {
+      const newHierarchy = newDisplay === 'hierarchy'
+      if(newHierarchy !== hierarchy) {
+        setHierarchy(newHierarchy)
+        setPage(1)
+        fetchResults(getQueryParams(input, 1, pageSize, filters, orderBy, order, newHierarchy), true)
+      }
+    }
+    input && setTimeout(highlight, 100)
+  }
+
+  const getCurrentLayoutURL = (params, _resource) => {
+    /*eslint no-unused-vars: 0*/
+    const { q, page, limit, includeSearchMeta, sortAsc, sortDesc, onlyHierarchyRoot, ...filters} = params
+    const isMatch = params['$match']
+    delete filters['$match']
+    _resource = _resource || resource || 'concepts'
+    if(_resource === 'organizations')
+      _resource = 'orgs'
+    let url = '/search/?'
+    if(q)
+      url += `&q=${q || ''}`
+    if(_resource !== 'concepts')
+      url += `&type=${_resource}`
+    if(limit !== DEFAULT_LIMIT)
+      url += `&limit=${limit}`
+    if(page && page > 1)
+      url += `&page=${page}`
+    if(isMatch)
+      url += '&$match=true'
+    if(!isEmpty(filters)){
+      if(_resource === 'references')
+        url += Object.entries(filters)
+        .map(([key, value]) => `&${key}=${String(value)}`)
+        .join('');
+      else
+        url += `&filters=${encodeURIComponent(JSON.stringify(omit(filters, 'includeRetired')))}`
+    }
+    if(sortDesc)
+      url += `&sortDesc=${sortDesc}`
+    else if(sortAsc)
+      url += `&sortAsc=${sortAsc}`
+
+
+    let queryStr = url.replace('?&', '?').split('?')[1]
+    queryStr = queryStr ? '?' + queryStr : ''
+
+    return window.location.hash.replace('#', '').split('?')[0] + queryStr;
+  }
+
+
+  const getFiltersFromQueryParams = () => {
+    const queryParams = new URLSearchParams(window.location.hash.split('?')[1])
+    let _filters = false
+    if(resource === 'references') {
+      _filters = {};
+      ['cascade', 'versioning', 'repo_version', 'definition_type', 'inclusion_type'].forEach(param => {
+        if(queryParams.has(param))
+          _filters[param] = queryParams.get(param)
+      })
+    } else {
+      _filters = queryParams.get('filters') || false
+      if(_filters)
+        _filters = JSON.parse(_filters)
+      if(_filters) {
+        try {
+          _filters = getAppliedFacetFromQueryParam(_filters)
+        } catch {
+          _filters = {}
+        }
+      }
+    }
+    return _filters
+  }
+
+  const setQueryParamsInState = (mustFetch, includeRepoDefaultFilters) => {
+    const queryParams = new URLSearchParams(window.location.hash.split('?')[1])
+    const value = queryParams.get('q') || ''
+    const isMatch = queryParams.get('$match') === 'true'
+    const isDiffFromPrevInput = value !== input
+    const _page = parseInt(queryParams.get('page') || 1)
+    const _pageSize = parseInt(queryParams.get('limit') || 25)
+    const _resource = queryParams.get('type') || props.resource || 'concepts'
+    let _orderBy, _order;
+    const sortAsc = queryParams.get('sortAsc')
+    const sortDesc = queryParams.get('sortDesc')
+    if(sortAsc) {
+      _orderBy = sortAsc
+      _order = 'asc'
+    } else if (sortDesc) {
+      _orderBy = sortDesc
+      _order = 'desc'
+    } else if(!value) {
+      _orderBy = _resource === 'users' ? 'username' : ''
+      _order = 'asc'
+    }
+    let _fetch = mustFetch || false
+    let _fetchFacets = mustFetch || isDiffFromPrevInput
+    let _filters = getFiltersFromQueryParams()
+    if(_filters) {
+      _fetch = true
+      _fetchFacets = true
+    }
+    if(includeRepoDefaultFilters && !_filters && !isEmpty(props.repoDefaultFilters)) {
+      _filters = getAppliedFacetFromQueryParam(props.repoDefaultFilters)
+      // Write the defaults into the URL so it stays the single source of truth --
+      // otherwise the next location.search-driven sync sees no `filters` param and
+      // wipes these back out (e.g. as soon as the user performs a search).
+      history.replace(getCurrentLayoutURL(getQueryParams(value, _page, _pageSize, _filters, _orderBy, _order), _resource))
+      return
+    }
+    if(!isEqual(isMatch, isMatchOp)) {
+      setIsMatchOp(isMatch)
+      _fetch = true
+      _fetchFacets = false
+    }
+    if(!isEqual(filters, _filters)) {
+      setFilters(_filters)
+      _fetchFacets = true
+      _fetch = true
+    }
+    if(isDiffFromPrevInput) {
+      setInput(value)
+      _fetch = true
+    }
+    if(_resource !== resource) {
+      setResource(_resource)
+      _fetch = true
+      _fetchFacets = true
+    }
+    if(_page !== page) {
+      setPage(_page)
+      _fetch = true
+    }
+    if(_pageSize !== pageSize) {
+      setPageSize(_pageSize)
+      _fetch = true
+    }
+    if(_orderBy !== orderBy || _order !== order) {
+      setOrderBy(_orderBy)
+      setOrder(_order)
+      _fetch = true
+    }
+
+    if(_fetch) {
+      if(isMatch)
+        fetchMatchResults(getQueryParams(value, _page, _pageSize, _filters, _orderBy, _order))
+      else
+        fetchResults(getQueryParams(value, _page, _pageSize, _filters, _orderBy, _order), _fetchFacets, _resource)
+    }
+  }
+
+  const getAppliedFacetFromQueryParam = filters => {
+    const applied = {}
+    forEach(filters, (value, field) => {
+      applied[field] = {}
+      if(isBoolean(value)) {
+        applied[field][value.toString()] = true
+      } else {
+        let _value = value
+        if(typeof _value === 'string' && _value.startsWith('!')) {
+          applied[field][EXCLUDE_FILTER_KEY] = true
+          _value = _value.slice(1)
+        }
+        forEach(_value.split(','), val => applied[field][val] = true)
+      }
+    })
+    return applied
+  }
+
+  const getFacetQueryParam = filters => {
+    if(resource === 'references')
+      return filters
+    const queryParam = {}
+    forEach(
+      filters, (value, field) => {
+        const excluded = Boolean(value?.[EXCLUDE_FILTER_KEY])
+        const joined = keys(pickBy(omit(value, EXCLUDE_FILTER_KEY), Boolean)).join(',')
+        queryParam[field] = joined && excluded ? `!${joined}` : joined
+      }
+    )
+
+    if(queryParam?.retired === 'true,false' || queryParam?.retired === 'false,true')
+      queryParam['includeRetired'] = true
+
+    return queryParam
+  }
+
+
+  const getQueryParams = (_input, _page, _pageSize, _filters, _orderBy, _order, _hierarchy) => {
+    let params = {q: _input, page: _page || 1, limit: _pageSize, includeSearchMeta: true, ...getFacetQueryParam(_filters || {})}
+    if(_orderBy) {
+      if(_order === 'desc')
+        params.sortDesc = _orderBy
+      else
+        params.sortAsc = _orderBy
+    } else if(!_input) {
+      params.sortAsc = ''
+    }
+    if(isMatchOp)
+      params['$match'] = true
+    if(isHierarchySupported && (_hierarchy === undefined ? hierarchy : _hierarchy)) {
+      params.onlyHierarchyRoot = true
+      // sort params force the API onto the search-index path, which ignores
+      // onlyHierarchyRoot and doesn't return has_children
+      delete params.sortAsc
+      delete params.sortDesc
+    }
+    return params
+  }
+
+  const isSearchIndexQuery = () => {
+    const params = omit(
+      getQueryParams(input, page, pageSize, filters, orderBy, order),
+      ['page', 'limit', 'includeSearchMeta', 'onlyHierarchyRoot']
+    )
+    return Object.values(params).some(Boolean)
+  }
+
+  const handleResourceChange = (event, newTab) => {
+    event.preventDefault()
+    event.stopPropagation()
+    setFilters({})
+
+    history.push(getCurrentLayoutURL(getQueryParams(input, page, pageSize, {}), newTab))
+  }
+
+  const getURL = __resource => {
+    if(props.nested && props.url)
+      return props.url
+    return `/${__resource}/`
+  }
+
+  const recordSearchEvent = (__resource, params) => {
+    GAService.recordActionEvent('Search', `search_${__resource}`, undefined, {
+      term: params?.q || '',
+      resource: __resource,
+      page: params?.page || 1,
+      page_size: params?.limit || DEFAULT_LIMIT,
+      has_filters: !isEmpty(omit(params || {}, ['q', 'page', 'limit', 'includeSearchMeta', 'verbose', 'sortAsc', 'sortDesc']))
+    })
+  }
+
+  const fetchResults = (params, facets=true, _resource=undefined) => {
+    let __resource = _resource || resource
+    if(!__resource)
+      return
+    recordSearchEvent(__resource, params)
+    setLoading(true)
+    setResult(prev => {
+      return {...prev, [__resource]: {...result[__resource], results: []}}
+    })
+    if(['users', 'orgs', 'references'].includes(__resource))
+      params.verbose = true
+    if(__resource === 'references')
+      params.includeResolvedRepoVersions = true
+    if(['concepts', 'mappings'].includes(__resource) && props.url?.includes('/collections/')) {
+      params.includeReferences = true
+      params.includeResolvedRepoVersions = true
+    }
+    if(__resource === 'repos') {
+      // fills the latest version and content summary columns
+      params.includeLatestReleasedVersion = true
+      params.includeSummary = true
+    }
+    if(!params.sortAsc)
+      delete params.sortAsc
+    if(!params.sortDesc)
+      delete params.sortDesc
+    APIService.new().overrideURL(getURL(__resource)).get(null, null, params).then(response => {
+      if(response?.detail) {
+        setAlert({message: response.detail, severity: 'error', duration: 5000})
+        setLoading(false)
+        return
+      }
+      let total = parseInt(response?.headers?.num_found)
+      const summaryCount = get(props.summary, `active_${__resource}`) || get(props.summary, `${__resource}.active`) || 0
+      if(!params.q && props?.summary && props.nested && (total < summaryCount && total === 10000) && keys(params).every(el => ['includeSearchMeta', 'q', 'limit', 'page', 'pageSize', 'offset', 'sortAsc', 'sortDesc', 'display', 'type'].includes(el)))
+        total = summaryCount
+      const resourceResult = {total: total, pageSize: max([parseInt(response?.headers?.num_returned), params?.limit]), page: parseInt(response?.headers?.page_number), pages: parseInt(response?.headers?.pages), results: response?.data || [], facets: result[__resource]?.facets || {}}
+      setResult(prev => {
+        return {...result, [__resource]: resourceResult}
+      })
+      setLoading(false)
+      if(facets && isFilterable(__resource) && __resource !== 'references')
+        fetchFacets(params, resourceResult, __resource)
+    })
+  }
+
+
+  const fetchMatchResults = (params) => {
+    let __resource = 'concepts'
+    recordSearchEvent(__resource, params)
+    setLoading(true)
+    setResult(prev => {
+      return {...prev, [__resource]: {...result[__resource], results: []}}
+    })
+    let _filters = omit(params, ['q', 'page', 'page_number', 'page_size', 'limit', 'offset', 'includeSearchMeta', 'verbose', 'order', 'orderBy', 'sortAsc', 'sortDesc', 'display', 'type', 'onlyHierarchyRoot'])
+    const payload = {rows: [{name: params.q}], target_repo_url: contextRepo?.version_url, filter: _filters || {}}
+    APIService.new().overrideURL('/concepts/$match/').post(payload, null, null, {verbose: true, includeSearchMeta: true, semantic: true, reranker: true, ...params}).then(response => {
+      const limitError = getQuotaError(response)
+      if(limitError) {
+        setQuotaError(limitError)
+        setLoading(false)
+        return
+      }
+      if(response?.detail) {
+        setAlert({message: response.detail, severity: 'error', duration: 5000})
+        setLoading(false)
+        return
+      }
+      let __results = get(response, 'data.0.results') || []
+      let total = __results.length + 10
+      const resourceResult = {total: total, pageSize: params?.limit || 10, page: params?.page || params?.page_number || 1, pages: 2, results: __results || [], facets: result[__resource]?.facets || {}}
+      setResult(prev => {
+        return {...result, [__resource]: resourceResult}
+      })
+      setLoading(false)
+    })
+  }
+
+  const fetchFacets = (params, otherResults, _resource=undefined) => {
+    setLoadingFacets(true)
+    const __resource = _resource || resource
+    APIService.new().overrideURL(getURL(__resource)).get(null, null, {...omit(params, ['includeLatestReleasedVersion', 'includeSummary', 'includeReferences', 'includeResolvedRepoVersions']), facetsOnly: true}).then(response => {
+      setResult(prev => {
+        return {...prev, [__resource]: {...(prev[__resource] || otherResults), facets: prepareFacets(response?.data?.facets?.fields || {}, __resource)}}
+      })
+      setLoadingFacets(false)
+    })
+  }
+
+  const prepareFacets = (newFacets, _resource) => {
+    // 1. If no facets are applied then just replace with new facets
+    // 2. If facet(s) are applied then do not change anything in the applied field list
+    // 3. If facet(s) are applied then new facets will be added and enabled but old facets that are not present in new facets will be disabled with count 0
+    // 4. If facet(s) are applied then anything that is existing in both new and old will only have count updated
+    let existingFacets = result[_resource]?.facets
+    if(isEmpty(existingFacets))
+      return newFacets
+
+    let appliedFacets = getFiltersFromQueryParams()
+    const doNotRemoveFacets = keys(appliedFacets)
+    let mergedFacets = {}
+    forEach(uniq([...keys(newFacets), ...keys(existingFacets)]), field => {
+      mergedFacets[field] = mergedFacets[field] || []
+      if(doNotRemoveFacets.includes(field)) {
+        const facets = uniq([...(existingFacets[field].map(facet => facet[0]) || []), ...(newFacets[field].map(facet => facet[0]) || [])])
+        forEach(facets, facet => {
+          const newFacet = find(get(newFacets, field), f => f[0] === facet)
+          const existingFacet = find(get(existingFacets, field), f => f[0] === facet)
+          if(newFacet)
+            mergedFacets[field].push(newFacet)
+          else if (existingFacet)
+            mergedFacets[field].push(existingFacet)
+        })
+      } else if (!has(existingFacets, field)) {
+        mergedFacets[field] = newFacets[field]
+      } else {
+        forEach(existingFacets[field], facet => {
+          const val = facet[0]
+          let newFacet = find(newFacets[field], newFacet => newFacet[0] === val)
+          if(newFacet) {
+            mergedFacets[field].push(newFacet)
+          } else {
+            mergedFacets[field].push([facet[0], 0, false, true])
+          }
+        })
+        mergedFacets[field] = uniqBy([...(mergedFacets[field] || []), ...(newFacets[field] || [])], facet => facet[0])
+      }
+
+      mergedFacets[field] = sortBy(mergedFacets[field], facet => facet[1], 'desc')
+    })
+
+    return mergedFacets
+  }
+
+  const onPageChange = (_page, _pageSize) => {
+    history.push(getCurrentLayoutURL(getQueryParams(input, _page, _pageSize, filters, orderBy, order)))
+  }
+
+  const highlight = item => highlightTexts(item?.id ? [item] : result[resource]?.results || [], null, true)
+
+  const onFiltersChange = newFilters => {
+    // A new filter means a different result set -- the current page number is meaningless
+    // against it (and may not even exist), so start over from the first page.
+    history.push(getCurrentLayoutURL(getQueryParams(input, 1, pageSize, newFilters, orderBy, order)))
+  }
+
+  const TAB_STYLES = {textTransform: 'none'}
+  const searchBgColor = showItem ? COLORS.surface.main : COLORS.primary.contrastText
+  const getLastSelectedURL = () => {
+    let URL = showItem?.version_url || showItem?.url
+    if(showItem && ['concepts', 'mappings'].includes(resource)) {
+      const item = find(result[resource].results, {version_url: showItem})
+      if(item?.uuid && (parseInt(item?.versioned_object_id) === parseInt(item?.uuid) || item.is_latest_version)) {
+        URL = item.url
+      }
+    }
+    return URL
+  }
+
+  const noResults = !loading && input && !(result[resource]?.results || []).length
+  const showFilters = openFilters && !noResults && isFilterable(resource)
+
+  const getSearchResultsWidth = () => {
+    let toSubtract = 0;
+    if(showFilters)
+      toSubtract = FILTERS_WIDTH
+    return toSubtract ? `calc(100% - ${toSubtract}px)` : '100%'
+  }
+
+  const onSelectItem = value => {
+    setSelected(value)
+    props.onSelectItem ? props.onSelectItem(value) : null
+  }
+
+  const onShowItemSelect = item => {
+    onSelectItem([])
+    setShowItem(item || false)
+    props.onShowItem && props.onShowItem(item || false)
+  }
+
+  const onOrderByChange = (newOrderByField, newOrder) => {
+    history.push(getCurrentLayoutURL(getQueryParams(input, page, pageSize, filters, newOrderByField, newOrder)))
+  }
+
+  const isHead = props.nested ? props.repo?.version === 'HEAD' : false
+  const isInCollection = props.url?.includes('/collections/')
+  const collectionUrl = isInCollection ? getBaseCollectionUrl(props.url) : null
+  const collectionLookupUrl = isInCollection ? getCollectionLookupUrl(props.url) : null
+
+  const selectedReferenceObjects = resource === 'references' && selected.length > 0
+    ? (result['references']?.results || []).filter(r => selected.includes(r.version_url || r.url || r.id))
+    : []
+
+  const onDeleteReferences = deleteBody => {
+    const body = deleteBody || { ids: selectedReferenceObjects.map(r => r.id).filter(Boolean) }
+    const deleteUrl = isInCollection ? `${collectionUrl}references/` : props.url
+    setDeletingReferences(true)
+    APIService.new().overrideURL(deleteUrl).delete(body).then(response => {
+      setDeletingReferences(false)
+      if(response?.status === 204 || response?.status === 200) {
+        setDeleteReferencesOpen(false)
+        onSelectItem([])
+        setAlert({ severity: 'success', message: t('reference.remove_success') })
+        fetchResults(getQueryParams(input, page, pageSize, filters, orderBy, order))
+      } else {
+        setAlert({ severity: 'error', message: response?.data?.detail || t('common.generic_error') })
+      }
+    })
+  }
+
+  const addTransformedReferences = group => {
+    const data = {
+      expressions: group.items.map(item => item.proposedExpression),
+      include: group.include,
+    }
+    const body = { data }
+    if(group.cascade) {
+      data.cascade = group.cascade
+      body.cascade = typeof group.cascade === 'string' ? group.cascade : group.cascade?.method || ''
+    }
+
+    return APIService.new().overrideURL(collectionUrl).appendToUrl('references/').put(body)
+  }
+
+  const getAddedTransformItems = (response, group) => {
+    if(![200, 201].includes(response?.status))
+      return []
+    if(!Array.isArray(response?.data))
+      return group.items
+
+    const addedExpressions = response.data.filter(item => item.added).map(item => item.expression)
+    return group.items.filter(item => addedExpressions.includes(item.proposedExpression))
+  }
+
+  const onTransformReferences = async transformItems => {
+    const groups = getTransformAddGroups(transformItems)
+    setTransformingReferences(true)
+
+    const addResults = await Promise.all(groups.map(group => addTransformedReferences(group).then(response => ({ group, response }))))
+    const addedItems = addResults.reduce((items, { group, response }) => [...items, ...getAddedTransformItems(response, group)], [])
+    const addFailures = addResults.reduce((count, { group, response }) => count + group.items.length - getAddedTransformItems(response, group).length, 0)
+
+    if(!addedItems.length) {
+      setTransformingReferences(false)
+      setAlert({ severity: 'error', message: t('reference.transform_no_references_changed') })
+      return
+    }
+
+    const deleteResponse = await APIService.new()
+      .overrideURL(collectionUrl)
+      .appendToUrl('references/')
+      .delete({ ids: addedItems.map(item => item.reference.id).filter(Boolean) })
+
+    setTransformingReferences(false)
+    const deleteSucceeded = [200, 204].includes(deleteResponse?.status)
+    if(deleteSucceeded) {
+      setTransformReferencesOpen(false)
+      onSelectItem([])
+      const transformedCount = addedItems.length
+      setAlert({
+        severity: addFailures ? 'warning' : 'success',
+        message: addFailures ?
+          t('reference.transform_partial_success', { transformed: transformedCount, failed: addFailures }) :
+          t('reference.transform_success', { count: transformedCount }),
+      })
+      fetchResults(getQueryParams(input, page, pageSize, filters, orderBy, order))
+    } else {
+      setAlert({
+        severity: 'warning',
+        message: t('reference.transform_delete_failed', { count: addedItems.length }),
+      })
+      fetchResults(getQueryParams(input, page, pageSize, filters, orderBy, order))
+    }
+  }
+
+  const selectedRows = (result[resource]?.results || []).filter(r => selected.includes(r.version_url || r.url || r.id))
+
+  const onBulkRemoveFromCollection = deleteBody => {
+    const body = deleteBody || { ids: [] }
+    setBulkRemoving(true)
+    APIService.new().overrideURL(collectionUrl).appendToUrl('references/').delete(body).then(response => {
+      setBulkRemoving(false)
+      if(response?.status === 204 || response?.status === 200) {
+        setBulkRemoveOpen(false)
+        onSelectItem([])
+        setAlert({ severity: 'success', message: t('reference.remove_success') })
+        fetchResults(getQueryParams(input, page, pageSize, filters, orderBy, order))
+      } else {
+        setAlert({ severity: 'error', message: response?.data?.detail || t('common.generic_error') })
+      }
+    })
+  }
+
+  const bulkRemoveFromCollectionAction = isInCollection && isHead && ['concepts', 'mappings'].includes(resource) && isLoggedIn() && selected.length > 0 ? (
+    <Button
+      startIcon={<RemoveCircleOutlineIcon fontSize='inherit' />}
+      variant='contained'
+      size='small'
+      color='error'
+      sx={{textTransform: 'none', whiteSpace: 'nowrap', marginLeft: '8px'}}
+      onClick={() => setBulkRemoveOpen(true)}
+    >
+      {t('reference.remove_from_collection')}
+    </Button>
+  ) : null
+
+  const closeReferenceActions = () => setReferenceActionsAnchor(null)
+
+  const referenceActionsControl = resource === 'references' && isLoggedIn() && selected.length > 0 ? (
+    <Tooltip title={!isHead ? t('reference.not_available_in_version') : ''}>
+      <span>
+        <Button
+          endIcon={<DownIcon fontSize='inherit' />}
+          variant='contained'
+          size='small'
+          disabled={!isHead}
+          sx={{textTransform: 'none', whiteSpace: 'nowrap'}}
+          onClick={event => {setReferenceActionsAnchor(event.currentTarget)}}
+        >
+          {t('reference.actions')}
+        </Button>
+      </span>
+    </Tooltip>
+  ) : null
+
+  React.useEffect(() => {
+    setShowItem(props.showItem || false)
+  }, [props.showItem])
+
+  React.useEffect(() => {
+    if(!props.nested)
+      setShowItem(false)
+  }, [location.search])
+
+  const findPinFor = item => (pins || []).find(pin => pin.resource_uri === item?.url)
+  const pinLimitReached = (pins || []).length >= MAX_PINS_ALLOWED
+  const pinColumn = (canPin && PIN_RESOURCES.includes(resource)) ? {
+    id: 'pin',
+    label: '',
+    sortable: false,
+    align: 'right',
+    sx: {width: '48px', padding: '0 8px'},
+    renderer: item => {
+      const pin = findPinFor(item)
+      return (
+        <PinActionButton
+          item={item}
+          pin={pin}
+          onToggle={onPinToggle}
+          disabled={!pin && pinLimitReached}
+        />
+      )
+    }
+  } : null
+
+  return (
+    <div className='col-xs-12 padding-0'>
+      <div className={!props.nested && showItem?.id ? 'col-xs-7 split' : 'col-xs-12 split'} style={{backgroundColor: searchBgColor, borderRadius: '10px', height: '100%', ...(props.containerStyle || {})}}>
+        {
+          !props.noTabs &&
+            <div className='col-xs-12 padding-0' style={{borderBottom: `1px solid ${COLORS.surface.n90}`}}>
+              <Tabs value={resource} onChange={handleResourceChange} aria-label="search tabs" TabIndicatorProps={{style: {height: '3px'}}}>
+                <Tab value='concepts' icon={<ConceptIcon selected={resource == 'concepts'} fontSize='small' />} label={t('concept.concepts')} style={TAB_STYLES} />
+                <Tab value='repos' icon={<RepoIcon noTooltip selected={resource == 'repos'} fontSize='small' />} label={t('repo.repos')} style={TAB_STYLES} />
+                <Tab value='orgs' icon={<OrgIcon color={resource === 'orgs' ? 'primary' : 'secondary'} fontSize='small' />} label={t('org.orgs')} style={TAB_STYLES} />
+                <Tab value='users' icon={<UserIcon color={resource === 'users' ? 'primary' : 'secondary'} fontSize='small' />} label={t('user.users')} style={TAB_STYLES} />
+              </Tabs>
+            </div>
+        }
+        <div className='col-xs-12 padding-0' style={{height: '100%'}}>
+          <div className='col-xs-12 padding-0' style={{height: '100%'}}>
+            <div className='col-xs-3 split padding-0' style={{width: showFilters ? `${FILTERS_WIDTH}px` : 0, padding: showFilters ? '0 8px' : 0, ...(showFilters ? {borderRight: '0.3px solid', borderColor: COLORS.surface.n90} : {})}}>
+              {
+                resource === 'references' ?
+                  <ReferenceFilters
+                    open={showFilters}
+                    filters={result[resource]?.facets || {}}
+                    onChange={onFiltersChange}
+                    bgColor={searchBgColor}
+                    appliedFilters={filters}
+                    nested={props.nested}
+                    heightToSubtract={props.filtersHeightToSubtract || 175}
+                  />:
+                  <SearchFilters
+                    open={showFilters}
+                    loading={loadingFacets}
+                    allowExclude
+                    resource={resource}
+                    filters={result[resource]?.facets || {}}
+                    onChange={onFiltersChange}
+                    bgColor={searchBgColor}
+                    appliedFilters={filters}
+                    nested={props.nested}
+                    onSaveAsDefaultFilters={props.onSaveAsDefaultFilters ? filters => props.onSaveAsDefaultFilters(getFacetQueryParam(filters)) : false}
+                    repoDefaultFilters={getAppliedFacetFromQueryParam(props.repoDefaultFilters || {})}
+                    propertyFilters={props.propertyFilters}
+                    propertyDefinition={props.propertyDefinition}
+                    heightToSubtract={props.filtersHeightToSubtract || 175}
+                  />
+              }
+            </div>
+            <div className='col-xs-9 split' style={{width: getSearchResultsWidth(), paddingRight: 0, paddingLeft: 0, float: 'right', height: '100%'}}>
+              <div className='col-xs-12 padding-0' style={{height: '100%'}}>
+                <SearchResults
+                  loading={loading}
+                  noCardDisplay={props.noCardDisplay}
+                  order={order}
+                  orderBy={orderBy}
+                  onOrderByChange={onOrderByChange}
+                  nested={props.nested}
+                  openFilters={showFilters}
+                  appliedFilters={filters}
+                  isFilterable={isFilterable(resource)}
+                  noResults={noResults}
+                  searchedText={input}
+                  bgColor={searchBgColor}
+                  results={result[resource]}
+                  resource={resource}
+                  onPageChange={onPageChange}
+                  selected={selected}
+                  onSelect={newSelected => onSelectItem(newSelected)}
+                  selectedToShow={showItem}
+                  onShowItemSelect={onShowItemSelect}
+                  onFiltersToggle={() => setOpenFilters(!openFilters)}
+                  onDisplayChange={onDisplayChange}
+                  resultContainerStyle={props.resultContainerStyle}
+                  resultSize={props.resultSize}
+                  excludedColumns={props.excludedColumns}
+                  extraColumns={[...(props.extraColumns || []), pinColumn].filter(Boolean)}
+                  properties={props.properties}
+                  propertyDefinition={props.propertyDefinition}
+                  propertyFilters={props.propertyFilters}
+                  isMatch={isMatchOp}
+                  searchIndexQuery={isSearchIndexQuery()}
+                  hierarchySupported={isHierarchySupported}
+                  baseURL={props.url}
+                  toolbarControl={<>{props.toolbarControl}{referenceActionsControl}</>}
+                  extraBulkActions={[bulkRemoveFromCollectionAction, props.extraBulkActions]}
+                  onCreateSimilarClick={props.onCreateSimilarClick}
+                  onCreateMappingClick={props.onCreateMappingClick}
+                  fixedLeftControls={[props.fixedLeftControls]}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      {
+        !props.nested &&
+          <div className={'col-xs-5 padding-0' + (showItem ? ' split-appear' : '')} style={{marginLeft: '16px', width: showItem ? 'calc(41.66666667% - 16px)' : 0, backgroundColor: COLORS.primary.contrastText, borderRadius: '10px', height: showItem ? 'calc(var(--app-height) - 100px)' : 0, opacity: showItem ? 1 : 0}}>
+            {
+              showItem &&
+                <ConceptHome concept={showItem} url={getLastSelectedURL()} onClose={() => setShowItem(false)} />
+            }
+          </div>
+      }
+      <Menu
+        anchorEl={referenceActionsAnchor}
+        open={Boolean(referenceActionsAnchor)}
+        onClose={closeReferenceActions}
+      >
+        <MenuItem
+          onClick={() => {
+            closeReferenceActions()
+            setTransformReferencesOpen(true)
+          }}
+        >
+          <ListItemIcon>
+            <TransformIcon fontSize='small' />
+          </ListItemIcon>
+          <ListItemText>{t('reference.transform_to_non_versioned')}</ListItemText>
+        </MenuItem>
+        <MenuItem
+          onClick={() => {
+            closeReferenceActions()
+            setDeleteReferencesOpen(true)
+          }}
+        >
+          <ListItemIcon>
+            <DeleteForeverIcon fontSize='small' color='error' />
+          </ListItemIcon>
+          <ListItemText>{t('common.remove')}</ListItemText>
+        </MenuItem>
+      </Menu>
+      <TransformReferencesDialog
+        open={transformReferencesOpen}
+        onClose={() => setTransformReferencesOpen(false)}
+        onConfirm={onTransformReferences}
+        references={selectedReferenceObjects}
+        loading={transformingReferences}
+      />
+      <DeleteReferencesDialog
+        open={deleteReferencesOpen}
+        onClose={() => setDeleteReferencesOpen(false)}
+        onConfirm={onDeleteReferences}
+        references={selectedReferenceObjects}
+        loading={deletingReferences}
+      />
+      <RemoveFromCollectionDialog
+        open={bulkRemoveOpen}
+        onClose={() => setBulkRemoveOpen(false)}
+        onConfirm={onBulkRemoveFromCollection}
+        resources={selectedRows}
+        collectionUrl={collectionUrl}
+        lookupCollectionUrl={collectionLookupUrl}
+        loading={bulkRemoving}
+      />
+      <QuotaDialog
+        open={Boolean(quotaError)}
+        onClose={() => setQuotaError(null)}
+        meter={quotaError?.meter}
+        surface='tbv3_match'
+        usage={quotaError?.usage}
+      />
+    </div>
+  )
+}
+export default Search;

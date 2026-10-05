@@ -1,0 +1,146 @@
+import React from 'react';
+import moment from 'moment';
+import { useTranslation } from 'react-i18next';
+import Dialog from '@mui/material/Dialog';
+import DialogContent from '@mui/material/DialogContent';
+import DialogTitle from '@mui/material/DialogTitle';
+import Table from '@mui/material/Table';
+import TableHead from '@mui/material/TableHead';
+import TableBody from '@mui/material/TableBody';
+import TableRow from '@mui/material/TableRow';
+import TableCell from '@mui/material/TableCell';
+import IconButton from '@mui/material/IconButton';
+import CloseIcon from '@mui/icons-material/Close';
+import { map, get, keys, flatten, uniq, isBoolean } from 'lodash'
+import Link from '../common/Link'
+import { formatWebsiteLink, formatDate, formatDateTime } from '../../common/utils'
+
+const EntityAttributesDialog = ({ entity, fields, open, onClose }) => {
+  const { t } = useTranslation()
+  const getValue = (field, info) => {
+    let value = info?.value || get(entity, field)
+    if(value) {
+      if(info.type === 'datetime')
+        return moment(value).format('lll')
+      if(info.type === 'datetime')
+        return formatDateTime(value)
+      if(info.type === 'date')
+        return formatDate(value)
+      if(info.type === 'external_link')
+        return formatWebsiteLink(value)
+      if(info.type === 'user')
+        return <Link sx={{fontSize: '14px', justifyContent: 'flex-start'}} label={value} href={`#/users/${value}/`} />
+      if(info.type === 'json')
+        return <pre style={{margin: 0}}>{JSON.stringify(value, undefined, 2)}</pre>
+      if(info.type === 'locales-list') {
+        return map(value, (val, index) => {
+          return (
+            <React.Fragment key={index}>
+              <span style={{fontWeight: index === 0 ? 'bold': 'normal'}}>
+                {val}
+              </span>
+              {
+                index < (value.length - 1) &&
+                  <>, </>
+              }
+            </React.Fragment>
+          )
+        })
+      }
+      if(info.type === 'table') {
+        if(value?.length > 0) {
+          let columns = uniq(flatten(value.map(val => keys(val))))
+          return <Table size='small' sx={{'.MuiTableCell-root': {padding: '6px', border: '1px solid rgba(0, 0, 0, 0.1)'}}}>
+                   <TableHead>
+                     <TableRow>
+                       {
+                         columns.map(
+                           col => <TableCell key={col} sx={{fontSize: '12px', verticalAlign: 'top'}}><b>{col}</b></TableCell>
+                         )
+                       }
+                     </TableRow>
+                   </TableHead>
+                   <TableBody>
+                     {
+                       map(value, (val, index) => (
+                         <TableRow key={index}>
+                           {
+                             columns.map(col => (
+                               <TableCell key={col} sx={{verticalAlign: 'top'}}>
+                                 <span style={{display: 'inline-block', maxWidth: '200px', wordBreak: 'break-all'}}>
+                                   {isBoolean(val[col]) ? val[col].toString() : val[col] || null}
+                                 </span>
+                               </TableCell>
+                             ))
+                           }
+                         </TableRow>
+                       ))
+                     }
+          </TableBody>
+                 </Table>
+        } else {
+          return value
+        }
+      }
+    }
+    return value
+  }
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      scroll='paper'
+      maxWidth="sm"
+      fullWidth
+      sx={[{
+        '& .MuiDialog-paper': {
+          backgroundColor: 'surface.n92',
+          borderRadius: '28px',
+          minHeight: '262px',
+          padding: 0
+        }
+      }, entity?.properties?.length > 0 ? {
+        '& .MuiDialog-paper': {
+          minWidth: '812px'
+        }
+      } : {
+        '& .MuiDialog-paper': {
+          minWidth: '312px'
+        }
+      }]}
+    >
+      <DialogTitle sx={{p: 2, color: 'surface.dark', fontSize: '22px', display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
+        <span>{entity.type} {t('common.attributes')}</span>
+        <IconButton onClick={onClose}><CloseIcon /></IconButton>
+      </DialogTitle>
+      <DialogContent style={{padding: '0 16px'}}>
+        <Table size="small" sx={{'.MuiTableCell-root': {padding: '6px'}}}>
+          <TableHead>
+            <TableRow>
+              <TableCell sx={{fontSize: '12px'}}><b>{t('common.attribute')}</b></TableCell>
+              <TableCell sx={{fontSize: '12px'}}><b>{t('common.value')}</b></TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {
+              map(fields, (info, field) => {
+                return (
+                  <TableRow
+                    key={field}
+                    sx={{ '&:last-child td, &:last-child th': { border: 0 } }}
+                  >
+                  <TableCell component="th" scope="row" sx={{fontSize: '12px', color: 'rgba(0, 0, 0, 0.7)', verticalAlign: 'top'}}>
+                      <span style={{maxWidth: '125px', display: 'inline-block'}}>{info?.label}</span>
+                    </TableCell>
+                    <TableCell>{getValue(field, info)}</TableCell>
+                  </TableRow>
+                )
+              })
+            }
+          </TableBody>
+        </Table>
+      </DialogContent>
+    </Dialog>
+  );
+}
+export default EntityAttributesDialog;

@@ -1,0 +1,154 @@
+const path = require('path');
+const fs = require('fs');
+const HtmlWebpackPlugin = require('html-webpack-plugin');
+const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+const CopyWebpackPlugin = require('copy-webpack-plugin');
+const { ProvidePlugin, DefinePlugin, IgnorePlugin } = require('webpack');
+
+module.exports = (env) => {
+  const isProduction = env.NODE_ENV === 'production';
+  const analyticsPluginModulePath = path.resolve(__dirname, 'node_modules', 'ocl-analytics-web');
+  const analyticsPluginAlias = fs.existsSync(analyticsPluginModulePath) ?
+    analyticsPluginModulePath :
+    path.resolve(__dirname, 'src/common/plugins/usage-dashboard.stub.js');
+  return {
+    mode: env.NODE_ENV,
+    // Production bundle names carry a content hash, so a deploy that changes
+    // a bundle also changes its URL and nginx can cache the bundles for a
+    // year (nginx/default.conf.template). HtmlWebpackPlugin writes the hashed
+    // names into index.html. Dev keeps webpack's default [name].js / [id].js.
+    output: isProduction ? {
+      filename: '[name].[contenthash:8].js',
+      chunkFilename: '[name].[contenthash:8].js',
+    } : {},
+    module: {
+      rules: [
+        {
+          test: /\.(js|jsx)$/,
+          use: ['babel-loader'],
+          exclude: /node_modules/,
+        },
+        {
+          test: /\.(png|jpg|woff|woff2|eot|ttf|svg)$/,
+          loader: 'url-loader'
+        },
+        {
+          test: /\.(scss|css)$/,
+          use: [{
+            loader: 'style-loader', // creates style nodes from JS strings
+          }, {
+            loader: 'css-loader', // translates CSS into CommonJS
+          }, {
+            loader: 'sass-loader', // compiles Sass to CSS
+          }],
+        },
+      ],
+    },
+    optimization: isProduction ? {
+      splitChunks: {
+        chunks: 'all',
+        minSize: 100000,
+        minRemainingSize: 0,
+        minChunks: 1,
+        maxAsyncRequests: 30,
+        maxInitialRequests: 30,
+        cacheGroups: {
+          default: false,
+          vendors: false,
+          react: {
+            chunks: 'all',
+            test: /[\\/]node_modules[\\/](react|react-dom|react-router-dom)[\\/]/,
+            name: "react"
+          },
+          lodash: {
+            chunks: 'all',
+            test: /[\\/]node_modules[\\/](lodash)[\\/]/,
+            name: "lodash"
+          },
+          moment: {
+            chunks: 'all',
+            test: /[\\/]node_modules[\\/](moment|moment-timezone)[\\/]/,
+            name: "moment",
+            reuseExistingChunk: true
+          },
+          material: {
+            chunks: 'all',
+            test: /[\\/]node_modules[\\/](@material-ui[\\/]core|@material-ui[\\/]icons)[\\/]/,
+            name: "material",
+            reuseExistingChunk: true
+          },
+          materialLab: {
+            chunks: 'all',
+            test: /[\\/]node_modules[\\/](@material-ui[\\/]lab)[\\/]/,
+            name: "material-lab",
+            reuseExistingChunk: true
+          },
+          materialPickers: {
+            chunks: 'all',
+            test: /[\\/]node_modules[\\/](@material-ui[\\/]pickers)[\\/]/,
+            name: "material-pickers",
+            reuseExistingChunk: true
+          },
+          vendor: {
+            name: 'vendor',
+            chunks: 'all',
+            test: /[\\/]node_modules[\\/](!react)(!react-dom)(!react-router-dom)(!@material-ui)(!lodash)(!moment)(!moment-timezone)[\\/]/,
+            reuseExistingChunk: true,
+            priority: 20
+          }
+        }
+      }
+    } : {},
+    devServer: {
+      static: {
+        directory: path.resolve(__dirname, 'public'),
+      },
+      allowedHosts: 'all',
+      historyApiFallback: {
+        index: 'index.html',
+      },
+      proxy: [
+        {
+          context: ['/api'],
+          target: 'https://openconceptlab.org',
+          changeOrigin: true,
+          pathRewrite: { '^/api': '' },
+        },
+      ],
+    },
+    devtool: env.NODE_ENV == 'production' ? "source-map" : "cheap-module-source-map",
+    plugins: [
+      new HtmlWebpackPlugin({
+        template: './public/index.html',
+      }),
+      new MiniCssExtractPlugin({filename: 'bundle.css'}),
+      new CopyWebpackPlugin(['src/assets']),
+      new ProvidePlugin({
+        $: 'jquery',
+        jQuery: 'jquery',
+        'window.jQuery': 'jquery',
+        Popper: ['popper.js', 'default'],
+      }),
+      new DefinePlugin({
+        'process.env.API_URL': JSON.stringify(env.API_URL || ''),
+        'process.env.NODE_ENV': JSON.stringify(env.NODE_ENV || 'development'),
+        'process.env.RECAPTCHA_SITE_KEY': JSON.stringify(env.RECAPTCHA_SITE_KEY || ''),
+        'process.env.GA_ACCOUNT_ID': JSON.stringify(env.GA_ACCOUNT_ID || ''),
+        'process.env.HOTJAR_ID': JSON.stringify(env.HOTJAR_ID || ''),
+        'process.env.ERRBIT_URL': JSON.stringify(env.ERRBIT_URL || ''),
+        'process.env.ERRBIT_KEY': JSON.stringify(env.ERRBIT_KEY || ''),
+        'process.env.LOGIN_REDIRECT_URL': JSON.stringify(env.LOGIN_REDIRECT_URL || ''),
+        'process.env.OIDC_RP_CLIENT_ID': JSON.stringify(env.OIDC_RP_CLIENT_ID || ''),
+        'process.env.ANALYTICS_API': JSON.stringify(env.ANALYTICS_API || ''),
+        'process.env.AI_ASSISTANT_API_URL': JSON.stringify(env.AI_ASSISTANT_API_URL || ''),
+      }),
+      new IgnorePlugin({ resourceRegExp: /moment\/locale\// })
+    ],
+    resolve: {
+      extensions: ['.js', '.jsx'],
+      alias: {
+        'ocl-analytics-web$': analyticsPluginAlias,
+      },
+    },
+  };
+};

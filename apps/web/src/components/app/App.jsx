@@ -1,0 +1,255 @@
+/*eslint no-process-env: 0*/
+import React from 'react';
+import { Route, Switch, withRouter } from 'react-router-dom';
+import {
+  isLoggedIn, getCurrentUser, getLoginURL, isOtherOCLClientURL, isRedirectingToLoginViaReferrer
+} from '../../common/utils';
+import GAService from '../../services/GAService';
+import { REPO_ROUTE_PATHS, getRepoKey } from '../../common/repoRoute';
+import Error404 from '../errors/Error404';
+import Error403 from '../errors/Error403';
+import Error401 from '../errors/Error401';
+import NetworkError from '../errors/NetworkError'
+import ErrorBoundary from '../errors/ErrorBoundary';
+import Footer from './Footer';
+import DocumentTitle from "./DocumentTitle"
+import './App.scss';
+import { hotjar } from 'react-hotjar';
+import APIService from '../../services/APIService'
+import Header from './Header';
+import Dashboard from '../dashboard/Dashboard';
+import Search from '../search/Search';
+import OIDLoginCallback from '../users/OIDLoginCallback';
+import { OperationsContext } from './LayoutContext';
+import Alert from '../common/Alert';
+import RepoHome from '../repos/RepoHome';
+import RepoCreate from '../repos/RepoCreate'
+import CompareVersions from '../repos/CompareVersions';
+import UserHome from '../users/UserHome'
+import UserEdit from '../users/UserEdit';
+import UserSettings from '../users/UserSettings';
+import OrgHome from '../orgs/OrgHome';
+import URLRegistry from '../url-registry/URLRegistry'
+import SigninRedirect from './SigninRedirect'
+import SignupRedirect from './SignupRedirect'
+import OrgCreate from '../orgs/OrgCreate'
+import ImportHome from '../imports/ImportHome'
+import ConceptsComparison from '../concepts/ConceptsComparison'
+import MappingsComparison from '../mappings/MappingsComparison'
+import CheckAuth from './CheckAuth'
+import { loadUsageDashboard } from "../../common/plugins/loader";
+import UserChip from '../users/UserChip'
+import UserTooltip from '../users/UserTooltip'
+
+
+const AuthenticationRequiredRoute = ({component: Component, ...rest}) => (
+  <Route
+    {...rest}
+    render={
+      props => isLoggedIn() ?
+        <Component {...props} /> :
+      isRedirectingToLoginViaReferrer(props.location) ?
+        <CheckAuth /> :
+      <Error401 />
+    }
+  />
+)
+
+const SessionUserRoute = ({component: Component, ...rest}) => (
+  <Route
+    {...rest}
+    render={props => getCurrentUser()?.username === rest?.computedMatch?.params?.user ? <Component {...props} /> : <Error403 />}
+  />
+)
+
+const StaffUserRoute = ({component: Component, componentProps={}, ...rest}) => {
+  return (
+  <Route
+    {...rest}
+    render={props => getCurrentUser()?.is_staff ? <Component {...props} {...componentProps} /> : <Error404 />}
+  />
+  )
+}
+
+const SelfOrStaffRoute = ({component: Component, componentProps={}, ...rest}) => {
+  return (
+  <Route
+    {...rest}
+    render={props => {
+      const currentUser = getCurrentUser()
+      const routeUser = props.match?.params?.user
+      if (currentUser?.is_staff || (currentUser?.username && currentUser.username === routeUser))
+        return <Component {...props} {...componentProps} />
+      return currentUser ? <Error403 /> : <Error404 />
+    }}
+  />
+  )
+}
+
+const App = props => {
+  const [networkError, setNetworkError] = React.useState(false)
+  const { alert, setAlert, setToggles } = React.useContext(OperationsContext);
+  const setupHotJar = () => {
+    /*eslint no-undef: 0*/
+    const HID = window.HOTJAR_ID || process.env.HOTJAR_ID
+    if(HID)
+      hotjar.initialize(HID, 6);
+  }
+
+  /*eslint no-undef: 0*/
+  const ANALYTICS_URL = window.ANALYTICS_API || process.env.ANALYTICS_API
+
+  const fetchToggles = async () => {
+    return new Promise(resolve => {
+      APIService.toggles().get().then(response => {
+        if(response === 'Network Error')
+          setNetworkError(true)
+        else {
+          setToggles(response.data)
+          resolve();
+        }
+      });
+    });
+  }
+
+  const addLogoutListenerForAllTabs = () => window.addEventListener(
+    "storage",
+    event => {
+      if(event.key === 'token' && !event.newValue) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        if(!localStorage?.server)
+          window.location = '/';
+      }
+    });
+
+  const forceLoginUser = () => {
+    const { search, hash, pathname } = props.location
+    const queryParams = new URLSearchParams(search)
+    const referrer = queryParams.get('referrer')
+    if(isLoggedIn()) {
+      // OIDLoginCallback navigates away itself; resetting the hash here would undo that.
+      if(!pathname.startsWith('/oidc/login'))
+        window.location.hash = '#'  + pathname + search
+    } else if(isOtherOCLClientURL(referrer) && !isLoggedIn()) {
+      const parts = hash ? hash.split('?') : referrer.split('?')
+      let params = new URLSearchParams(parts[1])
+      if(params.get('auth') === 'true') {
+        getLoginURL(window.location.origin + '/#' + pathname).then(url => { window.location.href = url })
+      }
+    }
+  }
+
+  React.useEffect(() => {
+    forceLoginUser()
+    fetchToggles()
+    addLogoutListenerForAllTabs()
+    GAService.recordPageView()
+    setupHotJar()
+  }, [])
+
+  const [UsageDashboard, setUsageDashboard] = React.useState(null);
+
+  React.useEffect(() => {
+    if(ANALYTICS_URL)
+      loadUsageDashboard().then(comp => {
+        setUsageDashboard(() => comp)
+      })
+  }, []);
+
+  const orgTabs = ['repos']
+  const orgTabsStr = orgTabs.join('|')
+
+  return (
+    <div>
+      <DocumentTitle/>
+      <Header>
+        <ErrorBoundary>
+          <main className='content'>
+            {
+              networkError ?
+                <NetworkError /> :
+            <Switch>
+              <Route exact path="/oidc/login" component={OIDLoginCallback} />
+              <Route path="/signin" component={SigninRedirect} />
+              <Route path="/signup" component={SignupRedirect} />
+              <Route exact path="/search" component={Search} />
+              <Route exact path="/" component={Dashboard} />
+              <Route exact path="/imports" component={ImportHome} />
+              {
+                UsageDashboard &&
+                  <StaffUserRoute
+                    exact
+                    path='/admin'
+                    component={UsageDashboard}
+                    componentProps={{
+                      APIService: APIService,
+                      currentUser: getCurrentUser(),
+                      ANALYTICS_URL: ANALYTICS_URL,
+                      UserChip: UserChip,
+                      UserTooltip: UserTooltip
+                    }}
+                  />
+              }
+              {
+                UsageDashboard &&
+                  <StaffUserRoute
+                    exact
+                    path='/admin/users/:user'
+                    component={UsageDashboard}
+                    componentProps={{
+                      APIService: APIService,
+                      currentUser: getCurrentUser(),
+                      ANALYTICS_URL: ANALYTICS_URL,
+                      UserChip: UserChip,
+                      UserTooltip: UserTooltip
+                    }}
+                  />
+              }
+              {
+                UsageDashboard &&
+                  <SelfOrStaffRoute
+                    exact
+                    path='/users/:user/usage'
+                    component={UsageDashboard}
+                    componentProps={{
+                      APIService: APIService,
+                      currentUser: getCurrentUser(),
+                      ANALYTICS_URL: ANALYTICS_URL,
+                      UserChip: UserChip,
+                      UserTooltip: UserTooltip
+                    }}
+                  />
+              }
+              <Route exact path="/concepts/compare" component={ConceptsComparison} />
+              <Route exact path="/mappings/compare" component={MappingsComparison} />
+              <AuthenticationRequiredRoute exact path={`/:ownerType(users|orgs)/:owner/repos/new/:step?`} component={RepoCreate} />
+              <AuthenticationRequiredRoute exact path={`/:ownerType(users|orgs)/:owner/:repoType(sources|collections)/:repo/edit/:step?`} component={RepoCreate} />
+              <Route exact path={`/:ownerType(users|orgs)/:owner/:repoType(sources|collections)/:repo/compare-versions`} component={CompareVersions} />
+              <Route exact path={`/:ownerType(users|orgs)/:owner/:repoType(sources|collections)/:repo/edit`} component={RepoCreate} />
+              {/* Keyed by repository so moving to another one starts fresh instead of reusing the last one's state */}
+              <Route exact path={REPO_ROUTE_PATHS} render={({ location }) => <RepoHome key={getRepoKey(location.pathname)} />} />
+              <AuthenticationRequiredRoute exact path='/url-registry' component={URLRegistry} />
+              <AuthenticationRequiredRoute exact path='/orgs/:org/url-registry' component={URLRegistry} />
+              <AuthenticationRequiredRoute exact path='/users/:user/url-registry' component={URLRegistry} />
+              <SessionUserRoute exact path='/users/:user/edit' component={UserEdit} />
+              <AuthenticationRequiredRoute path='/users/:user/settings' component={UserSettings} />
+              <AuthenticationRequiredRoute path={`/users/:user/:tab(${orgTabsStr})?`} component={UserHome} />
+              <AuthenticationRequiredRoute exact path='/orgs/new' component={OrgCreate} />
+              <AuthenticationRequiredRoute exact path='/orgs/:org/edit' component={OrgCreate} />
+              <Route path={`/orgs/:org/:tab(${orgTabsStr})?`} render={({ match }) => <OrgHome key={match.params.org} />} />
+              <Route exact path='/403' component={Error403} />
+              <Route component={Error404} />
+            </Switch>
+            }
+            <Alert message={alert?.message} onClose={() => setAlert(false)} severity={alert?.severity} duration={alert?.duration} action={alert?.action} />
+          </main>
+        </ErrorBoundary>
+        <Footer {...props} />
+      </Header>
+    </div>
+  );
+}
+
+export default withRouter(App);
+

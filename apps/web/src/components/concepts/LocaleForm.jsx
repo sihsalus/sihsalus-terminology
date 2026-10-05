@@ -1,0 +1,128 @@
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import TextField from '@mui/material/TextField'
+import FormControlLabel from '@mui/material/FormControlLabel'
+import Switch from '@mui/material/Switch';
+import Divider from '@mui/material/Divider';
+import get from 'lodash/get'
+import compact from 'lodash/compact'
+import fromPairs from 'lodash/fromPairs'
+import uniq from 'lodash/uniq'
+import IconButton from '@mui/material/IconButton'
+import DropDownChip from '../common/DropDownChip'
+import ExternalIdIcon from '../common/ExternalIdIcon'
+
+
+const LocaleForm = ({index, locales, repo, idPrefix, localeType, field, localeTypes, onChange, divider}) => {
+  const { t } = useTranslation()
+  const [showExternalID, setShowExternalID] = React.useState(Boolean(field.external_id.value))
+  const localeNames = React.useMemo(
+    () => fromPairs((locales || []).map(locale => [locale.id, locale.displayName || locale.name || ''])),
+    [locales]
+  )
+  // the repo's own default locale first, then its supported ones, then everything else
+  const suggestedLocales = React.useMemo(
+    () => uniq(compact([repo?.default_locale, ...(repo?.supported_locales || [])])),
+    [repo?.default_locale, repo?.supported_locales]
+  )
+  const localeOptions = React.useMemo(() => {
+    const all = (locales || []).map(locale => locale.id)
+    return [...suggestedLocales, ...all.filter(id => !suggestedLocales.includes(id))]
+  }, [locales, suggestedLocales])
+  const localeGroup = React.useCallback(
+    option => suggestedLocales.includes(option) ? t('common.suggested') : t('common.rest'),
+    [suggestedLocales, t]
+  )
+
+  React.useEffect(() => {
+    if(!showExternalID && Boolean(field.external_id.value))
+      setShowExternalID(Boolean(field.external_id.value))
+  }, [field?.external_id?.value])
+
+  return (
+    <div className='col-xs-12 padding-0' key={index}>
+      <div className='col-xs-12' style={{marginTop: '24px', padding: 0, display: 'flex', alignItems: 'center', gap: '8px'}}>
+        <div className='col-xs-10 padding-0' style={{display: 'flex', alignItems: 'flex-start', gap: '8px'}}>
+          <DropDownChip
+            id={`${idPrefix}.locale`}
+            label={t('concept.form.locale')}
+            options={localeOptions}
+            optionDisplayName={option => localeNames[option] || ''}
+            groupBy={localeGroup}
+            popperSx={{minWidth: '160px', maxWidth: '220px'}}
+            onChange={value => onChange(`${idPrefix}.locale`, value || '')}
+            sx={{flexShrink: 0, maxWidth: '25%'}}
+            defaultValue={field.locale.value}
+            required
+          />
+          <TextField
+            id={`${idPrefix}.${localeType}`}
+            label={t(`concept.form.${localeType}`)}
+            variant='outlined'
+            required
+            size='small'
+            onChange={event => onChange(event.target.id, event.target.value || '')}
+            value={get(field, `${localeType}.value`)}
+            sx={{'.MuiInputBase-root': {paddingLeft: 0}, flex: 1, minWidth: '120px'}}
+            error={Boolean(get(field, `${localeType}.errors.length`))}
+            helperText={get(field, `${localeType}.errors.0`)}
+          />
+          <DropDownChip
+            color='secondary'
+            id={`${idPrefix}.${localeType}_type`}
+            options={localeTypes?.map(type => type.id)}
+            onChange={value => onChange(`${idPrefix}.${localeType}_type`, value || '')}
+            sx={{flexShrink: 0, maxWidth: '35%'}}
+            defaultValue={get(field, `${localeType}_type.value`)}
+            label={t('concept.form.type')}
+            required
+            freeSolo
+            error={get(field, `${localeType}_type.errors.0`)}
+          />
+        </div>
+        <div className='col-xs-2 padding-0' style={{display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
+        <FormControlLabel
+          sx={{ml: 1, mr: 0.5, '.MuiFormControlLabel-label': {fontSize: '12px'}}}
+          labelPlacement="top"
+          id={`${idPrefix}.locale_preferred`}
+          control={
+            <Switch
+              id={`${idPrefix}.locale_preferred`}
+              size='small'
+              sx={{ m: 0 }}
+              checked={Boolean(field.locale_preferred.value)}
+            />
+          }
+          label={t('concept.form.locale_preferred')}
+          size='small'
+          onChange={event => onChange(event.target.id, event.target.checked || false)}
+          checked={Boolean(field.locale_preferred.value)}
+        />
+          <IconButton sx={{marginLeft: 0}} color={showExternalID ? 'primary' : 'secondary'} onClick={() => setShowExternalID(field.external_id.value ? true : !showExternalID)}>
+            <ExternalIdIcon fontSize='inherit' />
+    </IconButton>
+        </div>
+      </div>
+      {
+        showExternalID &&
+          <div className='col-xs-8 padding-0' style={{marginTop: '24px'}}>
+            <TextField
+              fullWidth
+              id={`${idPrefix}.external_id`}
+              label={t('concept.form.external_id')}
+              value={field.external_id.value}
+              variant='outlined'
+              size='small'
+              onChange={event => onChange(event.target.id, event.target.value || '')}
+            />
+          </div>
+      }
+      {
+        divider &&
+          <Divider sx={{width: '100%', marginTop: '24px', display: 'inline-block'}} />
+      }
+    </div>
+  )
+}
+
+export default LocaleForm

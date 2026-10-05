@@ -1,0 +1,1262 @@
+/*eslint no-process-env: 0*/
+import 'core-js/features/url-search-params';
+import React from 'react';
+import moment from 'moment';
+import { Tooltip } from '@mui/material';
+import {
+  filter, difference, compact, find, reject, intersectionBy, size, keys, omitBy, isEmpty,
+  get, includes, map, isArray, values, pick, sortBy, zipObject, orderBy, isObject, merge,
+  uniqBy, cloneDeep, isEqual, without, capitalize, last, nth, uniq, flatten, pickBy, upperFirst
+} from 'lodash';
+import {
+  DATE_FORMAT, TIME_FORMAT, DATETIME_FORMAT, OCL_SERVERS_GROUP, OCL_FHIR_SERVERS_GROUP, HAPI_FHIR_SERVERS_GROUP,
+  OPENMRS_URL, DEFAULT_FHIR_SERVER_FOR_LOCAL_ID, OPERATIONS_PANEL_GROUP, ID_REGEX,
+  RESERVED_ROUTE_KEYWORDS, OCL_CLIENT_HEADERS
+} from './constants';
+import APIService from '../services/APIService';
+import GAService from '../services/GAService';
+import { SERVER_CONFIGS } from './serverConfigs';
+
+export const currentPath = () => window.location.hash.split('?')[0];
+
+export const isAtGlobalSearch = () => window.location.hash.includes('#/search') || isAtRoot();
+
+export const isAtRoot = () => currentPath() === '#/';
+
+export const formatDate = date => moment(date).format(DATE_FORMAT);
+export const formatTime = date => moment(date).format(TIME_FORMAT);
+export const formatDateTime = date => moment(date).format(DATETIME_FORMAT);
+
+export const formatWebsiteLink = (value, style, text) => {
+  if(value && value.trim()) {
+    let href = value.trim();
+    if(!href.startsWith('http://') && !href.startsWith('https://'))
+      href = 'https://' + href;
+
+    return (
+      <a
+        target='_blank'
+        rel="noopener noreferrer"
+        href={href}
+        className="ellipsis-text"
+        style={merge({maxWidth: '100px'}, (style || {}))}>
+        {text || value.trim()}
+      </a>
+    );
+  }
+  return '';
+}
+
+export const formatWebsiteLinkTruncated = (value, style, text) => {
+  if(value && value.trim()) {
+    let href = value.trim();
+    if(!href.startsWith('http://') && !href.startsWith('https://'))
+      href = 'https://' + href;
+
+    const label = text || value.trim()
+
+    return (
+      <Tooltip title={label}>
+        <a
+          target='_blank'
+          rel="noopener noreferrer"
+          href={href}
+          className="ellipsis-text"
+          style={merge({width: 'auto', display: 'inline-block'}, (style || {}))}>
+          {label}
+        </a>
+      </Tooltip>
+    );
+  }
+  return '';
+}
+
+export const getIndirectMappings = (mappings, concept_url) => filter(mappings, {to_concept_url: concept_url});
+
+export const getDirectMappings = (mappings, concept_url) => filter(mappings, {from_concept_url: concept_url});
+
+export const getDirectExternalMappings = (mappings, concept_url) => filter(mappings, mapping => Boolean(mapping.from_concept_url === concept_url && mapping.external_id));
+
+export const getLinkedQuestions = (mappings, concept_url) => filter(mappings, {to_concept_url: concept_url, map_type: 'Q-AND-A'});
+
+export const getLinkedAnswers = (mappings, concept_url) => filter(mappings, {from_concept_url: concept_url, map_type: 'Q-AND-A'});
+
+export const getSetParents = (mappings, concept_url) => filter(mappings, {to_concept_url: concept_url, map_type: 'CONCEPT-SET'});
+
+export const getSetMembers = (mappings, concept_url) => filter(mappings, {from_concept_url: concept_url, map_type: 'CONCEPT-SET'});
+
+export const getMappingsDistributionByMapType = (mappings, concept_url) => {
+  const linkedQuestions = getLinkedQuestions(mappings, concept_url);
+  const linkedAnswers = getLinkedAnswers(mappings, concept_url);
+  const setParents = getSetParents(mappings, concept_url);
+  const setMembers = getSetMembers(mappings, concept_url);
+  const directExternalMappings = getDirectExternalMappings(
+    difference(mappings, [...linkedAnswers, ...linkedQuestions, ...setParents, ...setMembers]),
+    concept_url
+  );
+  const directInternalMappings = getDirectMappings(
+    difference(mappings, [...linkedAnswers, ...linkedQuestions, ...setParents, ...setMembers, ...directExternalMappings]),
+    concept_url
+  );
+  const indirectMappings = getIndirectMappings(
+    difference(mappings, [...linkedAnswers, ...linkedQuestions, ...setParents, ...setMembers, ...directExternalMappings, ...directInternalMappings]),
+    concept_url
+  );
+
+  return {
+    'Linked Question': linkedQuestions,
+    'Linked Answers': linkedAnswers,
+    'Set Parent': setParents,
+    'Set Members': setMembers,
+    'Direct External Mapping': directExternalMappings,
+    'Direct Internal Mapping': directInternalMappings,
+    'Inverse Mapping': indirectMappings,
+  }
+}
+
+export const getAPIURL = () => {
+  const savedConfigs = getSelectedServerConfig();
+  /*eslint no-undef: 0*/
+  return get(savedConfigs, 'url') || window.API_URL || process.env.API_URL;
+}
+
+export const toFullURL = uri => window.location.origin + '/#' + uri;
+
+export const toFullAPIURL = uri => getAPIURL() + uri;
+
+export const toRelativeURL = url => url.replace(getAPIURL(), '');
+
+export const originOf = url => {
+  try {
+    return new URL(url).origin
+  } catch {
+    return ''
+  }
+}
+
+export const toAPIOrigin = origin => origin.replace('://app.v3.', '://api.').replace('://app.', '://api.')
+
+export const fetchRepoFromURL = parsed => {
+  if(parsed.isExternal)
+    return fetch(parsed.fetchURL, {
+      method: 'GET',
+      credentials: 'omit',
+      headers: {...OCL_CLIENT_HEADERS, Accept: 'application/json'}
+    }).then(response => response.json().then(
+      data => ({ok: response.ok, status: response.status, data}),
+      () => ({ok: false, status: response.status, data: false})
+    ))
+
+  return APIService.new().overrideURL(parsed.fetchURL).get(null, {}, {}, true).then(response => {
+    const result = response?.response || response
+    return {ok: result?.status === 200, status: result?.status, data: result?.data}
+  })
+}
+
+export const copyToClipboard = copyText => {
+  if(copyText)
+    navigator.clipboard.writeText(copyText);
+}
+
+export const copyURL = url => copyToClipboard(url, 'Copied URL to clipboard!');
+
+export const toParentURI = uri => (uri || '').split('/').splice(0, 5).join('/') + '/';
+
+export const toOwnerURI = uri => uri && uri.split('/').splice(0, 3).join('/') + '/';
+
+// Extracts the trailing id from a `.../<resourceType>/<id>/` URL
+export const getResourceIdFromUrl = (url, resourceType) => {
+  const match = (url || '').replace(/\/$/, '').match(new RegExp(`/${resourceType}/([^/]+)$`))
+  return match ? decodeURIComponent(match[1]) : undefined
+}
+
+// True when only the trailing resource-id segment was added, removed, or swapped
+export const headFirst = versions => compact([find(versions, version => (version.version || version.id) === 'HEAD'), ...reject(versions, version => (version.version || version.id) === 'HEAD')]);
+
+export const currentUserToken = () => localStorage.token;
+
+export const isLoggedIn = () => Boolean(currentUserToken());
+
+export const getCurrentUser = () => {
+  const data = localStorage.user;
+  if(data)
+    return JSON.parse(data);
+
+  return null;
+};
+
+export const getCurrentUserOrgs = () => {
+  const user = getCurrentUser()
+  return sortOrgs(user?.subscribed_orgs)
+};
+
+export const sortOrgs = orgs => {
+  return [
+    ...orderBy(filter(orgs, 'logo_url'), [org => org?.id?.toLowerCase()], 'asc'),
+    ...orderBy(reject(orgs, 'logo_url'), [org => org?.id?.toLowerCase()], 'asc')
+  ]
+}
+
+export const getCurrentUserUsername = () => get(getCurrentUser(), 'username');
+
+export const nonEmptyCount = (object, attributes) => size(intersectionBy(keys(omitBy(object, val => (isEmpty(val) || includes(['none', 'None'], val)))), attributes));
+
+export const isCurrentUserMemberOf = orgId => Boolean(orgId && includes(map(getCurrentUserOrgs(), 'id'), orgId));
+
+export const canAccessUser = username => {
+  const currentUser = getCurrentUser()
+  return currentUser?.is_staff || currentUser?.username === username
+}
+
+export const canEditUser = username => getCurrentUser()?.username === username
+
+export const defaultDeletePin = (service, callback) => {
+  if(service) {
+    service.delete().then(response => {
+      if(callback && get(response, 'status') === 204)
+        callback();
+    });
+  }
+}
+
+export const isAdminUser = () => {
+  const currentUser = getCurrentUser();
+  return get(currentUser, 'is_staff') || get(currentUser, 'is_superuser');
+}
+
+export const isStaffUser = () => Boolean(get(getCurrentUser(), 'is_staff'))
+
+export const isSuperuser = () => get(getCurrentUser(), 'is_superuser');
+
+export const toObjectArray = obj => isEmpty(obj) ? [] : map(keys(obj), k => pick(obj, k));
+
+export const sortObjectBy = (obj, comparator) => {
+  const _keys = sortBy(keys(obj), key => comparator ? comparator(obj[key], key) : key);
+  return zipObject(_keys, map(_keys, key => obj[key]));
+}
+
+export const arrayToObject = arr => {
+  if(isEmpty(arr))
+    return {};
+
+  return arr.reduce((prev, curr) => {
+    if(curr.key)
+      prev[curr.key] = curr.value;
+    return prev;
+  }, {});
+}
+
+export const currentUserHasAccess = () => hasAccessToURL(window.location.hash.replace('#/', ''))
+
+export const hasAccessToURL = url => {
+  if(!isLoggedIn())
+    return false;
+  if(isAdminUser())
+    return true;
+
+  if(!url)
+    return false;
+
+  const url_parts = compact(url.split('/'));
+
+  const ownerType = url_parts[0];
+  const owner = url_parts[1];
+  if(!owner || !ownerType)
+    return false;
+
+  const currentUser = getCurrentUser();
+  if(ownerType === 'users')
+    return currentUser?.username === owner;
+  if(ownerType === 'orgs')
+    return isSubscribedTo(owner);
+
+  return false;
+}
+
+export const isSubscribedTo = org => Boolean(org && includes(map(get(getCurrentUser(), 'subscribed_orgs'), 'id'), org));
+
+export const getCurrentURL = () => window.location.href.replace(new RegExp('/$'), '');
+
+export const downloadObject = (obj, format, filename) => {
+  const data = new Blob([obj], {type: format});
+  downloadFromURL(window.URL.createObjectURL(data), filename);
+}
+
+export const downloadFromURL = (url, filename) => {
+  const tempLink = document.createElement('a');
+  tempLink.href = url;
+  tempLink.setAttribute('download', filename);
+  tempLink.click();
+}
+
+export const arrayToCSV = objArray => {
+  const array = typeof objArray !== 'object' ? JSON.parse(objArray) : objArray;
+  let str = `${Object.keys(array[0]).map(value => `"${value}"`).join(",")}` + '\r\n';
+
+  return array.reduce((str, next) => {
+    str += `${Object.values(next).map(value => isObject(value) ? `"${JSON.stringify(value)}"` : `"${value}"`).join(",")}` + '\r\n';
+    return str;
+  }, str);
+}
+
+export const refreshCurrentUserCache = callback => {
+  APIService.user().get(null, null, {includeSubscribedOrgs: true, includeAuthGroups: true, includePins: true, includeFollowing: true}).then(response => {
+    if(response.status === 200) {
+      localStorage.setItem('user', JSON.stringify(response.data));
+      if(callback) callback(response);
+    }
+  });
+}
+
+export const replaceCurrentUserCacheWith = data => localStorage.setItem('user', JSON.stringify(data));
+
+export const formatByteSize = bytes => {
+  if(bytes < 1024) return bytes + " bytes";
+  else if(bytes < 1048576) return(bytes / 1024).toFixed(3) + " KB";
+  else if(bytes < 1073741824) return(bytes / 1048576).toFixed(3) + " MB";
+  else return(bytes / 1073741824).toFixed(3) + " GB";
+};
+
+
+export const memorySizeOf = (obj, format=true) => {
+  var bytes = 0;
+
+  const sizeOf = obj => {
+    if(obj !== null && obj !== undefined) {
+      switch(typeof obj) {
+        case 'number':
+          bytes += 8;
+          break;
+        case 'string':
+          bytes += obj.length * 2;
+          break;
+        case 'boolean':
+          bytes += 4;
+          break;
+        case 'object':
+          var objClass = Object.prototype.toString.call(obj).slice(8, -1);
+          if(objClass === 'Object' || objClass === 'Array') {
+            for(var key in obj) {
+              if(!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+              sizeOf(obj[key]);
+            }
+          } else bytes += obj.toString().length * 2;
+          break;
+      }
+    }
+    return bytes;
+  };
+
+
+  const byteSize = sizeOf(obj);
+
+  if(format)
+    return formatByteSize(byteSize);
+
+  return byteSize;
+};
+
+export const getCurrentUserCollections = callback => {
+  const username = getCurrentUserUsername();
+  if(username) {
+    APIService
+      .users(username)
+      .collections()
+      .get(null, null, {limit: 1000, includeSummary: true})
+      .then(response => isArray(response.data) ? callback(response.data) : false);
+    APIService
+      .users(username)
+      .orgs()
+      .appendToUrl('collections/')
+      .get(null, null, {limit: 1000, includeSummary: true})
+      .then(response => isArray(response.data) ? callback(response.data) : false);
+  }
+}
+
+export const getCurrentUserSources = callback => {
+  const username = getCurrentUserUsername();
+  if(!username)
+    return callback([]);
+
+  const query = {limit: 1000, includeSummary: true};
+  Promise.all([
+    APIService.users(username).sources().get(null, null, query),
+    APIService.users(username).orgs().appendToUrl('sources/').get(null, null, query)
+  ]).then(responses => callback(
+    uniqBy(flatten(map(responses, response => isArray(response?.data) ? response.data : [])), 'url')
+  ));
+}
+
+export const isValidPassword = (password, strength, minStrength = 3) => {
+  return Boolean(
+    password &&
+    strength >= minStrength &&
+    password.length >= 8 &&
+    password.match(new RegExp(/(?=.*[0-9])(?=.*[a-zA-Z])(?=\S+$)./g))
+  );
+}
+
+export const getUserInitials = user => {
+  user = user || getCurrentUser();
+  if(!user)
+    return '';
+
+  let result = '';
+  const first_name = get(user, 'first_name', '').trim();
+  const last_name = get(user, 'last_name', '').trim();
+  const username = user.username;
+  const hasValidFirstName = first_name && first_name !== '-';
+  const hasValidLastName = last_name && last_name !== '-';
+  if(!hasValidFirstName && !hasValidLastName && username)
+    result = username.slice(0, 2);
+  if(hasValidFirstName)
+    result = first_name[0];
+  if(hasValidLastName)
+    result += last_name[0];
+  if(result.length == 1 && hasValidFirstName)
+    result += first_name[1];
+
+  return result.toUpperCase();
+}
+
+export const jsonifySafe = data => {
+  if(!data)
+    return data;
+
+  try {
+    return JSON.parse(data);
+  } catch (err) {
+    return data;
+  }
+}
+
+export const getSelectedServerConfig = () => {
+  const serverConfig = localStorage.getItem('server');
+  if(serverConfig)
+    return JSON.parse(serverConfig);
+}
+
+export const getAppliedServerConfig = () => {
+  const selectedConfig = getSelectedServerConfig();
+
+  if(selectedConfig)
+    return selectedConfig;
+
+  const APIURL = window.API_URL || process.env.API_URL;
+  return find(SERVER_CONFIGS, {url: APIURL});
+}
+
+export const isServerSwitched = () => {
+  const selectedServer = getSelectedServerConfig()
+  return selectedServer && selectedServer.id !== getDefaultServerConfig()?.id;
+};
+
+export const getDefaultServerConfig = () => {
+  const APIURL = window.API_URL || process.env.API_URL;
+  return find(SERVER_CONFIGS, {url: APIURL});
+}
+
+export const getLocalFHIRServerConfig = () => find(SERVER_CONFIGS, {type: 'fhir', local: true});
+export const getDefaultFHIRServerConfig = () => find(SERVER_CONFIGS, {id: DEFAULT_FHIR_SERVER_FOR_LOCAL_ID});
+
+export const getFHIRServerConfigFromCurrentContext = () => {
+  const server = getAppliedServerConfig();
+  if(server.type === 'fhir')
+    return server;
+  if(server.fhirServerId)
+    return find(SERVER_CONFIGS, {type: 'fhir', id: server.fhirServerId});
+  if(server.local)
+    return getLocalFHIRServerConfig() || getDefaultFHIRServerConfig();
+}
+
+export const canSwitchServer = () => {
+  const user = getCurrentUser();
+
+  return Boolean(
+    getSelectedServerConfig() ||
+    get(user, 'is_superuser') ||
+      hasAuthGroup(user, 'server')
+  );
+}
+
+export const hasAuthGroup = (user, groupName) => Boolean(find(user?.auth_groups, group => group.includes(groupName)))
+
+export const canViewOperationsPanel = () => {
+  const user = getCurrentUser()
+
+  return Boolean(
+    get(user, 'is_staff') ||
+    hasAuthGroup(user, OPERATIONS_PANEL_GROUP)
+  )
+}
+
+export const isFHIRServer = () => get(getAppliedServerConfig(), 'type') === 'fhir';
+
+export const isConcept = uri => Boolean(uri.match('/concepts/'));
+export const isMapping = uri => Boolean(uri.match('/mappings/'));
+
+
+// https://stackoverflow.com/questions/10420352/converting-file-size-in-bytes-to-human-readable-string
+/**
+ * Format bytes as human-readable text.
+ *
+ * @param bytes Number of bytes.
+ * @param si True to use metric (SI) units, aka powers of 1000. False to use
+ *           binary (IEC), aka powers of 1024.
+ * @param dp Number of decimal places to display.
+ *
+ * @return Formatted string.
+ */
+export const humanFileSize = (bytes, si=false, dp=1) => {
+  const thresh = si ? 1000 : 1024;
+
+  if (Math.abs(bytes) < thresh) {
+    return bytes + ' B';
+  }
+
+  const units = si
+              ? ['KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB']
+              : ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
+  let u = -1;
+  const r = 10**dp;
+
+  do {
+    bytes /= thresh;
+    ++u;
+  } while (Math.round(Math.abs(bytes) * r) / r >= thresh && u < units.length - 1);
+
+
+  return bytes.toFixed(dp) + ' ' + units[u];
+}
+
+export const getServerConfigsForCurrentUser = () => {
+  if(isAdminUser())
+    return SERVER_CONFIGS;
+
+  const defaultConfig = getDefaultServerConfig();
+  const appliedConfig = getAppliedServerConfig();
+
+  let eligible = [];
+  if(isLoggedIn()) {
+    const { auth_groups } = getCurrentUser();
+    if(includes(auth_groups, OCL_SERVERS_GROUP))
+      eligible = [...eligible, ...filter(SERVER_CONFIGS, {type: 'ocl'})];
+    if(includes(auth_groups, OCL_FHIR_SERVERS_GROUP))
+      eligible = [...eligible, ...filter(SERVER_CONFIGS, {type: 'fhir', hapi: false})];
+    if(includes(auth_groups, HAPI_FHIR_SERVERS_GROUP))
+      eligible = [...eligible, ...filter(SERVER_CONFIGS, {type: 'fhir', hapi: true})];
+  } else {
+    eligible = JSON.parse(localStorage.getItem('server_configs')) || [];
+  }
+
+  eligible = compact([defaultConfig, appliedConfig, ...eligible]);
+  return uniqBy(eligible, 'id');
+}
+
+export const arrayToSentence = (arr, separator, lastSeparator=' and ') => {
+  if(arr.length <= 2)
+    return arr.join(lastSeparator);
+
+  const newArr = cloneDeep(arr);
+  newArr.push( `${lastSeparator}${newArr.pop()}`);
+  return newArr.join(separator);
+}
+
+export const generateRandomString = () => Math.random().toString(36).substring(7);
+
+export const getEnv = forURL => {
+  const fqdn = window.location.origin;
+
+  if(fqdn.match('app.staging.openconceptlab'))
+    return 'staging';
+  if(fqdn.match('app.qa.openconceptlab'))
+    return 'qa';
+  if(fqdn.match('app.demo.openconceptlab'))
+    return 'demo';
+  if(fqdn.match('app.dev.openconceptlab'))
+    return 'dev';
+  if(fqdn.match('app.staging.who.openconceptlab'))
+    return forURL ? 'staging.who' : 'staging-who';
+  if(fqdn.match('app.openconceptlab'))
+    return forURL ? '' : 'production';
+
+  return 'development';
+}
+
+export const getOpenMRSURL = () => {
+  let env = getEnv(true);
+
+  if(env === 'development')
+    env = 'qa';
+
+  if(env) env += '.';
+
+  return OPENMRS_URL.replace('openmrs.', `openmrs.${env}`);
+}
+
+export const setUpRecentHistory = history => {
+  history.listen(location => {
+    GAService.recordPageView()
+    let visits = JSON.parse(get(localStorage, 'visits', '[]'));
+    let urlParts = compact(location.pathname.split('/'));
+    let type = '';
+    let category = '';
+    let format = false;
+    if(location.pathname.match('/login') || location.pathname === '/')
+      return;
+    if(location.pathname.match('/imports')) {
+      type = category = 'import';
+      format = true;
+    } else if(location.pathname.match('/search/')) {
+      category = 'search';
+      const queryParams = new URLSearchParams(location.search);
+      type = queryParams.get('type');
+      format = true;
+    } else if(location.pathname.match('/compare')) {
+      category = 'compare';
+      type = 'concepts';
+      format = true;
+    } else {
+      if(urlParts.length <= 3) {
+        type = category = urlParts[0];
+        urlParts = without(urlParts, 'orgs', 'users');
+      }
+      if(urlParts.length == 4) {
+        type = category = urlParts[2];
+        urlParts = without(urlParts, 'orgs', 'users', 'sources', 'collections');
+      }
+      if(urlParts.length == 5) {
+        if(includes(['mappings', 'concepts', 'versions', 'references'], last(urlParts))) {
+          type = category = last(urlParts);
+        }
+        urlParts = without(urlParts, 'orgs', 'users', 'sources', 'collections');
+      }
+      if(urlParts.length >= 6) {
+        if(location.pathname.match('/concepts/')) {
+          type = category = 'concept';
+        }
+        if(location.pathname.match('/mappings/')) {
+          type = category = 'mapping';
+        }
+        if(location.pathname.match('/references')) {
+          type = category = 'reference';
+        }
+        if(location.pathname.match('/expansions')) {
+          type = category = 'expansion';
+        }
+        urlParts = without(urlParts, 'orgs', 'users', 'sources', 'collections');
+      }
+    }
+    if(!includes(['concepts', 'mappings'], last(urlParts)))
+      urlParts = without(urlParts, 'concepts', 'mappings');
+    let name = format ? map(urlParts, capitalize).join(' / ') : urlParts.join(' / ');
+    if(category !== type && type)
+      name += ' / ' + type;
+    const lastVisit =  visits[0];
+    if(isEqual(get(lastVisit, 'name'), name))
+      visits.shift();
+    visits.push({name: name, location: location, type: type || '', category: category || '', at: new Date().getTime()});
+    visits = orderBy(visits, 'at', 'desc').slice(0, 10);
+    localStorage.setItem('visits', JSON.stringify(visits));
+  });
+}
+
+export const getSiteTitle = () => get(getAppliedServerConfig(), 'info.site.title', 'OCL');
+
+export const getRandomColor = () => `#${Math.floor(Math.random()*16777215).toString(16)}`;
+
+export const logoutUser = (redirectToLogin, forced) => {
+  const clearTokens = () => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('id_token');
+    localStorage.removeItem('user');
+    localStorage.removeItem('visits');
+  }
+
+  const returnTo = window.location.origin + '/' + window.location.hash
+  if(forced)
+    sessionStorage.setItem('session_expired', 'true')
+
+  const redirectURL = forced ?
+    window.location.origin + '/#/signin?returnTo=' + encodeURIComponent(returnTo) :
+    undefined
+  const logoutURL = getSSOLogoutURL(redirectURL)
+
+  clearTokens()
+  if(logoutURL)
+    window.location = logoutURL
+  else if(redirectToLogin)
+    getLoginURL(forced ? returnTo : undefined).then(url => { window.location.href = url })
+  else {
+    window.location.hash = '#/';
+    window.location.reload();
+  }
+}
+
+
+export const paramsToParentURI = (params, versioned=false) => {
+  let uri = '';
+  if(params.org)
+    uri += `/orgs/${params.org}`;
+  else if (params.user)
+    uri += `/users/${params.user}`;
+  if(params.source)
+    uri += `/sources/${params.source}`;
+  else if(params.collection)
+    uri += `/collections/${params.collection}`;
+  if(params.version && !versioned && params.version !== 'summary')
+    uri += `/${params.version}`;
+
+  return uri + '/';
+}
+
+export const paramsToURI = (params, versioned=false, expansion=false) => {
+  let uri = '';
+  if(params.org)
+    uri += `/orgs/${params.org}`;
+  else if (params.user)
+    uri += `/users/${params.user}`;
+  if(params.source)
+    uri += `/sources/${params.source}`;
+  else if(params.collection)
+    uri += `/collections/${params.collection}`;
+  if(params.version && !versioned)
+    uri += `/${params.version}`;
+  if(params.expansion && !expansion)
+    uri += `/expansions/${params.expansion}`;
+  if(params.concept)
+    uri += `/concepts/${params.concept}`;
+  else if(params.mapping)
+    uri += `/mappings/${params.mapping}`;
+  if(params.conceptVersion && !versioned)
+    uri += `/${params.conceptVersion}`;
+  if(params.mappingVersion && !versioned)
+    uri += `/${params.mappingVersion}`;
+
+  return uri + '/';
+}
+
+export const URIToOwnerParams = uri => {
+  const ownerURI = toOwnerURI(uri)
+  let owner = {ownerType: undefined, owner: undefined, uri: ownerURI}
+  if(ownerURI?.includes('/orgs/')) {
+    owner.ownerType = 'Organization'
+    owner.owner = ownerURI.split('/orgs/')[1].replaceAll('/', '')
+  } else {
+    owner.ownerType = 'User'
+    owner.owner = ownerURI?.split('/users/')[1]?.replaceAll('/', '')
+  }
+  return owner
+}
+
+export const URIToParentParams = uri => {
+  const parentURI = toParentURI(uri)
+  let parent = {ownerType: undefined, owner: undefined, url: parentURI, repo: undefined, repoType: undefined}
+  const parts = parentURI.split('/')
+  if(parts[1] === 'orgs') {
+    parent.ownerType = 'Organization'
+  } else {
+    parent.ownerType = 'User'
+  }
+  parent.owner = parts[2]
+  parent.repoType = upperFirst(parts[3]?.slice(0, -1))
+  parent.repo = parts[4]
+  return parent
+}
+
+export const getWidthOfText = (txt, fontname, fontsize) => {
+  if(getWidthOfText.c === undefined){
+    getWidthOfText.c=document.createElement('canvas');
+    getWidthOfText.ctx=getWidthOfText.c.getContext('2d');
+  }
+  var fontspec = fontsize + ' ' + fontname;
+  if(getWidthOfText.ctx.font !== fontspec)
+    getWidthOfText.ctx.font = fontspec;
+  return getWidthOfText.ctx.measureText(txt).width + 60;
+}
+
+export const getParamsFromObject = item => {
+  let params = {};
+  if(item.owner_type === 'Organization')
+    params.org = item.owner;
+  else if(item.owner_type === 'User')
+    params.user = item.owner;
+  if(item.source)
+    params.source = item.source;
+  if(item.map_type)
+    params.mapping = item.id;
+  else if (item.concept_class)
+    params.concept = item.id;
+
+  return params;
+}
+
+export const latestResolvedRepoVersion = resource => orderBy(
+  compact(flatten(map(resource?.references || [], 'resolved_repo_versions'))),
+  'created_at',
+  'desc'
+)[0]
+
+export const sourceVersionOf = resource => {
+  if(!resource?.references)
+    return resource?.latest_source_version
+  const version = latestResolvedRepoVersion(resource)?.version
+  return version === 'HEAD' ? undefined : version
+}
+
+export const dropVersion = uri => {
+  if(!uri)
+    return uri
+
+  const parts = uri.split('/')
+
+  if (parts.length <= 4)
+    return uri
+
+  const resource = nth(parts, -4)
+  const name = nth(parts, -3)
+  const version = nth(parts, -2)
+  if (['concepts', 'mappings', 'sources', 'collections'].includes(resource) && name && version)
+    return parts.splice(0, parts.indexOf(nth(parts, -2))).join('/') + '/'
+
+  return uri
+
+}
+
+// Internet Explorer 6-11
+export const isIE = () => /*@cc_on!@*/false || !!document.documentMode;
+
+// Chrome 1 - 71
+export const isChrome = () => !!window.chrome && (!!window.chrome.webstore || !!window.chrome.runtime);
+
+// Opera 8.0+
+export const isOpera = () => (!!window.opr && !!opr.addons) || !!window.opera || navigator.userAgent.indexOf(' OPR/') >= 0;
+
+export const isDeprecatedBrowser = () => isIE() || isOpera();
+
+const PKCE_CODE_VERIFIER_KEY = 'pkce_code_verifier'
+const OAUTH_STATE_KEY = 'oauth_state'
+const OAUTH_RETURN_TO_KEY = 'oauth_return_to'
+
+const base64UrlEncode = buffer => {
+  const bytes = new Uint8Array(buffer)
+  let str = ''
+  for(let i = 0; i < bytes.byteLength; i++)
+    str += String.fromCharCode(bytes[i])
+  return window.btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+const generateSecureRandomString = (length = 64) => {
+  const array = new Uint8Array(length)
+  window.crypto.getRandomValues(array)
+  return base64UrlEncode(array.buffer)
+}
+
+const generateCodeChallenge = async codeVerifier => {
+  const data = new TextEncoder().encode(codeVerifier)
+  const digest = await window.crypto.subtle.digest('SHA-256', data)
+  return base64UrlEncode(digest)
+}
+
+// Generates a fresh PKCE code_verifier for this login attempt, stashes it in sessionStorage
+// (tab-scoped, cleared on tab close) so OIDLoginCallback can read it back for the token exchange,
+// and returns the derived S256 code_challenge to send to Keycloak.
+const preparePKCECodeChallenge = async () => {
+  const codeVerifier = generateSecureRandomString(64)
+  sessionStorage.setItem(PKCE_CODE_VERIFIER_KEY, codeVerifier)
+  return generateCodeChallenge(codeVerifier)
+}
+
+// Marks the state getRegisterURL sends. Keycloak echoes it back after the email-verification link,
+// usually in a new tab, so OIDLoginCallback can tell a finished sign-up apart from other callbacks.
+const SIGNUP_STATE_PREFIX = 'signup.'
+
+// state is only meaningful for flows that echo it back (login/register); reset-password does not.
+const prepareOAuthState = (prefix = '') => {
+  const state = prefix + generateSecureRandomString(32)
+  sessionStorage.setItem(OAUTH_STATE_KEY, state)
+  return state
+}
+
+export const isSignupOAuthState = state => Boolean(state && state.startsWith(SIGNUP_STATE_PREFIX))
+
+export const consumeStoredPKCECodeVerifier = () => {
+  const codeVerifier = sessionStorage.getItem(PKCE_CODE_VERIFIER_KEY)
+  sessionStorage.removeItem(PKCE_CODE_VERIFIER_KEY)
+  return codeVerifier
+}
+
+// Returns true when there's nothing to validate (flows like reset-password never sent a state).
+export const consumeAndValidateOAuthState = returnedState => {
+  const storedState = sessionStorage.getItem(OAUTH_STATE_KEY)
+  sessionStorage.removeItem(OAUTH_STATE_KEY)
+  return !returnedState || returnedState === storedState
+}
+
+// A route's path as the router sees it: decoded once, as history does, so /%73ignup is /signup. A malformed
+// encoding makes the router throw, so it has no path.
+const routePath = route => {
+  try {
+    return decodeURI(route.split(/[?#]/)[0])
+  } catch {
+    return null
+  }
+}
+
+// Keycloak only redeems a code when the token request repeats the sign-in's redirect_uri exactly, and the
+// callback can't rebuild a page's query string (e.g. ?referrer= on links from openconceptlab.org). So sign-in
+// always goes through LOGIN_REDIRECT_URL, and the page to come back to (its hash route) waits here, in this tab.
+const prepareOAuthReturnTo = returnTo => {
+  const route = returnTo?.includes('#') ? returnTo.slice(returnTo.indexOf('#') + 1) : null
+  const path = route && routePath(route)
+  // The router matches paths case-insensitively, so /SIGNUP would start a sign-up too.
+  if(path?.startsWith('/') && !/^\/(oidc\/login|signin|signup)(\/|$)/i.test(path))
+    sessionStorage.setItem(OAUTH_RETURN_TO_KEY, route)
+  else
+    sessionStorage.removeItem(OAUTH_RETURN_TO_KEY)
+}
+
+export const consumeOAuthReturnTo = () => {
+  const route = sessionStorage.getItem(OAUTH_RETURN_TO_KEY)
+  sessionStorage.removeItem(OAUTH_RETURN_TO_KEY)
+  return route
+}
+
+export const getLoginURL = async returnTo => {
+  const oidClientID = window.OIDC_RP_CLIENT_ID || process.env.OIDC_RP_CLIENT_ID
+  let redirectURL = window.LOGIN_REDIRECT_URL || process.env.LOGIN_REDIRECT_URL
+
+  redirectURL = redirectURL.replace(/([^:]\/)\/+/g, "$1");
+
+  prepareOAuthReturnTo(returnTo)
+  const codeChallenge = await preparePKCECodeChallenge()
+  const state = prepareOAuthState()
+  const nonce = generateSecureRandomString(32)
+
+  GAService.clearSignupFlow()
+
+  return `${getAPIURL()}/users/login/?client_id=${oidClientID}&state=${state}&nonce=${nonce}&redirect_uri=${redirectURL}&code_challenge=${codeChallenge}&code_challenge_method=S256`
+}
+
+export const getResetPasswordURL = async returnTo => {
+  let redirectURL = returnTo || window.LOGIN_REDIRECT_URL || process.env.LOGIN_REDIRECT_URL
+  const oidClientID = window.OIDC_RP_CLIENT_ID || process.env.OIDC_RP_CLIENT_ID
+
+  redirectURL = redirectURL.replace(/([^:]\/)\/+/g, "$1");
+
+  prepareOAuthReturnTo()
+  const codeChallenge = await preparePKCECodeChallenge()
+
+  return `${getAPIURL()}/users/password/reset/?client_id=${oidClientID}&redirect_uri=${redirectURL}&code_challenge=${codeChallenge}&code_challenge_method=S256`
+}
+
+export const getRegisterURL = async returnTo => {
+  let redirectURL = returnTo || window.LOGIN_REDIRECT_URL || process.env.LOGIN_REDIRECT_URL
+  const oidClientID = window.OIDC_RP_CLIENT_ID || process.env.OIDC_RP_CLIENT_ID
+
+  redirectURL = redirectURL.replace(/([^:]\/)\/+/g, "$1");
+
+  prepareOAuthReturnTo()
+  const codeChallenge = await preparePKCECodeChallenge()
+  const state = prepareOAuthState(SIGNUP_STATE_PREFIX)
+  const nonce = generateSecureRandomString(32)
+
+  GAService.recordSignupStart()
+
+  return `${getAPIURL()}/users/signup/?client_id=${oidClientID}&state=${state}&nonce=${nonce}&redirect_uri=${redirectURL}&code_challenge=${codeChallenge}&code_challenge_method=S256`
+}
+
+
+export const getSSOLogoutURL = returnTo => {
+  const redirectURL = returnTo || window.LOGIN_REDIRECT_URL || process.env.LOGIN_REDIRECT_URL
+  const idToken = localStorage.id_token
+  if(redirectURL && idToken)
+    return `${getAPIURL()}/users/logout/?id_token_hint=${idToken}&post_logout_redirect_uri=${redirectURL}`
+}
+
+
+export const urlSearchParamsToObject = urlSearchParams => {
+  const result = {}
+  for(const [key, value] of urlSearchParams.entries()) { // each 'entry' is a [key, value] tuple
+    result[key] = value;
+  }
+  return result;
+}
+
+export const toNumDisplay = number => number ? number.toLocaleString() : number
+
+
+export const getSiblings = elem => {
+
+	// Setup siblings array and get the first sibling
+	var siblings = [];
+	var sibling = elem.parentNode.firstChild;
+
+	// Loop through each sibling and push to the array
+	while (sibling) {
+		if (sibling.nodeType === 1 && sibling !== elem) {
+			siblings.push(sibling);
+		}
+		sibling = sibling.nextSibling
+	}
+
+	return siblings;
+
+};
+
+export const sortValuesBySourceSummary = (data, summary, summaryField, isLocale) => {
+  if(isEmpty(compact(data)) || !summary)
+    return data
+  let _data = compact(data).map(d => {
+    d.resultType = 'Ordered'
+    return d
+  })
+  const summaryValues = get(summary, summaryField)
+  let suggested = []
+  if(summaryValues) {
+    const usedValues = map(summaryValues, value => value[0])
+    usedValues.forEach(used => {
+      const _used = find(_data, _d => {
+        const id = _d?.id?.toLowerCase()?.replace('-', '')?.replace('_', '')?.replace(' ', '')
+        const _used = used?.toLowerCase()?.replace('-', '')?.replace('_', '')?.replace(' ', '')
+        return _used === id
+      })
+      if(_used) {
+        suggested.push({..._used, resultType: 'Suggested'})
+        _data = reject(_data, {id: _used?.id})
+      }
+    })
+  }
+
+  let values = [...suggested, ...orderBy(_data, 'name', 'asc')]
+
+  if(isLocale) {
+    values = uniqBy(
+      [
+        {...find(values, {id: summary.default_locale}), resultType: 'Suggested'},
+        ...filter(
+            values,
+            val => (summary.supported_locales || []).includes(val.id)
+        ).map(val => ({...val, resultType: 'Suggested'})),
+        ...values
+      ],
+      'id'
+    )
+  }
+
+  return values
+}
+
+
+const extractTextBetweenEmTags = str => {
+  const regex = /<em>(.*?)<\/em>/g;
+  const matches = [];
+  let match;
+  while ((match = regex.exec(str)) !== null) {
+    matches.push(match[1]);
+    if(match[1] && match[1].includes('_'))
+      matches.push(match[1].replace('_', '-'))
+  }
+  return matches;
+}
+
+const getHighlightedTexts = items => {
+  return uniq(
+    flatten(
+      map(
+        flatten(
+          flatten(
+            flatten(
+              map(
+                items,
+                i => values(
+                  pickBy(
+                    i?.search_meta?.search_highlight,
+                    (value, key) => !key.startsWith('_')
+                  )
+                )
+              )
+            )
+          )
+        ),
+        val => extractTextBetweenEmTags(val)
+      )
+    )
+  )
+}
+
+
+export const highlightTexts = (items, texts, unmark=false) => {
+  const markInstance = new Mark(document.querySelectorAll('.searchable'))
+  const _texts = texts || getHighlightedTexts(items)
+  const options = {
+    element: "span",
+    className: "highlight-search-results",
+    separateWordSearch: false
+  }
+  if(unmark)
+    markInstance.unmark(options)
+  markInstance.mark(_texts, options);
+}
+
+export const pluralize = (count, singular, plural) => `${count?.toLocaleString()} ${count === 1 ? singular : plural}`;
+
+export const handleLookupValuesResponse = (data, callback, attr) => {
+  const _attr = attr || 'id';
+  callback(orderBy(uniqBy(map(data, cc => ({id: get(cc, _attr), name: get(cc, _attr)})), 'name')), 'name');
+}
+
+export const toMapperURL = path => {
+  let url = 'https://map.openconceptlab.org'
+  if(window.location.host?.includes('localhost'))
+    url = 'http://localhost:4004'
+  if(['app.v3.qa.openconceptlab.org', 'app.v3.demo.openconceptlab.org'].includes(window.location.host))
+    url = 'https://map.qa.openconceptlab.org'
+  if(window.location.host.match('app.v3.*.openconceptlab.org'))
+    url = window.location.origin.replace('//app.v3.', '//map.')
+
+  let referrerParams = `referrer=${window.location.href}`
+  if(isLoggedIn())
+    referrerParams += '?auth=true'
+
+
+  return `${url}/#${path || '/'}?${referrerParams}`
+}
+
+const SHARED_REPO_TABS = ['concepts', 'mappings', 'references', 'versions', 'about']
+const EXPANSION_SCOPED_TABS = ['concepts', 'mappings']
+const RESERVED_REPO_SEGMENTS = [...SHARED_REPO_TABS, ...RESERVED_ROUTE_KEYWORDS, 'edit', 'compare-versions']
+const SHARED_ROOT_PATHS = ['/search', '/imports', '/concepts/compare', '/mappings/compare']
+const SHARED_OWNER_PATHS = {users: ['settings'], orgs: ['edit']}
+
+const isRouteId = segment => Boolean(segment) && ID_REGEX.test(segment)
+
+export const toV2Path = path => {
+  const segments = (path || '').split('?')[0].split('/').filter(Boolean)
+
+  if(segments.length === 0)
+    return '/'
+
+  const fullPath = '/' + segments.join('/')
+  if(SHARED_ROOT_PATHS.includes(fullPath))
+    return fullPath
+
+  const [ownerType, owner, repoType, repo] = segments
+
+  if(!['users', 'orgs'].includes(ownerType) || !isRouteId(owner))
+    return '/'
+
+  const ownerHome = `/${ownerType}/${owner}`
+
+  if(segments.length === 2)
+    return ownerHome
+
+  if(segments.length === 3 && SHARED_OWNER_PATHS[ownerType].includes(segments[2]))
+    return fullPath
+
+  if(!['sources', 'collections'].includes(repoType) || !isRouteId(repo))
+    return ownerHome
+
+  let repoHome = `${ownerHome}/${repoType}/${repo}`
+  let rest = segments.slice(4)
+  let hasVersion = false
+
+  if(rest.length > 0 && !RESERVED_REPO_SEGMENTS.includes(rest[0])) {
+    if(!isRouteId(rest[0]))
+      return repoHome
+    repoHome = `${repoHome}/${rest[0]}`
+    rest = rest.slice(1)
+    hasVersion = true
+  }
+
+  let expansion = ''
+  if(rest[0] === 'expansions' && isRouteId(rest[1])) {
+    expansion = rest[1]
+    rest = rest.slice(2)
+  }
+
+  const expansionBase = expansion ? `${repoHome}${hasVersion ? '' : '/HEAD'}/expansions/${expansion}` : repoHome
+
+  if(rest.length === 0)
+    return expansionBase
+
+  if(!SHARED_REPO_TABS.includes(rest[0]))
+    return repoHome
+
+  const tabPath = `${EXPANSION_SCOPED_TABS.includes(rest[0]) ? expansionBase : repoHome}/${rest[0]}`
+
+  return isRouteId(rest[1]) ? `${tabPath}/${rest[1]}` : tabPath
+}
+
+export const toV2URL = path => {
+  let url = 'https://app.openconceptlab.org'
+  if(window.location.host?.includes('localhost'))
+    url = 'http://localhost:4000'
+  if(window.location.host.match('app.v3.*.openconceptlab.org'))
+    url = window.location.origin.replace('//app.v3.', '//app.')
+
+  let referrerParams = `referrer=${window.location.href}`
+  if(isLoggedIn())
+    referrerParams += '?auth=true'
+
+  return `${url}/#${toV2Path(path)}?${referrerParams}`
+}
+
+export const isMapperURL = url => {
+  if(!url)
+    return false
+  if(url.startsWith('http://localhost:4004'))
+    return true
+  if(!url.includes('.openconceptlab.org'))
+    return false
+  if(url.startsWith('https://map.'))
+    return true
+  return false
+}
+
+export const isV2URL = url => {
+  if(!url)
+    return false
+  if(url.startsWith('http://localhost:4000'))
+    return true
+  if(!url.includes('.openconceptlab.org'))
+    return false
+  if(url.startsWith('https://app.'))
+    return true
+  return false
+}
+
+export const isCommunitySiteURL = url => {
+  if(!url)
+    return false
+  if(url.startsWith('https://openconceptlab.org'))
+    return true
+  if(url.startsWith('http://localhost:4006'))
+    return true
+  if(!url.includes('.openconceptlab.org'))
+    return false
+  if(url.startsWith('https://preview.'))
+    return true
+  return false
+}
+
+export const isOtherOCLClientURL = referrer => referrer && (isMapperURL(referrer) || isV2URL(referrer) || isCommunitySiteURL(referrer))
+
+export const isRedirectingToLoginViaReferrer = location => {
+  const { search, hash } = location
+  const queryParams = new URLSearchParams(search)
+  const referrer = queryParams.get('referrer')
+  const parts = hash ? hash.split('?') : referrer?.split('?')
+  const params = parts?.length > 1 ? new URLSearchParams(parts[1]) : new URLSearchParams()
+  return isOtherOCLClientURL(referrer) && params.get('auth') === 'true'
+}
+
+export const toCamelCase = str => {
+  return str
+    .replace(/[-_\s]+(.)?/g, (_, c) => c ? c.toUpperCase() : '')
+    .replace(/^(.)/, (m) => m.toLowerCase());
+}
+
+export const isInWaitlist = () => getCurrentUser()?.auth_groups?.includes('mapper-waitlist')
+
+export const hashString = value => (value || '').split('').reduce((sum, char) => sum + char.charCodeAt(0), 0)

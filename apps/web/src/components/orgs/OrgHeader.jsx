@@ -1,0 +1,152 @@
+import React from 'react';
+import { useHistory } from 'react-router-dom'
+import { useTranslation } from 'react-i18next';
+
+import Paper from '@mui/material/Paper'
+import Button from '@mui/material/Button';
+import Menu from '@mui/material/Menu';
+import MenuItem from '@mui/material/MenuItem';
+import ListItemIcon from '@mui/material/ListItemIcon'
+import ListItemText from '@mui/material/ListItemText'
+import Typography from '@mui/material/Typography';
+import Divider from '@mui/material/Divider'
+import LocationIcon from '@mui/icons-material/LocationOnOutlined';
+import DownIcon from '@mui/icons-material/ArrowDropDown';
+import LinkIcon from '@mui/icons-material/LinkOutlined';
+import CompanyIcon from '@mui/icons-material/Business';
+import EditIcon from '@mui/icons-material/EditOutlined';
+import DeleteIcon from '@mui/icons-material/DeleteOutlined';
+
+import { formatWebsiteLink, currentUserHasAccess, isLoggedIn } from '../../common/utils'
+import Link from '../common/Link'
+import EntityAttributesDialog from '../common/EntityAttributesDialog'
+import FollowActionButton from '../common/FollowActionButton'
+import RepoIcon from '../repos/RepoIcon'
+import UserIcon from '../users/UserIcon';
+import OrgIcon from './OrgIcon';
+import EditMembers from './EditMembers'
+
+
+const Property = ({icon, value, label}) => {
+  return (label || value) ? (
+    <span style={{display: 'flex', alignItems: 'center', marginRight: '16px'}}>
+      <span style={{minWidth: 0, marginRight: '4px', display: 'flex'}}>
+        {icon}
+      </span>
+      <Typography sx={{maxWidth: '200px', whiteSpace: 'nowrap', textOverflow: 'ellipsis', overflow: 'hidden', fontSize: '14px', color: 'secondary.main'}} component="span">
+        {label || value}
+      </Typography>
+    </span>
+  ) : null
+}
+
+const OrgHeader = ({ org, members, onDeleteClick, canDelete, fetchMembers }) => {
+  const { t } = useTranslation()
+  const history = useHistory()
+
+  const [viewAll, setViewAll] = React.useState(false)
+  const [anchorEl, setAnchorEl] = React.useState(null);
+  const [editMembers, setEditMembers] = React.useState(false)
+
+  const style = org.logo_url ? {width: 'calc(100% - 112px)'} : {width: '100%'}
+  const iconStyle = {fontSize: '24px', color: 'surface.contrastText'}
+
+  const handleManageClick = event => anchorEl ? setAnchorEl(null) : setAnchorEl(event.currentTarget);
+  const handleNewRepoCreateClick = () => {
+    history.push(org.url + 'repos/new')
+  }
+
+  const extrasKeys = Object.keys(org.extras || {})
+  const hasCustomAttrs = extrasKeys.length > 0
+  const extrasFields = Object.fromEntries(extrasKeys.map(key => [`extras.${key}`, {label: key}]))
+
+  return (
+    <Paper component="div" className='col-xs-12' sx={{backgroundColor: 'surface.main', boxShadow: 'none', padding: '16px', borderRadius: '10px 10px 0 0', display: 'inline-flex'}}>
+      {
+        org.logo_url &&
+          <div className='col-xs-1' style={{width: '112px', paddingRight: '15px', paddingLeft: '0px', display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
+            <img src={org.logo_url} className='user-img-medium' style={{objectFit: 'cover'}} />
+          </div>
+      }
+      <div className='col-xs-12 padding-0' style={style}>
+        <div className='col-xs-8 padding-0' style={{margin: '4px 0 8px 0'}}>
+          <Typography sx={{fontSize: '28px', color: 'surface.dark', fontWeight: 600}}>{org.name}</Typography>
+        </div>
+        {
+          isLoggedIn() &&
+            <div className='col-xs-4 padding-0' style={{textAlign: 'right'}}>
+              <FollowActionButton iconButton entity={org} />
+              {
+                currentUserHasAccess() &&
+                  <Button endIcon={<DownIcon fontSize='inherit' />} variant='text' sx={{textTransform: 'none', color: 'surface.contrastText'}} onClick={handleManageClick}>
+                    {t('common.manage')}
+                  </Button>
+              }
+            </div>
+        }
+        <div className='col-xs-12 padding-0' style={{margin: '4px 0 8px 0', display: 'inline-flex'}}>
+          <Property icon={<OrgIcon strict noLink sx={iconStyle} />} value={org.id} />
+          <Property icon={<LocationIcon sx={iconStyle} />} value={org.location} />
+          <Property icon={<LinkIcon sx={iconStyle} />} value={org?.website} label={formatWebsiteLink(org?.website, {color: 'inherit'})} />
+          <Property icon={<CompanyIcon sx={iconStyle} />} value={org?.company} />
+          {hasCustomAttrs && <Property label={<Link sx={{fontSize: '14px'}} label={t('common.view_all_attributes')} onClick={() => setViewAll(true)} />} />}
+        </div>
+      </div>
+      {
+        hasCustomAttrs &&
+          <EntityAttributesDialog
+            fields={extrasFields}
+            entity={org}
+            open={viewAll}
+            onClose={() => setViewAll(false)}
+          />
+      }
+      <Menu
+        sx={{'.MuiPaper-root': {backgroundColor: 'surface.n94'}}}
+        anchorEl={anchorEl}
+        open={Boolean(anchorEl)}
+        onClose={handleManageClick}
+      >
+        <MenuItem sx={{padding: '8px 12px'}} href={`#/${org.url}repos/new`} onClick={handleNewRepoCreateClick}>
+          <ListItemIcon>
+            <RepoIcon noTooltip />
+          </ListItemIcon>
+          <ListItemText>{t('repo.new_repo')}</ListItemText>
+        </MenuItem>
+        <MenuItem sx={{padding: '8px 12px'}} onClick={() => setEditMembers(!editMembers)}>
+          <ListItemIcon>
+            <UserIcon />
+          </ListItemIcon>
+          <ListItemText>{t('org.edit_members')}</ListItemText>
+        </MenuItem>
+        <MenuItem sx={{padding: '8px 12px'}} href={`#/${org.url}edit`} onClick={() => history.push(`${org.url}edit`)}>
+          <ListItemIcon>
+            <EditIcon />
+          </ListItemIcon>
+          <ListItemText>{t('common.edit')}</ListItemText>
+        </MenuItem>
+        <Divider />
+        <MenuItem sx={{padding: '8px 12px'}} disabled={!canDelete} onClick={onDeleteClick}>
+          <ListItemIcon>
+            <DeleteIcon color='error' />
+          </ListItemIcon>
+          <ListItemText sx={{color: 'error.main'}}>{t('common.delete_label')}</ListItemText>
+        </MenuItem>
+      </Menu>
+      {
+        editMembers &&
+          <EditMembers
+            fetchMembers={fetchMembers}
+            org={org}
+            members={members}
+            onClose={() => {
+              setEditMembers(false)
+              setAnchorEl(null)
+            }}
+          />
+      }
+    </Paper>
+  )
+}
+
+export default OrgHeader;

@@ -1,0 +1,17 @@
+node_modules/
+src/stories/
+.storybook/
+.idea/
+dist/
+.env
+.DS_Store
+CLAUDE.md
+.superpowers/
+jsconfig.json
+
+# Local Docker Compose overrides
+docker-compose.override.yml
+
+# Added by code-review-graph
+.code-review-graph/
+.claude/

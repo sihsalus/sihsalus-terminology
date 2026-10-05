@@ -1,0 +1,276 @@
+import React from 'react';
+import { styled } from '@mui/material/styles';
+import { Chip, Popper, Box, InputBase, Typography } from '@mui/material';
+import { ArrowDropDown } from '@mui/icons-material';
+import Autocomplete, { autocompleteClasses } from '@mui/material/Autocomplete';
+import ClickAwayListener from '@mui/material/ClickAwayListener';
+import FormControl from '@mui/material/FormControl'
+import isEqual from 'lodash/isEqual'
+import GroupHeader from './GroupHeader'
+import GroupItems from './GroupItems'
+
+const StyledAutocompletePopper = styled('div')(({ theme }) => ({
+  [`& .${autocompleteClasses.paper}`]: {
+    boxShadow: 'none',
+    margin: 0,
+    color: 'inherit',
+    fontSize: 13,
+  },
+  [`& .${autocompleteClasses.listbox}`]: {
+    backgroundColor: '#1c2128',
+    padding: 0,
+    [`& .${autocompleteClasses.option}`]: {
+      minHeight: 'auto',
+      alignItems: 'flex-start',
+      padding: 8,
+      borderBottom: `1px solid  ${
+        '#30363d'
+      }`,
+      '&[data-focus="true"], &[data-focus="true"][aria-selected="true"]': {
+        backgroundColor: theme.palette.action.hover,
+      },
+      ...theme.applyStyles("light", {
+        borderBottom: `1px solid  ${' #eaecef'}`
+      })
+    },
+    ...theme.applyStyles("light", {
+      backgroundColor: '#fff'
+    })
+  },
+  [`&.${autocompleteClasses.popperDisablePortal}`]: {
+    position: 'relative',
+  },
+}));
+
+
+const PopperComponent = props => {
+  // eslint-disable-next-line no-unused-vars
+  const { disablePortal, anchorEl, open, ...other } = props;
+  return <StyledAutocompletePopper {...other} />;
+}
+
+
+const StyledPopper = styled(Popper)(({ theme }) => ({
+  border: `1px solid ${'#30363d'}`,
+  boxShadow: `0 8px 24px ${
+    'rgb(1, 4, 9)'
+  }`,
+  borderRadius: 6,
+  minWidth: 100,
+  maxWidth: 200,
+  zIndex: theme.zIndex.modal,
+  fontSize: 13,
+  color: '#c9d1d9',
+  backgroundColor: '#1c2128',
+  ...theme.applyStyles("light", {
+    border: `1px solid ${'#e1e4e8'}`,
+    boxShadow: `0 8px 24px ${'rgba(149, 157, 165, 0.2)'}`,
+    color: '#24292e',
+    backgroundColor: '#fff'
+  })
+}));
+
+
+const StyledInput = styled(InputBase)(({ theme }) => ({
+  padding: 10,
+  width: '100%',
+  borderBottom: `1px solid ${
+    '#30363d'
+  }`,
+  '& input': {
+    borderRadius: 4,
+    backgroundColor: '#0d1117',
+    padding: 8,
+    transition: theme.transitions.create(['border-color', 'box-shadow']),
+    border: `1px solid ${'#30363d'}`,
+    fontSize: 14,
+    '&:focus': {
+      boxShadow: `0px 0px 0px 3px ${
+        'rgb(12, 45, 107)'
+      }`,
+      borderColor: '#388bfd',
+      ...theme.applyStyles("light", {
+        boxShadow: `0px 0px 0px 3px ${'rgba(3, 102, 214, 0.3)'}`,
+        borderColor: '#0366d6'
+      })
+    },
+    ...theme.applyStyles("light", {
+      backgroundColor: '#fff',
+      border: `1px solid ${'#eaecef'}`
+    })
+  },
+  ...theme.applyStyles("light", {
+    borderBottom: `1px solid ${'#eaecef'}`
+  })
+}));
+
+
+class DropDownChip extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = {
+      anchorEl: null,
+      selected: null,
+      searchedValue: undefined,
+    };
+  }
+
+  componentDidMount() {
+    this.setDefault();
+  }
+
+  componentDidUpdate(prevProps) {
+    if(this.shouldSetDefault(prevProps))
+      this.setDefault();
+  }
+
+  shouldSetDefault(prevProps) {
+    const { defaultValue } = this.props;
+    const { selected } = this.state;
+    return !this.isSame(prevProps.defaultValue, defaultValue) && defaultValue && !this.isSame(selected, defaultValue);
+  }
+
+  isSame = (val1, val2) => val1 === val2 || val1?.replace('-', '')?.replace(' ', '')?.toLowerCase() === val2?.replace('-', '')?.replace(' ', '')?.toLowerCase()
+
+  setDefault() {
+    const { defaultValue } = this.props;
+    if(!isEqual(defaultValue, this.state.selected))
+      this.setState({selected: defaultValue});
+  }
+
+  setAnchorEl = event => {
+    if(event?.key !== 'Enter')
+      this.setState({anchorEl: document.getElementById(this.props.id || 'chip-list')});
+  };
+
+  close = () => this.setState({anchorEl: null, searchedValue: undefined});
+
+  afterSelect() {
+    this.close();
+    if(this.props.onChange)
+      this.props.onChange(this.state.selected);
+  }
+
+  renderGroup = params => (
+    <li style={{listStyle: 'none'}} key={params.key || params.group}>
+      <GroupHeader>{params.group}</GroupHeader>
+      <GroupItems>{params.children}</GroupItems>
+    </li>
+  )
+
+  filterByCodeOrName = (options, state) => {
+    const input = (state?.inputValue || '').trim().toLowerCase()
+    if(!input)
+      return options
+    return options.filter(
+      option => String(option).toLowerCase().includes(input) ||
+                String(this.props.optionDisplayName(option) || '').toLowerCase().includes(input)
+    )
+  }
+
+  handleSelect(value) {
+    if(value !== this.state.selected)
+      this.setState({selected: value}, this.afterSelect);
+  }
+
+  render() {
+    const { selected, anchorEl } = this.state;
+    const { disabled, options, sx, label, color, error, optionDisplayName, popperSx, groupBy } = this.props;
+    const open = Boolean(anchorEl)
+    return (
+      <FormControl sx={{...sx}}>
+        <Chip
+          id={this.props.id || "chip-list"}
+          label={selected}
+          deleteIcon={<ArrowDropDown />}
+          variant='outlined'
+          clickable
+          onDelete={this.setAnchorEl}
+          onClick={this.setAnchorEl}
+          color={error ? 'error' : (color || "primary")}
+          disabled={disabled}
+          sx={{height: "40px"}}
+        />
+        <StyledPopper id={open ? 'locale-selector' : undefined} open={open} anchorEl={anchorEl} placement="bottom-start" sx={popperSx}>
+        <ClickAwayListener onClickAway={this.close}>
+          <div>
+            <Box
+              sx={{
+                borderBottom: `1px solid #eaecef`,
+                padding: '8px 10px',
+                fontWeight: 600,
+              }}
+            >
+              {label}
+            </Box>
+            <Autocomplete
+              open
+              onClose={(event, reason) => {
+                if (reason === 'escape') {
+                  this.close();
+                }
+              }}
+              value={selected}
+              onChange={(event, newValue, reason) => {
+                if (
+                  event.type === 'keydown' &&
+                  event.key === 'Backspace' &&
+                  reason === 'removeOption'
+                ) {
+                  return;
+                }
+                if(newValue)
+                  this.handleSelect(newValue);
+              }}
+              PopperComponent={PopperComponent}
+              groupBy={groupBy}
+              renderGroup={groupBy ? this.renderGroup : undefined}
+              filterOptions={optionDisplayName ? this.filterByCodeOrName : undefined}
+              noOptionsText="No matches found"
+              renderOption={(props, option) => {
+                const { key, ...optionProps } = props
+                return (
+                  <li key={key || option} {...optionProps}>
+                    {
+                      optionDisplayName ?
+                        <Box sx={{flexGrow: 1, display: 'flex', alignItems: 'flex-start'}}>
+                          <Typography component='span' sx={{fontSize: 'inherit', color: 'text.secondary', minWidth: '32px', marginRight: '8px'}}>
+                            {option}
+                          </Typography>
+                          <Typography component='span' sx={{fontSize: 'inherit'}}>
+                            {optionDisplayName(option)}
+                          </Typography>
+                        </Box> :
+                      <Box
+                        sx={{
+                          flexGrow: 1,
+                          '& span': {
+                            color: '#586069',
+                          },
+                        }}
+                      >
+                        {option}
+                      </Box>
+                    }
+                  </li>
+                )
+              }}
+              options={options}
+              getOptionLabel={(option) => option}
+              renderInput={(params) => (
+                <StyledInput
+                  ref={params.slotProps.input.ref}
+                  inputProps={params.slotProps.htmlInput}
+                  autoFocus
+                />
+              )}
+            />
+          </div>
+        </ClickAwayListener>
+      </StyledPopper>
+      </FormControl>
+    );
+  }
+}
+
+export default DropDownChip;

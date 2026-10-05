@@ -1,0 +1,718 @@
+/*eslint no-process-env: 0*/
+/*global process*/
+import React from 'react';
+import { compact, map, isEmpty, flatten, values, keys, get, isArray, cloneDeep, isEqual, omit } from 'lodash';
+import TextField from '@mui/material/TextField'
+import IconButton from '@mui/material/IconButton'
+import Tooltip from '@mui/material/Tooltip'
+import CircularProgress from '@mui/material/CircularProgress'
+import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
+import CloseIconButton from '../common/CloseIconButton';
+import APIService from '../../services/APIService'
+import GAService from '../../services/GAService'
+import FormComponent, { CardSection } from '../common/FormComponent'
+import { sortValuesBySourceSummary } from '../repos/utils';
+import {
+  fetchDatatypes, fetchNameTypes, fetchDescriptionTypes, fetchConceptClasses, fetchLocales
+} from './utils';
+import { toParentURI, dropVersion } from '../../common/utils'
+import { OperationsContext } from '../app/LayoutContext';
+import Button from '../common/Button'
+import AutocompleteGroupByRepoSummary from '../common/AutocompleteGroupByRepoSummary'
+import LocaleForm from './LocaleForm'
+import ParentConceptsForm from './ParentConceptsForm'
+import ConceptDatatypeSection, { getDatatypeExtraKeys } from './ConceptDatatypeSection'
+import Breadcrumbs from '../common/Breadcrumbs'
+import QuotaDialog from '../common/QuotaDialog'
+import { getQuotaError } from '../common/quotaErrors'
+import CustomAttributesForm from '../common/CustomAttributesForm'
+import { required } from '../../common/validators';
+import { OCL_REQUEST_SOURCE } from '../../common/constants';
+
+const ANCHOR_UNDERLINE_STYLES = {textDecoration: 'underline', cursor: 'pointer'}
+
+const TOP_LEVEL_PROMPT_EXCLUSIONS = [
+  'uuid', 'type', 'url', 'version', 'version_url', 'versions_url', 'versioned_object_id', 'created_on',
+  'updated_on', 'created_by', 'updated_by', 'update_comment', 'comment', 'checksums', 'public_can_view',
+  'latest_source_version', 'owner_url', 'owner_type'
+];
+
+const NAME_PROMPT_EXCLUSIONS = ['uuid', 'checksum', 'type'];
+const DESCRIPTION_PROMPT_EXCLUSIONS = ['uuid', 'checksum', 'type'];
+const MAPPING_PROMPT_EXCLUSIONS = [
+  'uuid', 'checksums', 'type', 'url', 'version', 'version_url', 'versioned_object_id', 'versioned_object_url',
+  'created_on', 'updated_on', 'created_by', 'updated_by', 'update_comment', 'is_latest_version',
+  'version_created_on', 'version_updated_on', 'version_updated_by', 'public_can_view', 'latest_source_version',
+  'sort_weight', 'owner_type', 'from_source_owner_type', 'to_source_owner_type', 'from_source_version',
+  'to_source_version', 'from_concept_url', 'from_source_url', 'from_source_owner', 'to_source_url', 'to_source_owner'
+];
+
+class ConceptForm extends FormComponent  {
+  static contextType = OperationsContext;
+
+  constructor(props) {
+    super(props);
+    const mandatoryFieldStruct = this.getMandatoryFieldStruct()
+    const fieldStruct = this.getFieldStruct()
+    const autoAssignedId = Boolean(props.source?.autoid_concept_mnemonic)
+    this.state = {
+      locales: [],
+      conceptClasses: [],
+      datatypes: [],
+      nameTypes: [],
+      descriptionTypes: [],
+      usedExtras: [],
+      parent: null,
+      manualMnemonic: false,
+      manualExternalId: false,
+      originalParentConceptURLs: [],
+      parentConceptURLsLoaded: false,
+      parentConceptURLsChanged: false,
+      generatingChangeComment: false,
+      quotaError: null,
+      fields: {
+        id: {...mandatoryFieldStruct, validators: autoAssignedId ? [] : [required()]},
+        concept_class: {...mandatoryFieldStruct},
+        datatype: {...mandatoryFieldStruct},
+        external_id: {...fieldStruct},
+        extras: [],
+        comment: {...(props.edit ? mandatoryFieldStruct : fieldStruct)},
+        parent_concept_urls: [],
+        names: [
+          this.getNameStruct(true)
+        ],
+        descriptions: [
+        ]
+      }
+    }
+  }
+
+  // eslint-disable-next-line no-undef
+  getAIAssistantURL = () => window.AI_ASSISTANT_API_URL || process.env.AI_ASSISTANT_API_URL
+
+  sanitizeNameForPrompt = name => omit(name || {}, NAME_PROMPT_EXCLUSIONS)
+
+  sanitizeDescriptionForPrompt = description => omit(description || {}, DESCRIPTION_PROMPT_EXCLUSIONS)
+
+  sanitizeMappingForPrompt = mapping => omit(mapping || {}, MAPPING_PROMPT_EXCLUSIONS)
+
+  sanitizeConceptForPrompt = concept => {
+    const sanitized = omit(cloneDeep(concept || {}), TOP_LEVEL_PROMPT_EXCLUSIONS)
+
+    if (isArray(sanitized.names))
+      sanitized.names = sanitized.names.map(this.sanitizeNameForPrompt)
+
+    if (isArray(sanitized.descriptions))
+      sanitized.descriptions = sanitized.descriptions.map(this.sanitizeDescriptionForPrompt)
+
+    if (isArray(sanitized.mappings))
+      sanitized.mappings = sanitized.mappings.map(this.sanitizeMappingForPrompt)
+
+    return sanitized
+  }
+
+  normalizeNamesForComparison = names => (names || []).map(name => ({
+    locale: name?.locale || '',
+    name_type: name?.name_type || '',
+    locale_preferred: Boolean(name?.locale_preferred),
+    name: name?.name || '',
+    external_id: name?.external_id || '',
+  }))
+
+  normalizeDescriptionsForComparison = descriptions => (descriptions || []).map(description => ({
+    locale: description?.locale || '',
+    description_type: description?.description_type || '',
+    locale_preferred: Boolean(description?.locale_preferred),
+    description: description?.description || '',
+    external_id: description?.external_id || '',
+  }))
+
+  getComparableOriginalConcept = () => {
+    const concept = this.props.concept || {}
+
+    return {
+      id: concept.id || '',
+      concept_class: concept.concept_class || '',
+      datatype: concept.datatype || '',
+      external_id: concept.external_id || '',
+      extras: this.getExtrasWithDatatypeDefaults(concept.datatype, concept.extras),
+      parent_concept_urls: [...this.state.originalParentConceptURLs].sort(),
+      names: this.normalizeNamesForComparison(concept.names),
+      descriptions: this.normalizeDescriptionsForComparison(concept.descriptions),
+    }
+  }
+
+  getComparableCurrentConcept = () => {
+    const valuesMap = this.getConceptValues()
+
+    return {
+      id: valuesMap.id || '',
+      concept_class: valuesMap.concept_class || '',
+      datatype: valuesMap.datatype || '',
+      external_id: valuesMap.external_id || '',
+      extras: valuesMap.extras || {},
+      parent_concept_urls: [...this.getParentConceptURLs()].sort(),
+      names: this.normalizeNamesForComparison(valuesMap.names),
+      descriptions: this.normalizeDescriptionsForComparison(valuesMap.descriptions),
+    }
+  }
+
+  hasConceptChanges = () => !isEqual(this.getComparableOriginalConcept(), this.getComparableCurrentConcept())
+
+  getPromptConceptA = () => this.sanitizeConceptForPrompt({
+    ...this.props.concept,
+    parent_concept_urls: this.state.originalParentConceptURLs,
+  })
+
+  getPromptConceptB = () => {
+    const baseConcept = this.sanitizeConceptForPrompt(this.props.concept)
+    const formValues = this.getConceptValues()
+    delete formValues.comment
+
+    return this.sanitizeConceptForPrompt({
+      ...baseConcept,
+      ...formValues,
+      names: formValues.names || [],
+      descriptions: formValues.descriptions || [],
+      extras: formValues.extras || {},
+      parent_concept_urls: this.getParentConceptURLs(),
+      mappings: baseConcept.mappings,
+    })
+  }
+
+  generateChangeComment = async () => {
+    const { setAlert } = this.context;
+    const { t } = this.props
+    const aiAssistantURL = this.getAIAssistantURL()
+
+    if (!aiAssistantURL) {
+      setAlert({duration: 8000, message: t('concept.ai_assistant_not_configured'), severity: 'error'})
+      return
+    }
+
+    if (!this.hasConceptChanges())
+      return
+
+    this.setState({generatingChangeComment: true})
+
+    try {
+      const response = await APIService.new().request(
+        'POST',
+        {
+          variables: {
+            concept_a: this.getPromptConceptA(),
+            concept_b: this.getPromptConceptB(),
+          }
+        },
+        null,
+        {
+          url: `${aiAssistantURL}/prompts/concept-generate-change-comment/$invoke/`,
+          headers: {'X-OCL-Request-Source': OCL_REQUEST_SOURCE},
+        }
+      )
+
+      const output = (get(response, 'data.output') || '').trim()
+
+      if (!output)
+        throw new Error('No generated comment was returned.')
+
+      this.setFieldValue('comment', output)
+    } catch (error) {
+      const quotaError = getQuotaError(error)
+      if(quotaError) {
+        this.setState({quotaError})
+        return
+      }
+      const status = error?.response?.status
+      const message = status === 429 ?
+        t('concept.try_again_in_a_moment') :
+        (error?.response?.data?.detail || error?.response?.data?.error || error?.message || t('common.generic_error'))
+
+      setAlert({duration: 10000, message, severity: 'error'})
+    } finally {
+      this.setState({generatingChangeComment: false})
+    }
+  }
+
+  getNameStruct = (preferred=false) => {
+    const mandatoryFieldStruct = this.getMandatoryFieldStruct()
+    const fieldStruct = this.getFieldStruct()
+    return {
+      locale: {...mandatoryFieldStruct, value: this.props.source?.default_locale || this.state.parent?.default_locale || ''},
+      name_type: {...mandatoryFieldStruct, value: 'Fully-Specified'},
+      name: {...mandatoryFieldStruct},
+      external_id: {...fieldStruct},
+      locale_preferred: {...this.getFieldStruct(preferred)}
+    }
+  }
+
+  getDescriptionStruct = () => {
+    const mandatoryFieldStruct = this.getMandatoryFieldStruct()
+    const fieldStruct = this.getFieldStruct()
+
+    return {
+      locale: {...mandatoryFieldStruct, value: this.props.source?.default_locale || this.state.parent?.default_locale || ''},
+      description_type: {...mandatoryFieldStruct, value: 'Definition'},
+      description: {...mandatoryFieldStruct},
+      external_id: {...fieldStruct},
+      locale_preferred: {...this.getFieldStruct(false)}
+    }
+  }
+
+  componentDidMount() {
+    this.fetchExtrasUsed()
+    fetchDatatypes(data => this.setState({datatypes: sortValuesBySourceSummary(data, this.props.repoSummary, 'concepts.datatype')}))
+    fetchConceptClasses(data => this.setState({conceptClasses: sortValuesBySourceSummary(data, this.props.repoSummary, 'concepts.concept_class')}))
+    fetchNameTypes(data => this.setState({nameTypes: sortValuesBySourceSummary(data, this.props.repoSummary, 'concepts.name_type')}))
+    fetchDescriptionTypes(data => this.setState({descriptionTypes: data}))
+    fetchLocales(this.prepareLocales, true)
+    if(this.props.edit && this.props.concept) {
+      this.setFieldsForEdit(this.props.concept)
+      this.fetchParentConceptURLs()
+    }
+    if(this.props.copyFrom)
+      this.fetchConceptToCreate()
+    if(!this.props.edit) {
+      const newState = {...this.state}
+      newState.fields.names[0].locale.value = this.props.source.default_locale
+      this.setState(newState)
+    }
+    else
+      this.fetchParent()
+  }
+
+  setFieldsForEdit = instance => {
+    const { edit, copyFrom } = this.props;
+    const newState = {...this.state}
+    if(edit)
+      newState.fields.id.value = instance.id
+
+    newState.fields.concept_class.value = instance.concept_class
+    newState.fields.datatype.value = instance.datatype
+    newState.fields.external_id.value = copyFrom?.id ? '' : (instance.external_id || '')
+    let nameLocaleFields = ['locale', 'name_type', 'locale_preferred', 'name']
+    let descriptionLocaleFields = ['locale', 'description_type', 'locale_preferred', 'description']
+    if(!copyFrom?.id) {
+      nameLocaleFields.push('external_id')
+      descriptionLocaleFields.push('external_id')
+    }
+    if(!isEmpty(instance.names)) {
+      newState.fields.names = []
+      instance.names?.forEach(name => {
+        newState.fields.names.push({
+          locale: this.getMandatoryFieldStruct(name.locale),
+          name_type: this.getMandatoryFieldStruct(name.name_type),
+          locale_preferred: this.getFieldStruct(name.locale_preferred || false),
+          name: this.getMandatoryFieldStruct(name.name),
+          external_id: this.getFieldStruct(name.external_id || ''),
+        })
+      })
+    }
+    if(!isEmpty(instance.descriptions)) {
+      newState.fields.descriptions = []
+      instance.descriptions?.forEach(desc => {
+        newState.fields.descriptions.push({
+          locale: this.getMandatoryFieldStruct(desc.locale),
+          description_type: this.getMandatoryFieldStruct(desc.description_type),
+          locale_preferred: this.getFieldStruct(desc.locale_preferred || false),
+          description: this.getMandatoryFieldStruct(desc.description),
+          external_id: this.getFieldStruct(desc.external_id || ''),
+        })
+      })
+    }
+
+    newState.fields.extras = isEmpty(instance.extras) ? newState.fields.extras : map(instance.extras, (v, k) => ({key: k, value: v}))
+    newState.fields.parent_concept_urls = this.normalizeParentConceptURLs(instance.parent_concept_urls)
+    this.setState(newState);
+  }
+
+
+  fetchConceptToCreate = () => {
+    APIService.new().overrideURL(this.props.copyFrom.url).get(null, null, {includeParentConceptURLs: true}).then(response => this.setFieldsForEdit(response.data))
+  }
+
+  fetchParentConceptURLs = () => {
+    const { concept } = this.props
+    if(!concept?.url)
+      return
+    APIService.new().overrideURL(concept.url).get(null, null, {includeParentConceptURLs: true}).then(response => {
+      if(response?.status !== 200)
+        throw new Error(response?.data?.detail || response?.data?.error || response?.detail || response?.error || this.props.t('common.generic_error'))
+
+      const urls = this.normalizeParentConceptURLs(response?.data?.parent_concept_urls)
+      this.setState(state => ({
+        originalParentConceptURLs: urls,
+        parentConceptURLsLoaded: true,
+        fields: {
+          ...state.fields,
+          parent_concept_urls: state.parentConceptURLsChanged ? state.fields.parent_concept_urls : urls
+        }
+      }))
+    }).catch(error => {
+      const { setAlert } = this.context
+      setAlert({
+        duration: 10000,
+        message: error?.message || this.props.t('common.generic_error'),
+        severity: 'error'
+      })
+    })
+  }
+
+  normalizeParentConceptURLs = urls => compact(map(urls || [], dropVersion)).sort()
+
+  getParentConceptURLs = () => this.state.fields.parent_concept_urls || []
+
+  onParentConceptURLsChange = urls => this.setState(state => ({
+    parentConceptURLsChanged: true,
+    fields: {...state.fields, parent_concept_urls: this.normalizeParentConceptURLs(urls)}
+  }))
+
+  prepareLocales = _locales => {
+    this.setState({
+      locales: sortValuesBySourceSummary(compact(_locales), this.props.repoSummary, 'concepts.locale', true)
+    })
+  }
+
+  fetchExtrasUsed = () => {
+    let URL;
+    if(this.props.source)
+      URL = this.props.source.url
+    else if(this.props.concept)
+      URL = toParentURI(this.props.concept.url)
+
+    if(URL)
+      APIService.new().overrideURL(URL).appendToUrl('summary/').get(null, null, {verbose: true, distribution: 'concepts_extras'}).then(response => this.setState({usedExtras: response.data?.distribution?.concepts_extras || []}))
+  }
+
+  fetchParent = () => {
+    if(!this.props.source && this.props.concept) {
+      APIService.new().overrideURL(toParentURI(this.props.concept.url)).get().then(response => this.setState({parent: response.data}))
+    }
+  }
+
+  onAddNameLocale = () => {
+    const newState = {...this.state}
+    newState.fields.names.push(this.getNameStruct())
+    this.setState(newState, () => {
+      const el = document.getElementById('locales-names')
+      el.scrollTop = el.scrollHeight
+    })
+  }
+
+  onAddDescriptionLocale = () => {
+    this.setState({fields: {...this.state.fields, descriptions: [...this.state.fields.descriptions, this.getDescriptionStruct()]}}, () => {
+      const el = document.getElementById('locales-descriptions')
+      el.scrollTop = el.scrollHeight
+    })
+  }
+
+
+  toggleManualMnemonic = () => {
+    const newManualMnemonic = !this.state.manualMnemonic
+    const newState = {...this.state}
+    const autoAssignedId = Boolean(this.props.source?.autoid_concept_mnemonic) && !newManualMnemonic
+    newState.fields.id = {
+      ...newState.fields.id,
+      value: newManualMnemonic ? newState.fields.id.value : '',
+      validators: autoAssignedId ? [] : [required()],
+      errors: []
+    }
+    newState.manualMnemonic = newManualMnemonic
+    this.setState(newState)
+  }
+
+  onChange = (id, value) => this.setFieldValue(id, value)
+
+  getConceptValues = () => {
+    const result = this.getValues()
+    result.extras = this.getExtrasWithDatatypeDefaults(result.datatype, result.extras)
+    return result
+  }
+
+  getExtrasWithDatatypeDefaults = (datatype, extras) => {
+    const result = {...extras}
+    if(datatype === 'Text' && !result.text_format)
+      result.text_format = 'PLAIN'
+    if(datatype === 'Numeric' && result.allow_decimal == null)
+      result.allow_decimal = false
+    return result
+  }
+
+  onDatatypeExtraChange = (key, value) => {
+    this.setState(state => {
+      const extras = state.fields.extras.filter(extra => extra.key !== key)
+      if(value !== undefined && value !== '')
+        extras.push({key, value})
+      return {fields: {...state.fields, extras}}
+    })
+  }
+
+  handleSubmit = event => {
+    event.preventDefault()
+    event.stopPropagation()
+    const { edit } = this.props
+    const { fields } = this.state
+    const isValid = this.setAllFieldsErrors()
+    if(isValid) {
+      const { setAlert } = this.context;
+      const payload = this.getConceptValues()
+      if(!edit || this.state.parentConceptURLsLoaded || this.state.parentConceptURLsChanged)
+        payload.parent_concept_urls = this.getParentConceptURLs()
+      if(edit) {
+        payload.update_comment = fields.comment.value
+        delete payload.comment
+      }
+      GAService.recordUpsertEvent('Concept', edit)
+      const queryParams = {includeParentConceptURLs: true}
+      let service = APIService.new().overrideURL(this.props.source.url).appendToUrl('concepts/')
+      service = this.props.edit ?
+        service.appendToUrl(this.state.fields.id.value + '/').put(payload, null, {}, queryParams) :
+        service.post(payload, null, {}, queryParams)
+      service.then(response => {
+        if([200, 201].includes(response?.status)) {
+          setAlert({duration: 2000, message: this.props.edit ? this.props.t('concept.success_update') : this.props.t('concept.success_create'), severity: 'success'})
+          this.props.onClose(response.data)
+          window.location.hash = response.data.url
+        } else if (response?.status === 208) {
+          let error = get(response?.data, '__all__.0') || this.props.t('common.already_exists')
+          setAlert({duration: 10000, message: `${response.status}: ${error}`, severity: 'error'})
+        } else {
+          let error = compact(flatten(values(response)))
+          let field = get(keys(response), 0)
+          if(isArray(error) && error[0] && field)
+            error = error[0]
+          setAlert({duration: 10000, message: `${response.status || field || "Error"}: ${error || response.data?.error || response.data?.detail || (this.props.edit ? this.props.t("concept.error_update") : this.props.t("concept.error_create"))}`, severity: 'error'})
+          }
+        })
+    }
+  }
+
+
+  render() {
+    const { t, edit, repoSummary, repo, concept, onClose, source } = this.props
+    const { conceptClasses, datatypes, locales, nameTypes, descriptionTypes, fields, generatingChangeComment, manualMnemonic, quotaError } = this.state
+    const aiAssistantConfigured = Boolean(this.getAIAssistantURL())
+    const hasConceptChanges = edit && this.hasConceptChanges()
+    const canGenerateComment = edit && aiAssistantConfigured && hasConceptChanges && !generatingChangeComment
+    const generateCommentTooltip = !aiAssistantConfigured ?
+      t('concept.ai_assistant_not_configured') :
+      (!hasConceptChanges ? t('concept.make_change_before_generating') : t('common.generate_with_ai'))
+
+    return (
+      <div className='col-xs-12' style={{padding: '8px 16px 12px 16px', height: '100%', overflow: 'auto'}}>
+        <div className='col-xs-12 padding-0' style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px'}}>
+          <span>
+            <Breadcrumbs
+              ownerURL={repo.owner_url}
+              owner={repo.owner}
+              ownerType={repo.owner_type}
+              repo={repo.id}
+              repoType={repo.type}
+              id={concept?.id || fields.id.value || '[concept-id]'}
+              repoURL={repo?.url}
+              concept
+            />
+          </span>
+          <span>
+            <CloseIconButton color='secondary' onClick={onClose} />
+          </span>
+        </div>
+
+        <CardSection title={t('concept.form.concept_details.header')} sx={{p: 2, marginTop: 0}}>
+          <div className='col-xs-12 padding-0' style={{marginTop: '24px'}}>
+            {
+              !edit && source?.autoid_concept_mnemonic && !manualMnemonic ?
+                <span style={{fontWeight: '500', borderLeft: '3px solid lightgray', padding: '10px 5px'}}>
+                  {t('concept.form.id_auto_assign')} (<a style={ANCHOR_UNDERLINE_STYLES} onClick={this.toggleManualMnemonic}>{t('common.click_here')}</a> {t('concept.form.id_auto_assign_override')})
+                </span> :
+                <TextField
+                  fullWidth
+                  id='id'
+                  label={t('concept.form.id')}
+                  variant='outlined'
+                  required={!source?.autoid_concept_mnemonic || manualMnemonic}
+                  size='small'
+                  onChange={event => this.setFieldValue('id', event.target.value || '')}
+                  value={fields.id.value}
+                  disabled={edit}
+                  error={Boolean(fields.id.errors.length)}
+                  helperText={fields.id.errors[0]}
+                />
+            }
+          </div>
+          <div className='col-xs-12 padding-0' style={{marginTop: '16px'}}>
+            <div className='col-xs-6' style={{padding: '0 8px 0 0'}}>
+              <AutocompleteGroupByRepoSummary
+                freeSolo={repo?.custom_validation_schema !== "OpenMRS"}
+                id="concept_class"
+                options={conceptClasses}
+                label={t('concept.form.concept_class')}
+                onChange={this.setFieldValue}
+                value={fields.concept_class.value}
+                edit={edit}
+                required
+                error={Boolean(fields.concept_class.errors.length)}
+                helperText={fields.concept_class.errors[0]}
+              />
+            </div>
+            <div className='col-xs-6' style={{padding: '0 0 0 8px'}}>
+              <AutocompleteGroupByRepoSummary
+                freeSolo={repo?.custom_validation_schema !== "OpenMRS"}
+                id="datatype"
+                options={datatypes}
+                label={t('concept.form.datatype')}
+                onChange={this.setFieldValue}
+                value={fields.datatype.value}
+                edit={edit}
+                required
+                error={Boolean(fields.datatype.errors.length)}
+                helperText={fields.datatype.errors[0]}
+              />
+            </div>
+          </div>
+          <div className='col-xs-12 padding-0' style={{marginTop: '16px'}}>
+            <TextField
+              fullWidth
+              id='external_id'
+              label={t('concept.form.external_id')}
+              variant='outlined'
+              size='small'
+              onChange={event => this.setFieldValue('external_id', event.target.value || '')}
+              value={fields.external_id.value}
+            />
+          </div>
+        </CardSection>
+        <ConceptDatatypeSection
+          datatype={fields.datatype.value}
+          extras={this.getConceptValues().extras}
+          onChange={this.onDatatypeExtraChange}
+          t={t}
+        />
+        <CardSection title={t('concept.form.names.header')}>
+          <div id='locales-names' className='col-xs-12 padding-0' style={{maxHeight: '500px', overflow: 'auto'}}>
+            {
+              map(fields.names, (name, index) => {
+                return (
+                  <LocaleForm
+                    locales={locales}
+                    key={index}
+                    index={index}
+                    localeType='name'
+                    field={name}
+                    idPrefix={`names.${index}`}
+                    localeTypes={nameTypes}
+                    onChange={(id, value) => this.setFieldValue(id, value?.id ? value.id : value || '')}
+                    repoSummary={repoSummary}
+                    repo={repo}
+                    divider={index !== (fields.names.length - 1)}
+                  />
+                )})
+            }
+          </div>
+          <div className='col-xs-12 padding-0' style={{marginTop: '16px'}}>
+            <Button label={t('common.add')} sx={{backgroundColor: 'surface.s90'}} onClick={this.onAddNameLocale} />
+          </div>
+        </CardSection>
+        <CardSection title={t('concept.form.descriptions.header')}>
+          <div id='locales-descriptions' className='col-xs-12 padding-0' style={{maxHeight: '500px', overflow: 'auto'}}>
+            {
+              map(fields.descriptions, (description, index) => {
+                return (
+                  <LocaleForm
+                    locales={locales}
+                    key={index}
+                    index={index}
+                    localeType='description'
+                    field={description}
+                    idPrefix={`descriptions.${index}`}
+                    localeTypes={descriptionTypes}
+                    onChange={(id, value) => this.setFieldValue(id, value || '')}
+                    repoSummary={repoSummary}
+                    repo={repo}
+                    divider={index !== (fields.descriptions.length - 1)}
+                  />
+                )})
+            }
+          </div>
+          <div className='col-xs-12 padding-0' style={{marginTop: '16px'}}>
+            <Button label={t('common.add')} sx={{backgroundColor: 'surface.s90'}} onClick={this.onAddDescriptionLocale} />
+          </div>
+        </CardSection>
+        <CardSection title={t('concept.form.parent_concepts_header')}>
+          <div className='col-xs-12 padding-0' style={{marginTop: '24px'}}>
+            <ParentConceptsForm
+              t={t}
+              sourceURL={source?.url}
+              selfURL={edit ? concept?.url : undefined}
+              value={fields.parent_concept_urls}
+              onChange={this.onParentConceptURLsChange}
+            />
+          </div>
+        </CardSection>
+        <CardSection title={t('custom_attributes.label')}>
+          <CustomAttributesForm
+            extras={fields.extras} onChange={this.setExtrasValue} onAdd={this.onAddExtras}
+            excludedKeys={getDatatypeExtraKeys(fields.datatype.value)}
+            usedExtras={this.state.usedExtras}
+          />
+        </CardSection>
+        {
+          edit &&
+            <CardSection title={t('common.update_comment')}>
+              <div className='col-xs-12 padding-0' style={{marginTop: '0px'}}>
+                {
+                  aiAssistantConfigured &&
+                    <div style={{display: 'flex', justifyContent: 'flex-end', marginBottom: '8px'}}>
+                      <Tooltip arrow title={generateCommentTooltip}>
+                        <span>
+                          <IconButton
+                            color='secondary'
+                            size='small'
+                            onClick={this.generateChangeComment}
+                            disabled={!canGenerateComment}
+                            aria-label={t('concept.generate_comment_aria')}
+                          >
+                            {
+                              generatingChangeComment ?
+                                <CircularProgress size={18} color='inherit' /> :
+                                <AutoAwesomeIcon fontSize='small' />
+                            }
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    </div>
+                }
+                <TextField
+                  id="comment"
+                  label={t('common.comment')}
+                  variant="outlined"
+                  fullWidth
+                  onChange={event => this.setFieldValue('comment', event.target.value || '')}
+                  value={fields.comment.value}
+                  required
+                  rows={3}
+                  maxRows={4}
+                  multiline
+                  helperText={fields.comment.errors[0]}
+                  error={Boolean(fields.comment.errors[0])}
+                />
+              </div>
+            </CardSection>
+        }
+
+        <div className='col-xs-12 padding-0' style={{marginTop: '16px'}}>
+          <Button label={t('common.submit')} sx={{backgroundColor: 'surface.s90'}} onClick={this.handleSubmit} />
+        </div>
+        <QuotaDialog
+          open={Boolean(quotaError)}
+          onClose={() => this.setState({quotaError: null})}
+          meter={quotaError?.meter}
+          surface='tbv3_change_comment'
+          usage={quotaError?.usage}
+        />
+      </div>
+    )
+  }
+}
+
+export default ConceptForm;
