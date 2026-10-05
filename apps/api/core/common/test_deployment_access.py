@@ -3,10 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
 from django.test import SimpleTestCase, override_settings
 from rest_framework.exceptions import PermissionDenied
 
 from core.users.views import UserSignup
+from core.middlewares.middlewares import RequireAuthenticationMiddleware
 
 
 class DeploymentAccessTest(SimpleTestCase):
@@ -16,6 +18,18 @@ class DeploymentAccessTest(SimpleTestCase):
         """Access logs suffice; request and response bodies can contain credentials."""
         self.assertNotIn('core.middlewares.middlewares.CustomLoggerMiddleware', settings.MIDDLEWARE)
         self.assertNotIn('request_logging.middleware.LoggingMiddleware', settings.MIDDLEWARE)
+
+    @override_settings(APPROVED_ANONYMOUS_CLIENTS=set(), APPROVED_ANONYMOUS_API_KEYS=set(),
+                       APPROVED_ANONYMOUS_IPS=set())
+    def test_health_checker_header_does_not_bypass_authentication(self):
+        """Health endpoints remain available without trusting a client-supplied agent header."""
+        middleware = RequireAuthenticationMiddleware(lambda request: None)
+        request = SimpleNamespace(method='GET', path='/orgs/SIHSALUS/',
+                                  META={'HTTP_USER_AGENT': 'ELB-HealthChecker/2.0'})
+        with patch.object(middleware, 'get_authenticated_user', return_value=AnonymousUser()):
+            self.assertFalse(middleware.is_request_allowed(request))
+            request.path = '/healthcheck/'
+            self.assertTrue(middleware.is_request_allowed(request))
 
     @override_settings(ALLOW_SELF_REGISTRATION=False)
     def test_signup_disabled_before_processing(self):

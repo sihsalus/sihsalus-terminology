@@ -47,7 +47,7 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python manage.py check
       - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access --verbosity 2
-      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/services/storages/cloud/minio.py
+      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py
 
   images:
     needs: [api-checks, web-dependencies]
