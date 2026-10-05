@@ -1,0 +1,10 @@
+-r requirements-runtime.txt
+pylint==3.3.8
+colour_runner==0.1.1
+moto==5.0.27
+factory_boy==3.3.0
+coverage==7.3.0
+mock==5.1.0
+fakeredis[lua]==2.38.0 # tests run the capacity limit's Redis scripts without a Redis server
+lupa==2.8
+responses==0.25.0

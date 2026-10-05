@@ -12,12 +12,13 @@ https://docs.djangoproject.com/en/3.0/ref/settings/
 
 import os
 
+from django.core.exceptions import ImproperlyConfigured
+
 from corsheaders.defaults import default_headers
 from kombu import Queue, Exchange
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError  # pylint: disable=redefined-builtin
 from redis.retry import Retry
-from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from core import __version__
 
@@ -34,12 +35,14 @@ API_INTERNAL_BASE_URL = os.environ.get('API_INTERNAL_BASE_URL', 'http://api:8000
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/3.0/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = '=q1%fd62$x!35xzzlc3lix3g!s&!2%-1d@5a=rm!n4lu74&6)p'
-
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DEBUG') == 'TRUE'
 ENV = os.environ.get('ENVIRONMENT', 'development')
+DEBUG = os.environ.get('DEBUG') == 'TRUE'
+SECRET_KEY = os.environ.get('SECRET_KEY', '')
+if not SECRET_KEY:
+    if ENV in ['ci', 'dev', 'development']:
+        SECRET_KEY = 'development-only-never-use-in-a-deployed-environment'
+    else:
+        raise ImproperlyConfigured('SECRET_KEY is required outside development and CI.')
 
 ES_SYNC = True
 
@@ -60,7 +63,21 @@ APPROVED_ANONYMOUS_CLIENTS = get_set_from_env('APPROVED_ANONYMOUS_CLIENTS')
 APPROVED_ANONYMOUS_API_KEYS = get_set_from_env('APPROVED_ANONYMOUS_API_KEYS')
 APPROVED_ANONYMOUS_IPS = get_set_from_env('APPROVED_ANONYMOUS_IPS')
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = [host.strip() for host in os.environ.get('ALLOWED_HOSTS', '').split(',') if host.strip()]
+if not ALLOWED_HOSTS:
+    if ENV in ['ci', 'dev', 'development']:
+        ALLOWED_HOSTS = ['*']
+    else:
+        raise ImproperlyConfigured('ALLOWED_HOSTS is required outside development and CI.')
+
+# The deployment gateway owns TLS and must overwrite the forwarded protocol.
+if os.environ.get('TRUST_PROXY_HTTPS') == 'TRUE':
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in
+                        os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if origin.strip()]
+FORCE_SCRIPT_NAME = os.environ.get('API_PATH_PREFIX') or None
 
 CORS_ALLOW_HEADERS = default_headers + (
     'INCLUDEFACETS',
@@ -105,7 +122,9 @@ CORS_EXPOSE_HEADERS = (
     'X-OCL-Capacity-Suggested-Concurrency',
 )
 
-CORS_ORIGIN_ALLOW_ALL = True
+CORS_ORIGIN_ALLOW_ALL = ENV in ['ci', 'dev', 'development']
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in
+                        os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if origin.strip()]
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
 # Application definition
 
@@ -672,6 +691,9 @@ ENCODER = None
 LM_MODEL_NAME = None
 LM = None
 if ENV not in ['ci', 'demo'] and not NO_LM:
+    # Optional model packages are absent from the terminology runtime image.
+    from sentence_transformers import SentenceTransformer, CrossEncoder  # pylint: disable=import-error
+
     LM_MODEL_NAME = 'all-MiniLM-L6-v2'
     LM = SentenceTransformer(LM_MODEL_NAME)
     if not NO_ENCODER:

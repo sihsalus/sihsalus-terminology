@@ -1011,11 +1011,12 @@ def clean_term(term):
 
 
 def get_embeddings(txt):
-    if settings.ENV == 'ci':
+    """Leave vector fields empty when local semantic models are disabled."""
+    if settings.ENV == 'ci' or settings.NO_LM:
         return None
 
     model = settings.LM
     if not model:
-        from sentence_transformers import SentenceTransformer
+        from sentence_transformers import SentenceTransformer  # pylint: disable=import-error
         model = SentenceTransformer(settings.LM_MODEL_NAME)
     return model.encode(str(txt))

@@ -1,0 +1,3 @@
+-r requirements-runtime.txt
+sentence-transformers==5.4.0
+litellm==1.84.0
