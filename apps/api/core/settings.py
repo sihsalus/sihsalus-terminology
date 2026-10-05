@@ -283,6 +283,9 @@ DATABASES = {
         'PASSWORD': os.environ.get('DB_PASSWORD', 'Postgres123'),
         'HOST': os.environ.get('DB_HOST', 'db'),
         'PORT': os.environ.get('DB_PORT', 5432),
+        # Celery's Django lifecycle closes expired or unusable connections between tasks.
+        'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '0')),
+        'CONN_HEALTH_CHECKS': True,
     }
 }
 

@@ -56,3 +56,23 @@ UUID ni las reglas que rechazan nombres completos o preferidos duplicados.
 Responsable: mantenimiento de SIHSALUS Terminología. Seguimiento: PR #1.
 Revisar la adaptación cuando upstream unifique las representaciones aceptadas
 por la validación de tipos y por los consumidores de esa constante.
+
+## Conexiones de base de datos en workers
+
+La configuración importada no expone `CONN_MAX_AGE`. Con Django 5.2.17 y Celery
+5.4.0, el cierre por defecto hace que cada tarea breve vuelva a abrir su conexión
+PostgreSQL. Durante la migración, una muestra de cinco lecturas por modalidad
+registró medianas de 493 ms con conexiones nuevas y 23 ms al reutilizarlas;
+esta muestra identifica un coste y no demuestra el rendimiento de una cola
+completa.
+
+Se expone `DB_CONN_MAX_AGE` con valor predeterminado cero y se habilita la
+comprobación de salud nativa de Django. El despliegue puede limitar la
+reutilización a los workers prefork y conservar los límites de procesos,
+conexiones, CPU y memoria. La reutilización usa el ciclo nativo de Django y
+Celery. Referencia: [conexiones de Django 5.2](https://docs.djangoproject.com/en/5.2/ref/databases/#persistent-connections).
+
+Responsable: mantenimiento de SIHSALUS Terminología. Seguimiento: PR #1.
+Revisar esta configuración cuando upstream exponga una opción equivalente o
+cambie el ciclo de conexiones del worker; conservar la verificación de
+caducidad, recuperación tras desconexión y consumo antes de adoptarlo.

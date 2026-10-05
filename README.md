@@ -27,6 +27,14 @@ Redis (72 horas por defecto), conservando los informes de tareas persistentes
 en PostgreSQL. La ventana elegida debe superar el tiempo durante el cual una
 tarea coordinadora necesita los resultados de sus subtareas.
 
+`DB_CONN_MAX_AGE` permite reutilizar conexiones PostgreSQL durante un número
+limitado de segundos. Su valor predeterminado es cero. Los workers prefork pueden
+usar una ventana corta para reducir el coste de abrir una conexión por tarea;
+Django comprueba su salud y Celery cierra las conexiones caducadas o inutilizables
+entre tareas. El proceso web conserva el valor cero. Antes de habilitar esta
+opción, comprobar que PostgreSQL admite las conexiones de todos los procesos y
+hilos y medir el resultado con el mismo presupuesto de CPU y memoria.
+
 La operación se mantiene en
 [`sihsalus`](https://github.com/sihsalus/sihsalus/blob/feature/terminology-deployment/docs/operations/terminology.md):
 Compose, límites de recursos, HTTPS, credenciales privadas, importación y
