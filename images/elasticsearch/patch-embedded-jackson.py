@@ -25,8 +25,8 @@ def main():
         Path('/work', filename).write_bytes(data)
 
     archives = sorted(Path('/patched').rglob('*.jar'))
-    if len(archives) != 3:
-        raise ValueError('Expected three Elasticsearch provider archives.')
+    if len(archives) != 2:
+        raise ValueError('Expected two Elasticsearch provider archives.')
     for path in archives:
         target = path.with_suffix('.patched')
         with ZipFile(path) as original, ZipFile('/work/' + NEW) as replacement, \

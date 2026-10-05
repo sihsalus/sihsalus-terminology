@@ -4,14 +4,14 @@ FROM python:3.12-alpine AS jackson
 WORKDIR /work
 COPY --from=upstream /usr/share/elasticsearch/lib/elasticsearch-x-content-8.19.22.jar /patched/lib/elasticsearch-x-content-8.19.22.jar
 COPY --from=upstream /usr/share/elasticsearch/lib/tools/plugin-cli/elasticsearch-x-content-8.19.22.jar /patched/lib/tools/plugin-cli/elasticsearch-x-content-8.19.22.jar
-COPY --from=upstream /usr/share/elasticsearch/bin/elasticsearch-sql-cli-8.19.22.jar /patched/bin/elasticsearch-sql-cli-8.19.22.jar
 COPY jackson.sha256 patch-embedded-jackson.py /work/
 RUN python patch-embedded-jackson.py
 
 FROM upstream
 USER root
 RUN apt-get update && apt-get upgrade -y --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm /usr/share/elasticsearch/bin/elasticsearch-sql-cli /usr/share/elasticsearch/bin/elasticsearch-sql-cli-8.19.22.jar
 # Keep the supported server series and apply patch releases of its JSON libraries.
 COPY --from=jackson /patched/ /usr/share/elasticsearch/
 COPY --from=jackson /work/jackson-core-2.21.7.jar /work/jackson-databind-2.21.7.jar /work/jackson.sha256 /tmp/
