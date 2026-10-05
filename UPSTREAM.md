@@ -72,6 +72,13 @@ reutilización a los workers prefork y conservar los límites de procesos,
 conexiones, CPU y memoria. La reutilización usa el ciclo nativo de Django y
 Celery. Referencia: [conexiones de Django 5.2](https://docs.djangoproject.com/en/5.2/ref/databases/#persistent-connections).
 
+La tarea heredada `vacuum_and_analyze_db` modifica directamente el aislamiento
+del driver. Se comprobó que al restaurar el valor original deja su autocommit
+en `False` mientras Django conserva `True`. Antes de reutilizar conexiones,
+la tarea pasa a usar `set_autocommit` de Django y restaura el valor anterior en
+un bloque `finally`, también si el mantenimiento falla. Las transacciones
+gestionadas conservan la protección nativa que impide cambiar su autocommit.
+
 Responsable: mantenimiento de SIHSALUS Terminología. Seguimiento: PR #1.
 Revisar esta configuración cuando upstream exponga una opción equivalente o
 cambie el ciclo de conexiones del worker; conservar la verificación de
