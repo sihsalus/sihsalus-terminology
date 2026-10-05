@@ -373,8 +373,7 @@ def write_export_file(
         headers={'content-type': 'application/zip'}
     )
     logger.info(f'Upload response status: {str(upload_status_code)}')
-    uploaded_path = export_service.url_for(s3_key)
-    logger.info(f'Uploaded to {uploaded_path}.')
+    logger.info('Export uploaded.')
 
     if not get(settings, 'TEST_MODE', False):
         tmp_dir_path = file_path.replace('/export.zip', '')
