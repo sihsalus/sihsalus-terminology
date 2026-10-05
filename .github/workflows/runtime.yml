@@ -15,6 +15,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  web-dependencies:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: npm audit --package-lock-only --omit=dev --audit-level=high
+
   api-checks:
     runs-on: ubuntu-latest
     defaults:
@@ -38,7 +50,7 @@ jobs:
       - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/services/storages/cloud/minio.py
 
   images:
-    needs: api-checks
+    needs: [api-checks, web-dependencies]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 35

@@ -12,7 +12,6 @@ requests==2.33.0
 # Celery
 celery[redis]==5.4.0
 celery_once==3.0.1
-git+https://github.com/snyaggarwal/flower # use until https://github.com/mher/flower/issues/1231 issue is resolved
 redis==5.2.1
 django-redis==5.4.0 # needed for redis sentinel support
 kombu==5.4.2
@@ -21,7 +20,7 @@ drf-yasg==1.21.15
 git+https://github.com/snyaggarwal/django-queryset-csv
 ocldev==0.2.3
 # ocldev imports distutils, provided by setuptools on Python 3.12.
-setuptools==80.9.0
+setuptools==84.0.0
 tblib==2.0.0
 django-ordered-model==3.7.4
 django-health-check==3.17.0
@@ -43,3 +42,6 @@ elastic-transport==8.17
 strawberry-graphql==0.315.7
 strawberry-graphql-django==0.80.0
 graphql-core==3.2.12 # 3.3.0 drops graphql.execution.ExecutionContext, which strawberry-graphql 0.315.7 imports
+# Security floors for transitive HTTP and queue serialization dependencies.
+urllib3==2.8.0
+msgpack==1.2.3

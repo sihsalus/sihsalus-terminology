@@ -8,3 +8,4 @@ mock==5.1.0
 fakeredis[lua]==2.38.0 # tests run the capacity limit's Redis scripts without a Redis server
 lupa==2.8
 responses==0.25.0
+git+https://github.com/snyaggarwal/flower # use until https://github.com/mher/flower/issues/1231 issue is resolved

@@ -77,7 +77,7 @@ LABEL org.opencontainers.image.source="https://github.com/sihsalus/sihsalus-term
 ENV WEB_PORT=${WEB_PORT:-4002}
 
 # Add bash
-RUN apk add --no-cache bash
+RUN apk upgrade --no-cache && apk add --no-cache bash
 
 ADD start-prod.sh /
 RUN chmod +x start-prod.sh
