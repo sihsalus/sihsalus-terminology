@@ -43,3 +43,16 @@ monorepositorio. Retirar la adaptación al fijar una versión de ocldev que
 conserve las descripciones y comprobar nuevamente el recorrido ZIP → API →
 exportación. Actualizar solo la dependencia no resuelve el fallo en la versión
 consultada; copiar el conversor completo duplicaría lógica ajena a este cambio.
+
+## Tipos de nombres en catálogos importados
+
+La revisión inicial de la API acepta `Index-Term` en la validación de tipos de
+nombres, pero su lista compartida de términos de índice omite esa representación.
+Esto hace que la validación de unicidad trate algunos términos de búsqueda como
+nombres completos y rechace categorías válidas al importar procedimientos.
+Se añade esa representación a `LOCALES_SEARCH_INDEX_TERM`, sin cambiar nombres,
+UUID ni las reglas que rechazan nombres completos o preferidos duplicados.
+
+Responsable: mantenimiento de SIHSALUS Terminología. Seguimiento: PR #1.
+Revisar la adaptación cuando upstream unifique las representaciones aceptadas
+por la validación de tipos y por los consumidores de esa constante.
