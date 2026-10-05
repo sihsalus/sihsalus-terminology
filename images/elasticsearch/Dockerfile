@@ -1,14 +1,22 @@
-FROM docker.elastic.co/elasticsearch/elasticsearch:8.19.22@sha256:e98f9c3b09beb2fbb9eaf667d602df3f0e00bd3644138b8458dc17ba1a675595
+FROM docker.elastic.co/elasticsearch/elasticsearch:8.19.22@sha256:e98f9c3b09beb2fbb9eaf667d602df3f0e00bd3644138b8458dc17ba1a675595 AS upstream
+
+FROM python:3.12-alpine AS jackson
+WORKDIR /work
+COPY --from=upstream /usr/share/elasticsearch/lib/elasticsearch-x-content-8.19.22.jar /patched/lib/elasticsearch-x-content-8.19.22.jar
+COPY --from=upstream /usr/share/elasticsearch/lib/tools/plugin-cli/elasticsearch-x-content-8.19.22.jar /patched/lib/tools/plugin-cli/elasticsearch-x-content-8.19.22.jar
+COPY --from=upstream /usr/share/elasticsearch/bin/elasticsearch-sql-cli-8.19.22.jar /patched/bin/elasticsearch-sql-cli-8.19.22.jar
+COPY jackson.sha256 patch-embedded-jackson.py /work/
+RUN python patch-embedded-jackson.py
+
+FROM upstream
 USER root
 RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 # Keep the supported server series and apply patch releases of its JSON libraries.
-COPY jackson.sha256 /tmp/jackson.sha256
+COPY --from=jackson /patched/ /usr/share/elasticsearch/
+COPY --from=jackson /work/jackson-core-2.21.7.jar /work/jackson-databind-2.21.7.jar /work/jackson.sha256 /tmp/
 RUN set -eu; \
     cd /tmp; \
-    for artifact in jackson-core jackson-databind; do \
-      curl -fsSLO "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/$artifact/2.21.7/$artifact-2.21.7.jar"; \
-    done; \
     sha256sum -c jackson.sha256; \
     for artifact in jackson-core jackson-databind; do \
       find /usr/share/elasticsearch -type f -name "$artifact-2.21.6.jar" > /tmp/jackson-paths; \
