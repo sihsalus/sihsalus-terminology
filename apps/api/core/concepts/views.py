@@ -1208,6 +1208,10 @@ class MetadataToConceptsListView(CapacityLimitMixin, BaseAPIView):  # pragma: no
         rows = request.data.get('rows')
         semantic = request.query_params.get('semantic', None) in TRUTHY
         reranker = request.query_params.get('reranker', None) in TRUTHY
+        if semantic and settings.NO_LM:
+            raise Http400('Semantic search is disabled on this server.')
+        if reranker and (settings.NO_LM or settings.NO_ENCODER):
+            raise Http400('Semantic reranking is disabled on this server.')
         if not (isinstance(rows, list) and rows and (semantic or reranker)):
             return self.match(request)
         with self.capacity_gate(
@@ -1265,6 +1269,8 @@ class RerankConceptsListView(CapacityLimitMixin, BaseAPIView):
     permission_classes = (IsAuthenticated, CanUseMapper)
 
     def post(self, request, **kwargs):  # pylint: disable=unused-argument,too-many-return-statements
+        if settings.NO_LM or settings.NO_ENCODER:
+            raise Http400('Semantic reranking is disabled on this server.')
         user = self.request.user
         rows = self.request.data.get('rows', [])
         name_key = self.request.data.get('name_key', None) or 'display_name'

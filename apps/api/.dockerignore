@@ -22,4 +22,9 @@ __pycache__/*
 src/*
 **/test*.py
 htmlcov/
-
+core/samples/
+**/tests/
+.env
+.env.*
+docker-compose*
+**/AGENTS.md

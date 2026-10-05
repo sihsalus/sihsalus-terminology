@@ -1,0 +1,133 @@
+name: Terminology runtime
+
+on:
+  push:
+    branches: [main, feature/terminology-runtime]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminology-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  web-dependencies:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - run: npm audit --package-lock-only --omit=dev --audit-level=high
+
+  api-checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    env:
+      ENVIRONMENT: ci
+      NO_LM: 'TRUE'
+      NO_ENCODER: 'TRUE'
+      ANALYTICS_API: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: apps/api/requirements-*.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python manage.py check
+      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access core.middlewares.tests --verbosity 2
+      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py core/importers/export_converter.py
+
+  images:
+    needs: [api-checks, web-dependencies]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {app: api, context: apps/api}
+          - {app: web, context: apps/web}
+          - {app: postgres, context: images/postgres}
+          - {app: redis, context: images/redis}
+          - {app: elasticsearch, context: images/elasticsearch}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/sihsalus/terminology-${{ matrix.app }}:candidate-${{ github.sha }}-${{ github.run_id }}
+          build-args: SOURCE_COMMIT=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=terminology-${{ matrix.app }}
+          cache-to: type=gha,scope=terminology-${{ matrix.app }},mode=max
+      - name: Check runtime identity and size
+        env:
+          IMAGE: ghcr.io/sihsalus/terminology-${{ matrix.app }}@${{ steps.build.outputs.digest }}
+          APP: ${{ matrix.app }}
+        run: |
+          docker pull "$IMAGE"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")" = "$GITHUB_SHA"
+          size=$(docker image inspect --format '{{.Size}}' "$IMAGE")
+          test "$size" -lt 1610612736
+          if [ "$APP" = api ]; then
+            docker run --rm -e ENVIRONMENT=ci "$IMAGE" python manage.py check
+            docker run --rm "$IMAGE" python -c "import importlib.util; assert all(importlib.util.find_spec(name) is None for name in ('torch', 'sentence_transformers', 'pytest', 'pylint', 'pip'))"
+          fi
+          if [ "$APP" = postgres ]; then
+            docker run -d --name candidate --memory 640m -e POSTGRES_PASSWORD=synthetic-ci-only "$IMAGE"
+            for attempt in $(seq 1 30); do docker exec candidate pg_isready -U postgres && break || sleep 2; done
+            docker exec candidate psql -U postgres -c 'SELECT 1'
+          elif [ "$APP" = redis ]; then
+            docker run -d --name candidate --memory 256m "$IMAGE"
+            for attempt in $(seq 1 30); do docker exec candidate redis-cli ping && break || sleep 2; done
+            test "$(docker exec candidate redis-cli ping)" = PONG
+          elif [ "$APP" = elasticsearch ]; then
+            docker run -d --name candidate --memory 1536m -e discovery.type=single-node -e xpack.security.enabled=false -e 'ES_JAVA_OPTS=-Xms512m -Xmx512m' "$IMAGE"
+            for attempt in $(seq 1 60); do docker exec candidate curl -fsS http://localhost:9200/ && break || sleep 3; done
+            docker exec candidate curl -fsS -X PUT -H 'Content-Type: application/json' http://localhost:9200/synthetic/_doc/1 -d '{"name":"rodilla"}'
+            docker exec candidate curl -fsS http://localhost:9200/synthetic/_doc/1 | jq -e '._source.name == "rodilla"'
+          fi
+          printf '%s\n' "$IMAGE" > image-ref.txt
+          printf 'Image bytes: %s\n' "$size" >> "$GITHUB_STEP_SUMMARY"
+      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514
+        with:
+          version: v0.74.0
+          cache: true
+      - name: Scan candidate
+        env:
+          IMAGE: ghcr.io/sihsalus/terminology-${{ matrix.app }}@${{ steps.build.outputs.digest }}
+        run: trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --format json --output security.json "$IMAGE"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && steps.build.outcome == 'success'
+        with:
+          name: terminology-${{ matrix.app }}-${{ github.sha }}
+          path: |
+            image-ref.txt
+            security.json
+          if-no-files-found: error

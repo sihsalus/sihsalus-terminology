@@ -6,7 +6,6 @@ import UserMenu from '../users/UserMenu';
 import UserProfileButton from '../users/UserProfileButton';
 import AddMenuList from '../users/AddMenuList'
 import { isLoggedIn } from '../../common/utils';
-import ClassicTermBrowserButton from './ClassicTermBrowserButton';
 
 
 const HeaderControls = () => {
@@ -27,7 +26,6 @@ const HeaderControls = () => {
 
   return (
     <div className='col-xs-4 padding-0' style={{textAlign: 'right'}}>
-      <ClassicTermBrowserButton />
       {
         authenticated &&
           <>

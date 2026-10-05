@@ -10,10 +10,9 @@ from django.conf import settings
 from django.db.models import Case, When, IntegerField
 from elasticsearch_dsl import FacetedSearch, Q
 from pydash import compact, get, has, set_
-from sentence_transformers import CrossEncoder
-import torch
 
 from core.common.constants import ES_REQUEST_TIMEOUT
+from core.common.exceptions import Http400
 from core.common.utils import is_url_encoded_string
 
 
@@ -431,6 +430,8 @@ class Reranker:
     DEFAULT_ENCODER_PREDICT_LOCK = threading.Lock()
 
     def __init__(self, model_name=None):
+        if settings.NO_LM or settings.NO_ENCODER:
+            raise Http400('Semantic reranking is disabled on this server.')
         self.model_name = model_name
         self.encoder_state = self._get_encoder_state(self.model_name)
         self.encoder = self.encoder_state['encoder']
@@ -478,6 +479,7 @@ class Reranker:
         """Return the score activation required by the configured reranker model."""
         model_name = self.model_name or self.default_model
         if isinstance(model_name, str) and self._is_sigmoid_model(model_name):
+            import torch  # pylint: disable=import-error
             return torch.nn.Sigmoid()
         return None
 
@@ -565,6 +567,8 @@ class Reranker:
 
     @staticmethod
     def _load_encoder(model_name):
+        """Load optional model dependencies only for an enabled semantic request."""
+        from sentence_transformers import CrossEncoder  # pylint: disable=import-error
         return CrossEncoder(model_name, device="cpu", max_length=128)
 
     @staticmethod
@@ -613,6 +617,7 @@ class Reranker:
     @staticmethod
     def _release_memory():
         """Reclaim memory after the last cache reference to an evicted encoder has been dropped."""
+        import torch  # pylint: disable=import-error
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

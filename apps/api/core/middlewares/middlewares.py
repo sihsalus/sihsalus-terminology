@@ -123,7 +123,6 @@ class RequireAuthenticationMiddleware(BaseMiddleware):
     }
     forbidden_response = {
         'detail': 'Authentication required. Anonymous API access is disabled.',
-        'upgrade_url': 'https://openconceptlab.org/pricing',
     }
 
     def __call__(self, request):
@@ -143,7 +142,7 @@ class RequireAuthenticationMiddleware(BaseMiddleware):
 
     def is_request_allowed(self, request):
         """Return whether the current request can bypass authentication enforcement."""
-        if request.method == 'OPTIONS' or request.META.get('HTTP_USER_AGENT', '').startswith('ELB-HealthChecker'):
+        if request.method == 'OPTIONS':
             return True
 
         return self.is_exempt_path(request.path) or self.has_approved_client_header(request) or \

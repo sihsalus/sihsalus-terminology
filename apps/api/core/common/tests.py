@@ -1279,6 +1279,7 @@ class UtilsTest(OCLTestCase):
     @patch('core.common.utils.settings')
     def test_get_embeddings_loads_model_when_not_ci(self, settings_mock, sentence_transformer_mock):
         settings_mock.ENV = 'production'
+        settings_mock.NO_LM = False
         settings_mock.LM = None
         settings_mock.LM_MODEL_NAME = 'some-model'
         model_instance_mock = Mock()

@@ -1,0 +1,47 @@
+Django==5.2.17
+psycopg2==2.9.11
+gunicorn==22.0.0 #production server
+whitenoise==6.5.0 #serving swagger static files
+djangorestframework==3.17.2
+pydash==7.0.6
+django-cors-headers==4.9.0
+pyyaml==6.0.1
+boto3==1.36.10
+python-dateutil==2.8.2
+requests==2.33.0
+# Celery
+celery[redis]==5.4.0
+celery_once==3.0.1
+redis==5.2.1
+django-redis==5.4.0 # needed for redis sentinel support
+kombu==5.4.2
+django-elasticsearch-dsl==8.0
+drf-yasg==1.21.15
+git+https://github.com/snyaggarwal/django-queryset-csv
+ocldev==0.2.3
+# ocldev imports distutils, provided by setuptools on Python 3.12.
+setuptools==84.0.0
+tblib==2.0.0
+django-ordered-model==3.7.4
+django-health-check==3.17.0
+markdown==3.8.1
+django-request-logging==0.7.5
+django-cid==2.4
+django-dirtyfields==1.9.2
+jsonpath-ng==1.5.3
+mozilla-django-oidc==5.0.1
+django-celery-beat==2.9.0
+jsondiff==2.0.0
+django-silk==5.5.0
+azure-storage-blob==12.19.0
+fhir.resources==7.1.0
+ijson==3.2.3
+pydantic==2.10.6
+minio==7.2.9
+elastic-transport==8.17
+strawberry-graphql==0.315.7
+strawberry-graphql-django==0.80.0
+graphql-core==3.2.12 # 3.3.0 drops graphql.execution.ExecutionContext, which strawberry-graphql 0.315.7 imports
+# Security floors for transitive HTTP and queue serialization dependencies.
+urllib3==2.8.0
+msgpack==1.2.3

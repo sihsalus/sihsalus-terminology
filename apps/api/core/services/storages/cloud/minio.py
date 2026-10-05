@@ -2,11 +2,11 @@ import base64
 import mimetypes
 from io import BytesIO
 
+from django.conf import settings
 from minio import Minio, S3Error
 from minio.deleteobjects import DeleteObject
 from pydash import get
 
-from core import settings
 from core.services.storages.cloud.core import CloudStorageServiceInterface
 
 
@@ -19,6 +19,7 @@ class MinIO(CloudStorageServiceInterface):
         self.secret_key = settings.MINIO_SECRET_KEY
         self.bucket_name = settings.MINIO_BUCKET_NAME
         self.secure = settings.MINIO_SECURE
+        self.external_secure = settings.MINIO_EXTERNAL_SECURE
         self.client = Minio(endpoint=self.endpoint, access_key=self.access_key, secret_key=self.secret_key,
                             secure=self.secure)
         # Dedicated client for presigned URL generation.
@@ -28,8 +29,8 @@ class MinIO(CloudStorageServiceInterface):
         # All other operations use self.client (internal endpoint) since they run server-side.
         self._presign_client = Minio(
             endpoint=self.external_endpoint, access_key=self.access_key, secret_key=self.secret_key,
-            secure=self.secure, region=settings.MINIO_REGION
-        ) if self.external_endpoint != self.endpoint else self.client
+            secure=self.external_secure, region=settings.MINIO_REGION
+        ) if (self.external_endpoint, self.external_secure) != (self.endpoint, self.secure) else self.client
         # Ensure the bucket exists
         if not self.client.bucket_exists(self.bucket_name):
             self.client.make_bucket(self.bucket_name)
@@ -104,9 +105,8 @@ class MinIO(CloudStorageServiceInterface):
         """
         try:
             # Public URL for MinIO generally follows this format
-            url = f"http://{self.endpoint}/{self.bucket_name}/{file_path}"
-            if settings.ENV != 'development':
-                url = url.replace('http://', 'https://')
+            scheme = 'https' if self.external_secure else 'http'
+            url = f"{scheme}://{self.external_endpoint}/{self.bucket_name}/{file_path}"
             return url
         except S3Error as e:
             raise Exception(f"Could not generate public URL for file {file_path}. Error: {e}") from e  # pylint: disable=broad-exception-raised

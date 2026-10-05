@@ -884,14 +884,16 @@ def resources_report(start_date=None, end_date=None, email=None):  # pragma: no 
 
 @app.task(ignore_result=True)
 def vacuum_and_analyze_db():
+    """Run maintenance outside a transaction and restore Django's connection state."""
     from django.db import connections
     conn_proxy = connections['default']
-    conn_proxy.cursor()  # init connection field
-    conn = conn_proxy.connection
-    old_isolation_level = conn.isolation_level
-    conn.set_isolation_level(0)
-    conn.cursor().execute('VACUUM ANALYZE')
-    conn.set_isolation_level(old_isolation_level)
+    old_autocommit = conn_proxy.get_autocommit()
+    conn_proxy.set_autocommit(True)
+    try:
+        with conn_proxy.cursor() as cursor:
+            cursor.execute('VACUUM ANALYZE')
+    finally:
+        conn_proxy.set_autocommit(old_autocommit)
 
 
 @app.task(ignore_result=True)

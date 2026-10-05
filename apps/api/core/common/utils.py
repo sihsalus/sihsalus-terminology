@@ -373,8 +373,7 @@ def write_export_file(
         headers={'content-type': 'application/zip'}
     )
     logger.info(f'Upload response status: {str(upload_status_code)}')
-    uploaded_path = export_service.url_for(s3_key)
-    logger.info(f'Uploaded to {uploaded_path}.')
+    logger.info('Export uploaded.')
 
     if not get(settings, 'TEST_MODE', False):
         tmp_dir_path = file_path.replace('/export.zip', '')
@@ -1011,11 +1010,12 @@ def clean_term(term):
 
 
 def get_embeddings(txt):
-    if settings.ENV == 'ci':
+    """Leave vector fields empty when local semantic models are disabled."""
+    if settings.ENV == 'ci' or settings.NO_LM:
         return None
 
     model = settings.LM
     if not model:
-        from sentence_transformers import SentenceTransformer
+        from sentence_transformers import SentenceTransformer  # pylint: disable=import-error
         model = SentenceTransformer(settings.LM_MODEL_NAME)
     return model.encode(str(txt))

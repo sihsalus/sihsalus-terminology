@@ -1,6 +1,5 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next'
-import * as rssParser from 'react-native-rss-parser';
 import Card from '@mui/material/Card'
 import CardContent from '@mui/material/CardContent'
 import CardHeader from '@mui/material/CardHeader'
@@ -29,8 +28,21 @@ const CommunityBlog = ({ sx }) => {
   const fetchFeed = () => {
     fetch(window.location.href.includes('https://') ? 'https://openconceptlab.org/feed/' : '/api/feed/')
       .then(response => response.text())
-      .then(res => rssParser.parse(res))
-      .then(rss => setFeed(rss));
+      .then(xml => {
+        // Parse RSS as inert XML and expose only plain text and HTTP links.
+        const document = new DOMParser().parseFromString(xml, 'application/xml')
+        if (document.querySelector('parsererror')) throw new Error('Invalid RSS feed')
+        const items = Array.from(document.querySelectorAll('channel > item')).map(item => {
+          const link = item.querySelector('link')?.textContent?.trim() || ''
+          return {
+            title: item.querySelector('title')?.textContent || '',
+            published: item.querySelector('pubDate')?.textContent || '',
+            links: /^https?:\/\//i.test(link) ? [{url: link}] : [],
+          }
+        }).filter(item => item.links.length)
+        setFeed({items})
+      })
+      .catch(() => setFeed({items: []}));
   }
 
   React.useEffect(() => {

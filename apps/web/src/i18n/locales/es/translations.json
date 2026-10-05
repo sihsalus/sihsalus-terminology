@@ -115,6 +115,10 @@
     "name": "Marcadores"
   },
   "auth": {
+    "username": "Usuario",
+    "password": "Contraseña",
+    "managed_accounts": "Usa la cuenta proporcionada por el administrador.",
+    "local_sign_in_error": "No se pudo iniciar sesión. Revisa tus credenciales e inténtalo de nuevo; si persiste, contacta al administrador.",
     "sign_in": "Iniciar sesión",
     "sign_out": "Cerrar sesión",
     "register": "Registrar",

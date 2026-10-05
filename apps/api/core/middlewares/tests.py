@@ -91,7 +91,6 @@ class RequireAuthenticationMiddlewareTest(SimpleTestCase):
             json.loads(response.content),
             {
                 'detail': 'Authentication required. Anonymous API access is disabled.',
-                'upgrade_url': 'https://openconceptlab.org/pricing',
             }
         )
 
@@ -187,13 +186,13 @@ class RequireAuthenticationMiddlewareTest(SimpleTestCase):
 
         self.assertEqual(response.status_code, 200)
 
-    def test_allows_elb_health_checker_request(self):
-        """Infrastructure health checks should bypass the gate."""
+    def test_health_checker_header_cannot_access_catalogs(self):
+        """Client-supplied health-check headers do not grant catalog access."""
         response = self.middleware(
             self.make_request('/orgs/OCL/', HTTP_USER_AGENT='ELB-HealthChecker/2.0')
         )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 403)
 
     def test_allows_exempt_exact_paths(self):
         """Public root-level utility endpoints should remain anonymous."""
