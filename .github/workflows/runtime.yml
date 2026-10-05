@@ -60,7 +60,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        app: [api, web]
+        include:
+          - {app: api, context: apps/api}
+          - {app: web, context: apps/web}
+          - {app: postgres, context: images/postgres}
+          - {app: redis, context: images/redis}
+          - {app: elasticsearch, context: images/elasticsearch}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: docker/setup-buildx-action@v4
@@ -72,7 +77,7 @@ jobs:
       - uses: docker/build-push-action@v7
         id: build
         with:
-          context: apps/${{ matrix.app }}
+          context: ${{ matrix.context }}
           push: true
           platforms: linux/amd64
           tags: ghcr.io/sihsalus/terminology-${{ matrix.app }}:candidate-${{ github.sha }}-${{ github.run_id }}
@@ -93,6 +98,20 @@ jobs:
           if [ "$APP" = api ]; then
             docker run --rm -e ENVIRONMENT=ci "$IMAGE" python manage.py check
             docker run --rm "$IMAGE" python -c "import importlib.util; assert all(importlib.util.find_spec(name) is None for name in ('torch', 'sentence_transformers', 'pytest', 'pylint', 'pip'))"
+          fi
+          if [ "$APP" = postgres ]; then
+            docker run -d --name candidate --memory 640m -e POSTGRES_PASSWORD=synthetic-ci-only "$IMAGE"
+            for attempt in $(seq 1 30); do docker exec candidate pg_isready -U postgres && break || sleep 2; done
+            docker exec candidate psql -U postgres -c 'SELECT 1'
+          elif [ "$APP" = redis ]; then
+            docker run -d --name candidate --memory 256m "$IMAGE"
+            for attempt in $(seq 1 30); do docker exec candidate redis-cli ping && break || sleep 2; done
+            test "$(docker exec candidate redis-cli ping)" = PONG
+          elif [ "$APP" = elasticsearch ]; then
+            docker run -d --name candidate --memory 1536m -e discovery.type=single-node -e xpack.security.enabled=false -e 'ES_JAVA_OPTS=-Xms512m -Xmx512m' "$IMAGE"
+            for attempt in $(seq 1 60); do docker exec candidate curl -fsS http://localhost:9200/ && break || sleep 3; done
+            docker exec candidate curl -fsS -X PUT -H 'Content-Type: application/json' http://localhost:9200/synthetic/_doc/1 -d '{"name":"rodilla"}'
+            docker exec candidate curl -fsS http://localhost:9200/synthetic/_doc/1 | jq -e '._source.name == "rodilla"'
           fi
           printf '%s\n' "$IMAGE" > image-ref.txt
           printf 'Image bytes: %s\n' "$size" >> "$GITHUB_STEP_SUMMARY"
