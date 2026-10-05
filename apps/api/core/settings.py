@@ -604,16 +604,18 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = 25*1024*1024  # i.e. 25MBs before file is streamed
 # Mail settings
 EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
 EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', True) in ['true', True]
-EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', 'no-reply@openconceptlab.org')
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-EMAIL_PORT = os.environ.get('EMAIL_PORT', 587)
-COMMUNITY_EMAIL = os.environ.get('COMMUNITY_EMAIL', 'community@openconceptlab.org')
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'openconceptlab <noreply@openconceptlab.org>')
-ACCOUNT_EMAIL_SUBJECT_PREFIX = os.environ.get('ACCOUNT_EMAIL_SUBJECT_PREFIX', '[openconceptlab.org] ')
-ADMINS = (
-    ('Jonathan Payne', 'paynejd@gmail.com'),
-)
-REPORTS_EMAIL = os.environ.get('REPORTS_EMAIL', 'admin@openconceptlab.org')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_TIMEOUT = float(os.environ.get('EMAIL_TIMEOUT', 20))
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or 'webmaster@localhost')
+SERVER_EMAIL = os.environ.get('SERVER_EMAIL', DEFAULT_FROM_EMAIL)
+COMMUNITY_EMAIL = os.environ.get('COMMUNITY_EMAIL', EMAIL_HOST_USER)
+REPORTS_EMAIL = os.environ.get('REPORTS_EMAIL', EMAIL_HOST_USER)
+ACCOUNT_EMAIL_SUBJECT_PREFIX = os.environ.get('ACCOUNT_EMAIL_SUBJECT_PREFIX', '[SIHSALUS Terminología] ')
+# Error reports are opt-in and must never default to an upstream maintainer.
+ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', '')
+ADMINS = (('SIHSALUS Terminología', ADMIN_EMAIL),) if ADMIN_EMAIL else ()
 
 if ENV and ENV != 'development':
     # Serving swagger static files (inserted after SecurityMiddleware)
@@ -622,9 +624,9 @@ if ENV and ENV != 'development':
 EMAIL_SUBJECT_PREFIX = os.environ.get('EMAIL_SUBJECT_PREFIX', None)
 if not EMAIL_SUBJECT_PREFIX:
     if not ENV or ENV in ['production']:
-        EMAIL_SUBJECT_PREFIX = '[Openconceptlab.org] '
+        EMAIL_SUBJECT_PREFIX = '[SIHSALUS Terminología] '
     else:
-        EMAIL_SUBJECT_PREFIX = f'[Openconceptlab.org] [{ENV.upper()}]'
+        EMAIL_SUBJECT_PREFIX = f'[SIHSALUS Terminología] [{ENV.upper()}]'
 
 EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', None)
 if not EMAIL_BACKEND:
