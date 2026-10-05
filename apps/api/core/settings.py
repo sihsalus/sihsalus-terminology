@@ -526,7 +526,8 @@ CELERY_RESULT_BACKEND_TRANSPORT_OPTIONS = {
 }
 
 CELERY_RESULT_EXTENDED = True
-CELERY_RESULT_EXPIRES = 259200  # 72 hours
+# Completed task reports remain in PostgreSQL; bound their duplicate Redis cache.
+CELERY_RESULT_EXPIRES = int(os.environ.get('CELERY_RESULT_EXPIRES', '259200'))
 
 CELERY_BROKER_TRANSPORT_OPTIONS = {
     'visibility_timeout': 259200,  # 72 hours, the longest ETA

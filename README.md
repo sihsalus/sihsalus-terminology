@@ -22,6 +22,10 @@ arranque y analiza vulnerabilidades antes de aceptarlas. La API separa las
 dependencias de desarrollo y de IA de las necesarias para servir terminologías.
 Los modelos de IA están deshabilitados por defecto; las búsquedas textuales y
 los flujos de edición y publicación usan los servicios habituales de OCL.
+`CELERY_RESULT_EXPIRES` permite limitar la caché de resultados completados en
+Redis (72 horas por defecto), conservando los informes de tareas persistentes
+en PostgreSQL. La ventana elegida debe superar el tiempo durante el cual una
+tarea coordinadora necesita los resultados de sus subtareas.
 
 La operación se mantiene en
 [`sihsalus`](https://github.com/sihsalus/sihsalus/blob/feature/terminology-deployment/docs/operations/terminology.md):
