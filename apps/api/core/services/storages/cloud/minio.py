@@ -2,11 +2,11 @@ import base64
 import mimetypes
 from io import BytesIO
 
+from django.conf import settings
 from minio import Minio, S3Error
 from minio.deleteobjects import DeleteObject
 from pydash import get
 
-from core import settings
 from core.services.storages.cloud.core import CloudStorageServiceInterface
 
 
