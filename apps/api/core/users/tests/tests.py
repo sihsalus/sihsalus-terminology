@@ -4,6 +4,7 @@ from datetime import datetime
 from django.apps import apps
 from django.contrib.auth.models import Group, Permission
 from django.http import Http404
+from django.test import override_settings
 from mock import Mock, patch, ANY
 from rest_framework.authtoken.models import Token
 
@@ -545,6 +546,7 @@ class UserViewsAPITest(OCLAPITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('password', response.data)
 
+    @override_settings(ALLOW_SELF_REGISTRATION=True)
     @patch('core.users.views.AuthService.is_sso_enabled')
     def test_signup_perform_create_sso_enabled_400(self, is_sso_enabled_mock):
         is_sso_enabled_mock.return_value = True
