@@ -92,7 +92,7 @@ jobs:
           test "$size" -lt 1610612736
           if [ "$APP" = api ]; then
             docker run --rm -e ENVIRONMENT=ci "$IMAGE" python manage.py check
-            docker run --rm "$IMAGE" python -c "import importlib.util; assert all(importlib.util.find_spec(name) is None for name in ('torch', 'sentence_transformers', 'pytest', 'pylint'))"
+            docker run --rm "$IMAGE" python -c "import importlib.util; assert all(importlib.util.find_spec(name) is None for name in ('torch', 'sentence_transformers', 'pytest', 'pylint', 'pip'))"
           fi
           printf '%s\n' "$IMAGE" > image-ref.txt
           printf 'Image bytes: %s\n' "$size" >> "$GITHUB_STEP_SUMMARY"

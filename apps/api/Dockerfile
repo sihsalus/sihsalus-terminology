@@ -6,7 +6,8 @@ COPY requirements*.txt ./
 ARG REQUIREMENTS_FILE=requirements-runtime.txt
 RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --upgrade pip && \
-    /opt/venv/bin/pip install -r "$REQUIREMENTS_FILE"
+    /opt/venv/bin/pip install -r "$REQUIREMENTS_FILE" && \
+    /opt/venv/bin/pip uninstall -y pip
 
 FROM python:3.12-alpine AS runtime
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
