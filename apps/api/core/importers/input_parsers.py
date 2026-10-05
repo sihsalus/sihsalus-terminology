@@ -2,13 +2,13 @@ import csv
 import io
 from zipfile import ZipFile
 
-from ocldev.oclexporttoimportconverter import OCLExportToImportConverter
 from ocldev.oclcsvtojsonconverter import OclStandardCsvToJsonConverter
 from pydash import get, compact
 from rest_framework.exceptions import APIException
 
 from core.common.utils import is_zip_file, is_csv_file
 from core.importers.limits import download_import_file
+from core.importers.export_converter import OCLExportToImportConverter
 
 
 def csv_file_data_to_input_list(file_content):
