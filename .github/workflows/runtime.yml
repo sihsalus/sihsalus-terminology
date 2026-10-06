@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: terminology-${{ github.ref }}
+  group: terminology-${{ github.ref }}-${{ inputs.configuration == 'check' || inputs.configuration == 'apply' }}
   cancel-in-progress: false
 
 jobs:
@@ -108,15 +108,24 @@ jobs:
           fi
           if [ "$APP" = postgres ]; then
             docker run -d --name candidate --memory 640m -e POSTGRES_PASSWORD=synthetic-ci-only "$IMAGE"
-            for attempt in $(seq 1 30); do docker exec candidate pg_isready -U postgres && break || sleep 2; done
+            for ((attempt=0; attempt<30; attempt++)); do
+              if docker exec candidate pg_isready -U postgres; then break; fi
+              sleep 2
+            done
             docker exec candidate psql -U postgres -c 'SELECT 1'
           elif [ "$APP" = redis ]; then
             docker run -d --name candidate --memory 256m "$IMAGE"
-            for attempt in $(seq 1 30); do docker exec candidate redis-cli ping && break || sleep 2; done
+            for ((attempt=0; attempt<30; attempt++)); do
+              if docker exec candidate redis-cli ping; then break; fi
+              sleep 2
+            done
             test "$(docker exec candidate redis-cli ping)" = PONG
           elif [ "$APP" = elasticsearch ]; then
             docker run -d --name candidate --memory 1536m -e discovery.type=single-node -e xpack.security.enabled=false -e 'ES_JAVA_OPTS=-Xms512m -Xmx512m' "$IMAGE"
-            for attempt in $(seq 1 60); do docker exec candidate curl -fsS http://localhost:9200/ && break || sleep 3; done
+            for ((attempt=0; attempt<60; attempt++)); do
+              if docker exec candidate curl -fsS http://localhost:9200/; then break; fi
+              sleep 3
+            done
             docker exec candidate curl -fsS -X PUT -H 'Content-Type: application/json' http://localhost:9200/synthetic/_doc/1 -d '{"name":"rodilla"}'
             docker exec candidate curl -fsS http://localhost:9200/synthetic/_doc/1 | jq -e '._source.name == "rodilla"'
           fi
@@ -179,6 +188,26 @@ jobs:
         with:
           name: terminology-service-security
           path: reports/
+          if-no-files-found: error
+
+  release:
+    name: Collect verified release
+    needs: [images, operations]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: artifacts
+      - name: Create manifest from this run's successful image checks
+        run: |
+          python3 scripts/terminology/release.py manifest artifacts --commit "$GITHUB_SHA" --run "$GITHUB_RUN_ID" > release.json
+          printf 'Verified release: %s (run %s). Not deployed.\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: terminology-release-${{ github.sha }}
+          path: release.json
           if-no-files-found: error
 
   configuration:

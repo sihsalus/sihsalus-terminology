@@ -53,6 +53,11 @@ hilos y medir el resultado con el mismo presupuesto de CPU y memoria.
 La construcción y operación se mantienen en este repositorio. El workflow
 **Terminology runtime** verifica y publica imágenes; su opción manual
 `configuration=check|apply` sincroniza la configuración de la instalación.
+Cada ejecución completa entrega un artifact `terminology-release-<SHA>` con los
+digests de las cinco imágenes y del almacenamiento, vinculados a sus escaneos.
+El [procedimiento de actualización](docs/operations/terminology.md#actualización-y-recuperación)
+usa ese manifiesto para preparar la configuración y comprobar los contenedores.
+Publicar el artifact no despliega la versión.
 La [guía de operación](docs/operations/terminology.md) cubre Compose, HTTPS,
 límites, importación y backups. `gidis-terminology` descarga imágenes por digest.
 
