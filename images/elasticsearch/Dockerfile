@@ -27,6 +27,12 @@ RUN set -eu; \
       done < /tmp/jackson-paths; \
     done; \
     rm /tmp/jackson-*.jar /tmp/jackson.sha256 /tmp/jackson-paths
+# Keep the attachment module on a checksum-verified upstream jsoup release.
+ADD --checksum=sha256:e9d8c856856680427f096d156f02a414289985c930998fcb519ce5be39b42003 --chmod=644 \
+    https://repo.maven.apache.org/maven2/org/jsoup/jsoup/1.23.2/jsoup-1.23.2.jar \
+    /usr/share/elasticsearch/modules/ingest-attachment/jsoup-1.23.2.jar
+RUN test -f /usr/share/elasticsearch/modules/ingest-attachment/jsoup-1.21.2.jar \
+    && rm /usr/share/elasticsearch/modules/ingest-attachment/jsoup-1.21.2.jar
 USER 1000:0
 ARG SOURCE_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/sihsalus/sihsalus-terminology" \
