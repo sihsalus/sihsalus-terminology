@@ -25,7 +25,7 @@ operaciones SMTP a 20 segundos por defecto. `SERVER_EMAIL` hereda el remitente;
 `COMMUNITY_EMAIL` y `REPORTS_EMAIL` heredan la cuenta SMTP si no se especifican.
 No se incluyen destinatarios de OCL en estos valores predeterminados.
 Los informes automáticos de errores están deshabilitados salvo que se configure
-`ADMIN_EMAIL` explícitamente. Las credenciales se guardan únicamente en el
+`ADMIN_EMAIL` explícitamente. Las credenciales se administran en GitHub Secrets y en el
 archivo privado del servidor; para desactivar el envío se utiliza
 `EMAIL_BACKEND=django.core.mail.backends.dummy.EmailBackend`.
 
@@ -50,13 +50,22 @@ entre tareas. El proceso web conserva el valor cero. Antes de habilitar esta
 opción, comprobar que PostgreSQL admite las conexiones de todos los procesos y
 hilos y medir el resultado con el mismo presupuesto de CPU y memoria.
 
-La operación se mantiene en
-[`sihsalus`](https://github.com/sihsalus/sihsalus/blob/feature/terminology-deployment/docs/operations/terminology.md):
-Compose, límites de recursos, HTTPS, credenciales privadas, importación y
-backups. `gidis-terminology` descarga imágenes por digest y no realiza builds.
-La aceptación del despliegue requiere comprobar edición y publicación desde
-el navegador, reconciliar los catálogos y restaurar un backup en volúmenes
-aislados. No hay datos de pacientes ni credenciales en este repositorio.
+La construcción y operación se mantienen en este repositorio. El workflow
+**Terminology runtime** verifica y publica imágenes; su opción manual
+`configuration=check|apply` sincroniza la configuración de la instalación.
+La [guía de operación](docs/operations/terminology.md) cubre Compose, HTTPS,
+límites, importación y backups. `gidis-terminology` descarga imágenes por digest.
+
+Validar la operación sin iniciar contenedores:
+
+```sh
+python3 -B -m unittest discover -s tests/deploy -p 'test_*.py' -v
+python3 -B tests/deploy/terminology-compose.py
+```
+
+El segundo comando requiere Docker Compose, sin daemon. Los Compose dentro de
+`apps/` pertenecen a los proyectos upstream; la instalación SIHSALUS usa
+`docker-compose.terminology.yml` en la raíz.
 
 Consulta [UPSTREAM.md](UPSTREAM.md) para las revisiones importadas y el proceso
 de actualización. Los catálogos de terceros, incluidos los subconjuntos de
