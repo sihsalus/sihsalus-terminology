@@ -112,7 +112,7 @@ mantener desactivados los informes de errores.
 
 La clave SSH es exclusiva de esta integración. Instalar su clave pública en
 `authorized_keys` con `restrict` y un comando forzado que ejecute
-`python3 /ruta/sihsalus/scripts/terminology/sync-github-config.py receive`.
+`python3 /ruta/sihsalus-terminology/scripts/terminology/sync-github-config.py receive`.
 No copiar una clave personal ni las claves de DEV/QLTY. Obtener la clave pública
 del host mediante una conexión previamente verificada y fijarla en
 `TERMINOLOGY_SSH_KNOWN_HOSTS`; el cliente exige comprobación estricta.
@@ -254,9 +254,83 @@ nueva aceptación clínica ni incorpora códigos SNOMED CT adicionales.
 
 ## Actualización y recuperación
 
+### De CI a la versión instalada
+
+1. Elegir una ejecución **completa y satisfactoria** de `Terminology runtime`
+   sobre el SHA de `main` aprobado. El job `Collect verified release` solo corre
+   cuando las cinco imágenes y la operación han pasado sus verificaciones.
+   Su artifact `terminology-release-<SHA>` contiene `release.json`: SHA fuente,
+   ejecución y seis digests. Los escaneos originales permanecen en los artifacts
+   de esa misma ejecución. Descargar el manifiesto desde Actions; no reconstruirlo
+   juntando resultados de ejecuciones distintas.
+2. Guardar fuera de la VM el manifiesto, la evidencia de CI y el respaldo cifrado
+   recuperable. Los artifacts de Actions caducan. El JSON no está firmado y su
+   validez depende de obtenerlo de esa ejecución aprobada; editarlo o ejecutar
+   `manifest` localmente no demuestra que CI haya pasado.
+3. Revisar las migraciones y reservar una ventana sin importaciones ni edición.
+   Instalar ese SHA en el checkout operativo limpio. Registrar el SHA operativo
+   anterior antes de actualizar el checkout. No cambiar el nombre de proyecto
+   Compose, los volúmenes ni la ubicación del checkout que usan SSH y el timer.
+4. En el servidor, preparar un candidato privado. El comando conserva los
+   secretos y los parámetros existentes y cambia únicamente SHA y cinco imágenes.
+   Exige el checkout del SHA fuente, digests inmutables, almacenamiento coincidente
+   y un destino nuevo. No inicia contenedores ni modifica la configuración instalada.
+
 ```sh
-bash scripts/deploy/deploy-terminology.sh /ruta/privada/.env.terminology update /ruta/privada/backups
+set -euo pipefail
+umask 077
+cd /home/gidis-f1/sihsalus-terminology
+test -z "$(git status --porcelain)"
+journal=$(mktemp -d "$PWD/.env.terminology-state/release-XXXXXXXX")
+# /ruta/privada/release.json es el artifact descargado de la ejecución aprobada.
+install -m 600 /ruta/privada/release.json "$journal/release.json"
+cp .env.terminology-state/active-distro-commit "$journal/previous-operations-commit"
+cmp .env.terminology .env.terminology-state/active.env
+cp .env.terminology "$journal/previous.env"
+python3 scripts/terminology/release.py prepare \
+  "$journal/release.json" "$PWD/.env.terminology" "$journal/target.env"
 ```
+
+5. Tras revisar el candidato en privado, instalarlo y usar el despliegue existente.
+   Este conserva `active.env`, hace el backup y comprueba la revisión OCI descargada
+   antes de aplicar migraciones. Conservar el journal aunque el comando falle.
+
+```sh
+install -m 600 "$journal/target.env" .env.terminology
+bash scripts/deploy/deploy-terminology.sh "$PWD/.env.terminology" update \
+  /home/gidis-f1/terminology-backups > "$journal/deploy.log" 2>&1
+python3 scripts/terminology/release.py verify \
+  "$journal/release.json" "$PWD/.env.terminology" > "$journal/runtime.json"
+```
+
+6. `verify` exige los nueve contenedores, sus digests y revisiones, cero reinicios
+   y ausencia de OOM; comprueba los cinco healthchecks existentes. Worker,
+   importer, scheduler y storage solo acreditan proceso en ejecución. Completar
+   la sección **Aceptación**: HTTPS, autenticación, permisos, búsqueda, edición,
+   publicación, exportación y recuperación. Un contenedor sano no demuestra que
+   esos flujos funcionen. Registrar resultado, SHA, fecha y entorno por separado.
+7. Conservar fuera de la VM el respaldo cifrado nuevo y el journal privado.
+   `active-distro-commit` registra el código de operación; `source_commit` del
+   manifiesto identifica las imágenes. `active.env` indica configuración arrancada,
+   no aceptación funcional. La sincronización de GitHub Secrets sigue siendo un
+   flujo separado que conserva las imágenes instaladas.
+
+### Recuperar una actualización fallida
+
+Revisar primero el journal, `backup.log` y `migration-plan.log`. No reintentar ni
+restaurar automáticamente por el resultado de un healthcheck.
+
+- Si se detuvo **antes de cambiar contenedores o datos**, comparar las imágenes
+  ejecutadas con el manifiesto anterior y restaurar la configuración privada
+  anterior. Recuperar también el checkout operativo registrado si había cambiado.
+- Si arrancó una migración, determinar qué llegó a aplicarse. Restaurar una imagen
+  anterior exige compatibilidad comprobada con ese esquema. Si no está demostrada,
+  restaurar PostgreSQL, uploads y objetos del mismo backup en volúmenes nuevos,
+  usando su configuración e imágenes registradas; validar antes de cambiar el
+  servicio activo. Conservar intactos los volúmenes originales.
+- Comprobar los nueve servicios y repetir la aceptación de la revisión recuperada.
+  Registrar el backup, los SHA de operación e imágenes y el resultado. Una copia
+  cifrada verificada no sustituye el ensayo de restauración.
 
 La actualización conserva la configuración anterior registrada en `active.env`,
 ejecuta un respaldo cifrado, guarda el plan de migraciones y aplica únicamente
@@ -289,6 +363,30 @@ no comienza si quedan menos de 10 GiB libres para proteger la capacidad del host
 checkout ya tenga una actualización pendiente. Las instalaciones anteriores a
 este registro deben establecerlo a partir de su despliegue verificado antes
 del siguiente respaldo.
+
+## Consumo observado
+
+Referencia del 5 de octubre de 2026, imágenes `e1bdda3b`, operación `f4ce800e`:
+cinco muestras consecutivas durante consultas de lectura por HTTPS, sin importar
+ni publicar datos. No es una prueba de carga.
+
+| Medida | Resultado |
+| --- | --- |
+| Memoria del conjunto, incluido caché del cgroup | 2,18 GiB; máximo histórico del cgroup 3,03 GiB |
+| Elasticsearch, según `docker stats` | aproximadamente 902 MiB; heap configurado de 512 MiB |
+| Disco libre | 20,0 GiB de 38,2 GiB |
+| Listado autenticado de fuentes, cinco solicitudes | HTTP 200; 0,20–0,26 s |
+| Búsqueda autenticada de conceptos, cinco solicitudes | HTTP 200; 0,48–0,84 s |
+| Listado sin autenticación | HTTP 403 |
+| Eventos OOM del cgroup | 0 |
+
+Conservar los límites actuales: estas muestras no miden el pico durante una
+importación, indexación, publicación o backup. Antes de reducir heap o procesos,
+comparar la misma carga sintética en una instalación aislada, incluyendo tiempo
+hasta terminar las tareas, latencia de búsqueda, conexiones y eventos de memoria.
+Medir con `docker stats --no-stream`, `docker system df` y
+`systemctl show sihsalus-terminology.slice -p MemoryCurrent -p MemoryPeak`.
+El máximo del cgroup pertenece a su ciclo de vida, no solo a la ventana medida.
 
 ## Traslado desde el repositorio de distribución
 
