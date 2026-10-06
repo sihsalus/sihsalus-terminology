@@ -205,6 +205,7 @@ jobs:
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           path: artifacts
+          pattern: terminology-*
       - name: Create manifest from this run's successful image checks
         run: |
           python3 scripts/terminology/release.py manifest artifacts --commit "$GITHUB_SHA" --run "$GITHUB_RUN_ID" > release.json
