@@ -16,6 +16,21 @@ suscripción de OCL Online ni enlaces a un navegador clásico que no está insta
 
 ## Construcción y despliegue
 
+### Correo de la instalación
+
+El envío SMTP usa `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_USE_TLS`, `EMAIL_HOST_USER`
+y `EMAIL_HOST_PASSWORD`. Configurar `DEFAULT_FROM_EMAIL` con un remitente
+autorizado por el proveedor. `EMAIL_TIMEOUT` limita la espera de conexión y
+operaciones SMTP a 20 segundos por defecto. `SERVER_EMAIL` hereda el remitente;
+`COMMUNITY_EMAIL` y `REPORTS_EMAIL` heredan la cuenta SMTP si no se especifican.
+No se incluyen destinatarios de OCL en estos valores predeterminados.
+Los informes automáticos de errores están deshabilitados salvo que se configure
+`ADMIN_EMAIL` explícitamente. Las credenciales se guardan únicamente en el
+archivo privado del servidor; para desactivar el envío se utiliza
+`EMAIL_BACKEND=django.core.mail.backends.dummy.EmailBackend`.
+
+### Imágenes
+
 El workflow **Terminology runtime** construye imágenes inmutables de API,
 navegador, PostgreSQL, Redis y Elasticsearch en GitHub Actions; comprueba el
 arranque y analiza vulnerabilidades antes de aceptarlas. La API separa las
