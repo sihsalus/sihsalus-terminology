@@ -32,6 +32,7 @@ import map from 'lodash/map';
 
 import { formatDateTime } from '../../common/utils';
 import APIService from '../../services/APIService';
+import { signedExportDownload } from '../../services/signedExportDownload';
 import { OperationsContext } from '../app/LayoutContext';
 import { downloadBlob } from './VersionExportDialog';
 import { formatError, getVersionLabel, isHeadVersion } from './versionsTab.styles';
@@ -59,7 +60,8 @@ const ExternalExportsDialog = ({ version, open, onClose, canEdit, onChange }) =>
   const download = externalExport => {
     const url = externalExport.url || `${version.version_url}export/${externalExport.key}/`;
     setBusyKey(externalExport.key);
-    APIService.new().overrideURL(url).request('GET', null, null, { responseType: 'blob' })
+    APIService.new().overrideURL(url).request('GET', null, null, { query: { noRedirect: true } })
+      .then(signedExportDownload)
       .then(response => {
         if(response.status === 200) downloadBlob(response, externalExport.filename || externalExport.key);
         else setAlert({ severity: 'error', message: t('repo.could_not_download_external_export') });
