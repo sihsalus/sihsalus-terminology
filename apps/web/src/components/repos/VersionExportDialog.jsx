@@ -15,6 +15,7 @@ import get from 'lodash/get';
 
 import APIService from '../../services/APIService';
 import GAService from '../../services/GAService';
+import { signedExportDownload } from '../../services/signedExportDownload';
 import { OperationsContext } from '../app/LayoutContext';
 import { formatError, getVersionLabel, getVersionURL } from './versionsTab.styles';
 
@@ -47,7 +48,8 @@ const VersionExportDialog = ({ version, open, onClose, titleKey = 'repo.export_s
     setLoading(true);
     setState(null);
     setError('');
-    APIService.new().overrideURL(exportURL).request('GET', null, null, { responseType: 'blob' })
+    APIService.new().overrideURL(exportURL).request('GET', null, null, { query: { noRedirect: true } })
+      .then(signedExportDownload)
       .then(response => {
         if(response.status === 200) {
           GAService.recordActionEvent('Version Export', 'export_version_download', version?.short_code || version?.id, {
