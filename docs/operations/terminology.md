@@ -31,6 +31,48 @@ digest; no se compila en `gidis-terminology`.
    `${TERMINOLOGY_HOST}` y `${TERMINOLOGY_API_HOST}`: las variables de Nginx deben permanecer literales.
    Conservar `certbot.timer` y verificar que renueva el certificado.
 
+## Cambio de dominio
+
+La instalación verificada el 7 de octubre de 2026 usa
+`sih-terminology.inf.pucp.edu.pe` para el navegador y
+`api.gidis-terminology.duckdns.org` para la API. Cada nombre se configura mediante
+`TERMINOLOGY_HOST` y `TERMINOLOGY_API_HOST`, respectivamente; no es necesario
+esperar un segundo alias institucional para usar el primero.
+
+Antes de cambiar el dominio, comprobar su resolución pública hacia el host y
+guardar fuera de la VM un respaldo cifrado de la configuración y los certificados,
+con la clave por separado. Emitir el certificado con todos los nombres que Nginx
+seguirá atendiendo. Aplicar los hosts mediante el procedimiento de actualización,
+que conserva las credenciales y los volúmenes. Esto actualiza las URLs públicas de
+la aplicación y el origen CORS permitido; mantener también los mismos valores en
+las Variables del entorno `terminology` de GitHub para futuras sincronizaciones.
+
+Generar Nginx desde su plantilla sustituyendo solo los dos hosts, validar con
+`nginx -t` y recargar después de comprobar el arranque. La plantilla genera
+únicamente los sitios del navegador y la API. Durante la transición, conservar
+explícitamente el tercer sitio del alias anterior al regenerar la configuración;
+reemplazarla solo con la plantilla lo eliminaría. Ese alias puede redirigir la
+interfaz al nuevo nombre, conservando una ruta de lectura directa
+para las exportaciones firmadas ya emitidas: redirigir su hostname invalidaría
+la firma. Esa ruta debe conservar el encabezado `Host`, restringirse a GET/HEAD y
+usar el mismo formato de logs sin parámetros de consulta. Registrar su retirada
+cuando ya no deban mantenerse enlaces emitidos con el nombre anterior.
+
+Usar un único certificado vigente para estos nombres. Si se emite con
+`certbot certonly`, instalar en `renewal-hooks/deploy` un hook ejecutable que,
+para esa línea de certificado, valide y recargue Nginx. Comprobar la renovación
+con `certbot renew --cert-name NOMBRE --dry-run --run-deploy-hooks` y verificar
+que `certbot.timer` esté activo y habilitado. Retirar una línea anterior con
+`certbot delete` únicamente después de comprobar que ningún sitio activo la
+referencia y de conservar su respaldo cifrado; no revocar el certificado durante
+esta limpieza local.
+
+Completar la aceptación con TLS estricto, inicio de sesión desde el nuevo origen
+y una descarga ZIP real desde el navegador. La interfaz solicita a la API el
+enlace firmado mediante `noRedirect=true` y descarga desde almacenamiento sin
+reenviar credenciales ni encabezados de API. No ampliar CORS a `Origin: null`
+para compensar una redirección entre estos destinos.
+
 ## Primera instalación
 
 ```sh
