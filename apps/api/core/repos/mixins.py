@@ -5,7 +5,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from core.common.permissions import CanViewConceptDictionaryVersion
-from core.common.utils import get_export_service
+from core.common.utils import get_export_service, get_truthy_values
 from core.repos.serializers import RepoExternalExportSerializer
 
 
@@ -46,6 +46,8 @@ class RepoExternalExportMixin:
         if not export_url:
             return Response(status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+        if request.query_params.get('noRedirect', False) in get_truthy_values():
+            return Response({'url': export_url})
         return redirect(export_url)
 
     def post(self, request, *args, **kwargs):  # pylint: disable=unused-argument

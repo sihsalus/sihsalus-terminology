@@ -14,6 +14,14 @@ sus licencias y atribuciones en cada carpeta y en el pie de la interfaz.
 La instalación propia usa la identidad SIHSALUS y no presenta los avisos de
 suscripción de OCL Online ni enlaces a un navegador clásico que no está instalado.
 
+Las descargas de exportaciones nativas y externas consultan primero la API
+autenticada con `GET export/?noRedirect=true`, que devuelve `{"url": "..."}`
+cuando el archivo está disponible. El navegador descarga esa URL firmada sin
+credenciales ni cabeceras de la API. La consulta tradicional conserva su
+redirección HTTP 302; la nueva opción mantiene los permisos y los estados de
+exportación existentes. Actualizar la API antes del navegador al instalar este
+cambio.
+
 ## Construcción y despliegue
 
 ### Correo de la instalación

@@ -1060,6 +1060,8 @@ class ConceptContainerExportMixin:
             export_path = version.get_export_path()
             export_url = get_export_service().url_for(export_path)
             if export_url:
+                if request.query_params.get('noRedirect', False) in TRUTHY:
+                    return Response({'url': export_url})
                 return redirect(export_url)
             logger.error(
                 'Export exists for %s version %s but no signed URL was generated.',
