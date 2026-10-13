@@ -4,6 +4,9 @@ Monorepositorio para adaptar Open Concept Lab (OCL) a SIHSALUS, OpenMRS y los
 catálogos clínicos usados en Perú. La primera versión está destinada solo a
 SIHSALUS, con edición y publicación de conceptos desde una interfaz.
 
+Antes de contribuir u operar la instalación, seguir [AGENTS.md](AGENTS.md) y
+dejar la decisión de integración, despliegue o permisos para revisión humana.
+
 | Carpeta | Proyecto de origen | Función |
 | --- | --- | --- |
 | [`apps/api`](apps/api) | [OpenConceptLab/oclapi2](https://github.com/OpenConceptLab/oclapi2) | API y gestión de terminologías |
