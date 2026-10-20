@@ -31,10 +31,22 @@ SOURCE_SHA="$(read_env_value TERMINOLOGY_SOURCE_SHA "$ENV_FILE")"
 docker context show
 timeout 15 docker info >/dev/null
 [[ "$(docker info --format '{{.CgroupDriver}}')" == systemd ]] || fail 'systemd cgroup driver is required'
-[[ "$(systemctl show -p MemoryMax --value sihsalus-terminology.slice)" == 5368709120 ]] \
+[[ "$(systemctl show -p MemoryMax --value sihsalus-terminology.slice)" == 6442450944 ]] \
   || fail 'install and start terminology/sihsalus-terminology.slice before deploying'
 
 COMPOSE=(docker compose --parallel 1 --env-file "$ENV_FILE" -f docker-compose.terminology.yml)
+OIDC_URL="$(read_env_value TERMINOLOGY_OIDC_SERVER_URL "$ENV_FILE")"
+OIDC_CLIENT="$(read_env_value TERMINOLOGY_OIDC_CLIENT_ID "$ENV_FILE")"
+APPS=(API WEB POSTGRES REDIS ELASTICSEARCH)
+if [[ -n "$OIDC_URL" || -n "$OIDC_CLIENT" ]]; then
+  [[ "$OIDC_URL" == "https://$(read_env_value TERMINOLOGY_HOST "$ENV_FILE")/auth" && "$OIDC_CLIENT" == ocl-web ]] \
+    || fail 'SSO requires the reviewed local Keycloak URL and ocl-web client together'
+  for key in KEYCLOAK_DB_PASSWORD KEYCLOAK_ADMIN_USERNAME KEYCLOAK_ADMIN_PASSWORD; do
+    [[ -n "$(read_env_value "TERMINOLOGY_$key" "$ENV_FILE")" ]] || fail "missing Keycloak setting: TERMINOLOGY_$key"
+  done
+  COMPOSE+=(--profile keycloak)
+  APPS+=(KEYCLOAK)
+fi
 "${COMPOSE[@]}" config --quiet
 MAIL_BACKEND="$(read_env_value TERMINOLOGY_EMAIL_BACKEND "$ENV_FILE")"
 case "${MAIL_BACKEND:-django.core.mail.backends.dummy.EmailBackend}" in
@@ -46,6 +58,9 @@ case "${MAIL_BACKEND:-django.core.mail.backends.dummy.EmailBackend}" in
     ;;
   *) fail 'unsupported email backend; choose dummy or authenticated SMTP' ;;
 esac
+if [[ -n "$OIDC_URL" ]]; then
+  [[ "$MAIL_BACKEND" == django.core.mail.backends.smtp.EmailBackend ]] || fail 'Keycloak requires authenticated SMTP'
+fi
 REGISTRATION="$(read_env_value TERMINOLOGY_ALLOW_SELF_REGISTRATION "$ENV_FILE")"
 case "${REGISTRATION:-false}" in
   false) ;;
@@ -55,7 +70,7 @@ case "${REGISTRATION:-false}" in
     ;;
   *) fail 'self-registration must be true or false' ;;
 esac
-for app in API WEB POSTGRES REDIS ELASTICSEARCH; do
+for app in "${APPS[@]}"; do
   ref="$(read_env_value "TERMINOLOGY_${app}_IMAGE" "$ENV_FILE")"
   [[ "$ref" =~ ^ghcr\.io/sihsalus/terminology-${app,,}@sha256:[0-9a-f]{64}$ ]] || fail 'image must use the expected repository and a verified digest'
 done
@@ -68,7 +83,7 @@ git rev-parse HEAD > "$STATE_DIR/distro-commit"
 "${COMPOSE[@]}" images --format json > "$STATE_DIR/previous-images.json"
 
 "${COMPOSE[@]}" pull
-for app in API WEB POSTGRES REDIS ELASTICSEARCH; do
+for app in "${APPS[@]}"; do
   ref="$(read_env_value "TERMINOLOGY_${app}_IMAGE" "$ENV_FILE")"
   revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$ref")"
   [[ "$revision" == "$SOURCE_SHA" ]] || fail 'candidate revision differs from requested source commit'
@@ -84,6 +99,9 @@ if [[ "$MODE" == bootstrap ]]; then
 else
   [[ -f "$ACTIVE_ENV" ]] || fail 'missing configuration of the currently running deployment'
   [[ "$(read_env_value TERMINOLOGY_MACHINE_ID "$ACTIVE_ENV")" == "$EXPECTED_NODE" ]] || fail 'previous deployment belongs to a different node'
+  if [[ -n "$(read_env_value TERMINOLOGY_OIDC_SERVER_URL "$ACTIVE_ENV")" && -z "$OIDC_URL" ]]; then
+    fail 'Disabling SSO requires a reviewed account/password recovery migration'
+  fi
   cp "$ACTIVE_ENV" "$STATE_DIR/previous.env"
   bash scripts/terminology/backup.sh "$ACTIVE_ENV" "$BACKUP_DIR" leave-stopped > "$STATE_DIR/backup.log" 2>&1
   "${COMPOSE[@]}" stop scheduler web api importer worker
@@ -94,9 +112,38 @@ else
   "${COMPOSE[@]}" --profile maintenance run --rm --no-deps bootstrap python manage.py migrate
 fi
 
+if [[ -n "$OIDC_URL" ]]; then
+  DATABASE_ARGS=(database)
+  PREVIOUS_OIDC_URL=""
+  if [[ -f "$ACTIVE_ENV" ]]; then
+    PREVIOUS_OIDC_URL="$(read_env_value TERMINOLOGY_OIDC_SERVER_URL "$ACTIVE_ENV")"
+    [[ -z "$PREVIOUS_OIDC_URL" ]] || DATABASE_ARGS+=(--require-existing)
+  fi
+  "${COMPOSE[@]}" --profile maintenance run --rm -T --no-deps bootstrap python - "${DATABASE_ARGS[@]}" \
+    < scripts/terminology/keycloak-setup.py > "$STATE_DIR/keycloak-database.json"
+  sudo -n install -d -o 1000 -g 0 -m 700 "$ROOT_DIR/.env.terminology-state/keycloak-import"
+  REALM_INITIALIZED="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["realm_initialized"]).lower())' "$STATE_DIR/keycloak-database.json")"
+  [[ "$REALM_INITIALIZED" == true || "$REALM_INITIALIZED" == false ]] || fail 'invalid realm initialization result'
+  if [[ "$REALM_INITIALIZED" == false ]]; then
+    [[ -z "$PREVIOUS_OIDC_URL" ]] || fail 'Restore the existing Keycloak database; local password hashes may be obsolete'
+    "${COMPOSE[@]}" --profile maintenance run --rm -T --no-deps \
+      -v "$ROOT_DIR/images/keycloak/ocl-realm.json:/tmp/ocl-realm.json:ro" \
+      bootstrap python - --template /tmp/ocl-realm.json \
+      < scripts/terminology/keycloak-realm.py > "$STATE_DIR/ocl-realm.json"
+    sudo -n install -o 1000 -g 0 -m 600 "$STATE_DIR/ocl-realm.json" \
+      "$ROOT_DIR/.env.terminology-state/keycloak-import/ocl-realm.json"
+  fi
+  "${COMPOSE[@]}" up -d --no-deps --wait --wait-timeout 300 keycloak
+fi
+
 "${COMPOSE[@]}" up -d --no-deps --wait --wait-timeout 180 api
 "${COMPOSE[@]}" up -d --no-deps worker importer scheduler
 "${COMPOSE[@]}" up -d --no-deps --wait --wait-timeout 60 web
+if [[ -n "$OIDC_URL" ]]; then
+  # First import keeps registration closed until the API and web can accept SSO.
+  "${COMPOSE[@]}" --profile maintenance run --rm -T --no-deps bootstrap python - reconcile \
+    < scripts/terminology/keycloak-setup.py > "$STATE_DIR/keycloak-reconcile.json"
+fi
 "${COMPOSE[@]}" ps
 cp "$ENV_FILE" "$ACTIVE_ENV"
 cp "$STATE_DIR/distro-commit" "$ROOT_DIR/.env.terminology-state/active-distro-commit"

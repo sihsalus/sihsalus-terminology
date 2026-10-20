@@ -1,0 +1,147 @@
+{
+  "realm": "ocl",
+  "displayName": "SIHSALUS Terminología",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": "${TERMINOLOGY_ALLOW_SELF_REGISTRATION}",
+  "registrationEmailAsUsername": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "editUsernameAllowed": false,
+  "verifyEmail": true,
+  "resetPasswordAllowed": true,
+  "rememberMe": false,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "failureFactor": 10,
+  "waitIncrementSeconds": 60,
+  "maxFailureWaitSeconds": 900,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "actionTokenGeneratedByUserLifespan": 1800,
+  "actionTokenGeneratedByAdminLifespan": 43200,
+  "passwordPolicy": "length(8) and notUsername and notEmail",
+  "internationalizationEnabled": true,
+  "supportedLocales": [
+    "es"
+  ],
+  "defaultLocale": "es",
+  "localizationTexts": {
+    "es": {
+      "pucpEmailRequired": "Usa tu propio correo @pucp.edu.pe."
+    }
+  },
+  "smtpServer": {
+    "host": "${TERMINOLOGY_EMAIL_HOST}",
+    "port": "${TERMINOLOGY_EMAIL_PORT}",
+    "from": "${TERMINOLOGY_DEFAULT_FROM_EMAIL}",
+    "fromDisplayName": "SIHSALUS Terminología",
+    "auth": "true",
+    "user": "${TERMINOLOGY_EMAIL_HOST_USER}",
+    "password": "${TERMINOLOGY_EMAIL_HOST_PASSWORD}",
+    "starttls": "true",
+    "ssl": "false"
+  },
+  "clients": [
+    {
+      "clientId": "ocl-web",
+      "name": "SIHSALUS Terminología",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [
+        "${TERMINOLOGY_WEB_URL}/"
+      ],
+      "webOrigins": [
+        "${TERMINOLOGY_WEB_URL}"
+      ],
+      "baseUrl": "${TERMINOLOGY_WEB_URL}/",
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${TERMINOLOGY_WEB_URL}/"
+      },
+      "defaultClientScopes": [
+        "web-origins",
+        "profile",
+        "email"
+      ],
+      "optionalClientScopes": []
+    }
+  ],
+  "requiredActions": [
+    {
+      "alias": "CONFIGURE_TOTP",
+      "name": "Configure OTP",
+      "providerId": "CONFIGURE_TOTP",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 10,
+      "config": {}
+    },
+    {
+      "alias": "UPDATE_PASSWORD",
+      "name": "Update Password",
+      "providerId": "UPDATE_PASSWORD",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 30,
+      "config": {}
+    },
+    {
+      "alias": "UPDATE_PROFILE",
+      "name": "Update Profile",
+      "providerId": "UPDATE_PROFILE",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 40,
+      "config": {}
+    },
+    {
+      "alias": "VERIFY_EMAIL",
+      "name": "Verify Email",
+      "providerId": "VERIFY_EMAIL",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 50,
+      "config": {}
+    },
+    {
+      "alias": "VERIFY_PROFILE",
+      "name": "Verify Profile",
+      "providerId": "VERIFY_PROFILE",
+      "enabled": false,
+      "defaultAction": false,
+      "priority": 90,
+      "config": {}
+    },
+    {
+      "alias": "UPDATE_USER_LOCALE",
+      "name": "Update User Locale",
+      "providerId": "UPDATE_USER_LOCALE",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 1000,
+      "config": {}
+    }
+  ],
+  "components": {
+    "org.keycloak.userprofile.UserProfileProvider": [
+      {
+        "providerId": "declarative-user-profile",
+        "providerType": "org.keycloak.userprofile.UserProfileProvider",
+        "config": {
+          "kc.user.profile.config": [
+            "{\"unmanagedAttributePolicy\":\"DISABLED\",\"attributes\":[{\"name\":\"username\",\"displayName\":\"Usuario\",\"validations\":{\"length\":{\"min\":1,\"max\":150},\"username-prohibited-characters\":{},\"up-username-not-idn-homograph\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]}},{\"name\":\"email\",\"displayName\":\"Correo PUCP\",\"validations\":{\"email\":{},\"length\":{\"max\":254},\"pattern\":{\"pattern\":\"(?i)^[^@\\\\s]+@pucp\\\\.edu\\\\.pe$\",\"error-message\":\"pucpEmailRequired\"}},\"required\":{\"roles\":[\"user\",\"admin\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]}},{\"name\":\"firstName\",\"displayName\":\"Nombres\",\"validations\":{\"length\":{\"max\":100},\"person-name-prohibited-characters\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]}},{\"name\":\"lastName\",\"displayName\":\"Apellidos\",\"validations\":{\"length\":{\"max\":100},\"person-name-prohibited-characters\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\",\"user\"]}}],\"groups\":[]}"
+          ]
+        }
+      }
+    ]
+  }
+}

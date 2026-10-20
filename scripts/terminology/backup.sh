@@ -17,6 +17,11 @@ KEEP_COPIES="$(read_env_value TERMINOLOGY_BACKUP_KEEP "$ENV_FILE")"
 KEEP_COPIES="${KEEP_COPIES:-14}"
 [[ "$KEEP_COPIES" =~ ^[0-9]+$ && "$KEEP_COPIES" -ge 2 ]]
 COMPOSE=(docker compose --env-file "$ENV_FILE" -f docker-compose.terminology.yml)
+KEYCLOAK_ENABLED=false
+if [[ -n "$(read_env_value TERMINOLOGY_OIDC_SERVER_URL "$ENV_FILE")" ]]; then
+  COMPOSE+=(--profile keycloak)
+  KEYCLOAK_ENABLED=true
+fi
 "${COMPOSE[@]}" config --quiet
 
 busy="$("${COMPOSE[@]}" exec -T db psql -U postgres -d postgres -Atc \
@@ -31,6 +36,9 @@ resume() {
   # Updates start the new revision next; a failed backup still resumes the old one.
   if [[ "$stopped" == true && ( "$result" != 0 || "$AFTER_BACKUP" == resume ) ]]; then
     "${COMPOSE[@]}" start storage || result=1
+    if [[ "$KEYCLOAK_ENABLED" == true ]]; then
+      "${COMPOSE[@]}" start --wait --wait-timeout 300 keycloak || result=1
+    fi
     "${COMPOSE[@]}" start --wait --wait-timeout 180 api worker importer scheduler web || result=1
   fi
   if [[ "$result" == 0 ]]; then
@@ -47,6 +55,9 @@ resume() {
 trap resume EXIT
 stopped=true
 "${COMPOSE[@]}" stop scheduler web api
+if [[ "$KEYCLOAK_ENABLED" == true ]]; then
+  "${COMPOSE[@]}" stop keycloak
+fi
 "${COMPOSE[@]}" exec -T worker python < scripts/terminology/check-idle.py
 "${COMPOSE[@]}" stop importer worker
 # A request may have queued work between the initial check and stopping the API.
@@ -61,6 +72,12 @@ printf '%s\n' 'https://github.com/sihsalus/sihsalus-terminology' > "$STAGE/opera
 "${COMPOSE[@]}" images --format json > "$STAGE/images.json"
 "${COMPOSE[@]}" exec -T db pg_dump -U postgres -Fc postgres > "$STAGE/database.dump"
 "${COMPOSE[@]}" exec -T db pg_restore --list < "$STAGE/database.dump" > /dev/null
+has_keycloak="$("${COMPOSE[@]}" exec -T db psql -U postgres -d postgres -Atc \
+  "SELECT count(*) FROM pg_database WHERE datname = 'keycloak'")"
+if [[ "$has_keycloak" == 1 ]]; then
+  "${COMPOSE[@]}" exec -T db pg_dump -U postgres -Fc keycloak > "$STAGE/keycloak.dump"
+  "${COMPOSE[@]}" exec -T db pg_restore --list < "$STAGE/keycloak.dump" > /dev/null
+fi
 "${COMPOSE[@]}" stop storage
 for volume in uploads objects; do
   name="$("${COMPOSE[@]}" config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["volumes"][sys.argv[1]]["name"])' "$volume")"

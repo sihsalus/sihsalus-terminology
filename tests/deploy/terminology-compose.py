@@ -11,17 +11,21 @@ ROOT = Path(__file__).resolve().parents[2]
 class TerminologyComposition(unittest.TestCase):
     """A terminology deployment must not start clinical services or exhaust its host."""
 
-    def render(self, maintenance=False, registration='false'):
+    def render(self, maintenance=False, registration='false', keycloak=False):
         env = dict(os.environ, TERMINOLOGY_HOST="terminology.example.org")
         env["TERMINOLOGY_ALLOW_SELF_REGISTRATION"] = registration
+        env["TERMINOLOGY_OIDC_SERVER_URL"] = "https://terminology.example.org/auth" if keycloak else ""
+        env["TERMINOLOGY_OIDC_CLIENT_ID"] = "ocl-web" if keycloak else ""
         env["TERMINOLOGY_API_HOST"] = "api.terminology.example.org"
         for key in ("DB_PASSWORD", "SECRET_KEY", "ADMIN_PASSWORD", "ADMIN_TOKEN",
-                    "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY"):
+                    "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY", "KEYCLOAK_DB_PASSWORD", "KEYCLOAK_ADMIN_PASSWORD"):
             env["TERMINOLOGY_" + key] = "synthetic-render-only"
-        for app in ("API", "WEB", "POSTGRES", "REDIS", "ELASTICSEARCH"):
+        for app in ("API", "WEB", "POSTGRES", "REDIS", "ELASTICSEARCH", "KEYCLOAK"):
             env["TERMINOLOGY_" + app + "_IMAGE"] = (
                 "ghcr.io/sihsalus/terminology-" + app.lower() + "@sha256:" + "a" * 64)
         command = ["docker", "compose", "-f", "docker-compose.terminology.yml"]
+        if keycloak:
+            command += ["--profile", "keycloak"]
         if maintenance:
             command += ["--profile", "maintenance"]
         result = subprocess.run(command + ["config", "--format", "json"], cwd=ROOT, env=env,
@@ -58,6 +62,26 @@ class TerminologyComposition(unittest.TestCase):
             self.assertEqual(services[name]['environment']['ALLOW_SELF_REGISTRATION'], 'true')
             if name != 'web':
                 self.assertEqual(services[name]['environment']['SELF_REGISTRATION_EMAIL_DOMAINS'], 'pucp.edu.pe')
+
+    def test_sso_is_optional_private_and_within_six_gib(self):
+        services = self.render(keycloak=True)
+        self.assertEqual(len(services), 10)
+        self.assertLessEqual(sum(int(s["mem_limit"]) for s in services.values()), 6 * 1024**3)
+        identity = services['keycloak']
+        self.assertEqual(identity['profiles'], ['keycloak'])
+        self.assertTrue(identity['read_only'])
+        self.assertEqual(identity['environment']['KC_DB_POOL_MAX_SIZE'], '5')
+        self.assertEqual(identity['ports'][0]['host_ip'], '127.0.0.1')
+        self.assertEqual(identity['ports'][0]['published'], '8081')
+        self.assertEqual(identity['volumes'][0]['target'], '/opt/keycloak/data/import')
+        self.assertTrue(identity['volumes'][0]['read_only'])
+        self.assertFalse(identity['volumes'][0]['bind']['create_host_path'])
+        self.assertEqual(services['api']['environment']['OIDC_SERVER_URL'], 'https://terminology.example.org/auth')
+        self.assertEqual(services['web']['environment']['OIDC_RP_CLIENT_ID'], 'ocl-web')
+        self.assertEqual(services['web']['environment']['LOGIN_REDIRECT_URL'], 'https://terminology.example.org/')
+        for name in ('api', 'worker', 'importer', 'scheduler', 'web'):
+            self.assertNotIn('KC_BOOTSTRAP_ADMIN_PASSWORD', services[name]['environment'])
+            self.assertNotIn('TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD', services[name]['environment'])
 
     def test_bootstrap_is_explicit_and_bounded(self):
         services = self.render(maintenance=True)

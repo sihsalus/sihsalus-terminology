@@ -21,7 +21,7 @@ from django.utils import timezone
 from mock.mock import call
 from requests import ConnectTimeout
 from requests.auth import HTTPBasicAuth
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import AuthenticationFailed, ValidationError
 from rest_framework.test import APITestCase, APITransactionTestCase
 
 from core.collections.models import CollectionReference, Expansion
@@ -2503,6 +2503,7 @@ class URIValidatorTest(OCLTestCase):
             self.validator("https://[56FE::2159:5BBC::6594]")
 
 
+@override_settings(SELF_REGISTRATION_EMAIL_DOMAINS={'gotham.com'})
 class OCLOIDCAuthenticationBackendTest(OCLTestCase):
     def setUp(self):
         super().setUp()
@@ -2531,6 +2532,7 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
 
     def test_update_user(self):
         user = Mock()
+        user.email = 'batman@gotham.com'
         user.is_dirty.return_value = True
 
         self.backend.update_user(user, self.claim)
@@ -2540,7 +2542,7 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         self.assertEqual(user.email, 'batman@gotham.com')
 
         user.save.assert_called_once()
-        user.set_groups.assert_called_once_with([], _save=False)
+        user.set_groups.assert_not_called()
         user.set_checksums.assert_called_once()
 
     def test_update_user_skips_save_when_not_dirty(self):
@@ -2555,11 +2557,11 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         self.backend.update_user(user, self.claim)
 
         user.save.assert_not_called()
-        user.set_groups.assert_called_once_with([], _save=False)
+        user.set_groups.assert_not_called()
         user.set_checksums.assert_not_called()
 
     def test_filter_users_by_claims(self):
-        batman = UserProfileFactory(username='batman')
+        batman = UserProfileFactory(username='batman', email='batman@gotham.com')
         UserProfileFactory(username='superman@not-gotham.com')
 
         users = self.backend.filter_users_by_claims(self.claim)
@@ -2567,24 +2569,24 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         self.assertEqual(users.count(), 1)
         self.assertEqual(users.first(), batman)
 
-        self.assertEqual(self.backend.filter_users_by_claims({**self.claim, 'preferred_username': None}).count(), 0)
+        with self.assertRaises(AuthenticationFailed):
+            self.backend.filter_users_by_claims({**self.claim, 'preferred_username': None})
 
     def test_filter_users_by_claims_matches_username_exactly(self):
-        """Keycloak sends usernames in lowercase, and a mixed-case account is never matched, active or not"""
+        """Case collisions must not silently link or create a second local account."""
         UserProfileFactory(username='Batman', email='batman@gotham.com')
         robin = UserProfileFactory(username='Robin', email='robin@gotham.com')
         robin.deactivate()
 
-        self.assertEqual(self.backend.filter_users_by_claims(self.claim).count(), 0)
-        self.assertEqual(
+        with self.assertRaises(AuthenticationFailed):
+            self.backend.filter_users_by_claims(self.claim)
+        with self.assertRaises(AuthenticationFailed):
             self.backend.filter_users_by_claims(
-                {**self.claim, 'preferred_username': 'robin', 'email': 'robin@gotham.com'}).count(),
-            0
-        )
+                {**self.claim, 'preferred_username': 'robin', 'email': 'robin@gotham.com'})
         robin.refresh_from_db()
         self.assertFalse(robin.is_active)
 
-    def test_filter_users_by_claims_reactivates_deactivated_user_with_its_verified_email(self):
+    def test_filter_users_by_claims_preserves_deactivated_user_with_its_verified_email(self):
         batman = UserProfileFactory(username='batman', email='Batman@Gotham.com ')
         source = UserSourceFactory(user=batman)
         collection = UserCollectionFactory(user=batman)
@@ -2594,19 +2596,16 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         self.assertFalse(source.is_active)
         self.assertFalse(collection.is_active)
 
-        users = self.backend.filter_users_by_claims(self.claim)
-
-        self.assertEqual(list(users), [batman])
-        self.assertTrue(users[0].is_active)
+        with self.assertRaises(DeactivatedAccountLoginRefused):
+            self.backend.filter_users_by_claims(self.claim)
         batman.refresh_from_db()
-        self.assertTrue(batman.is_active)
-        self.assertTrue(batman.verified)
-        self.assertIsNone(batman.deactivated_at)
-        self.assertEqual(batman.status, 'verified')
+        self.assertFalse(batman.is_active)
+        self.assertFalse(batman.verified)
+        self.assertIsNotNone(batman.deactivated_at)
         source.refresh_from_db()
         collection.refresh_from_db()
-        self.assertTrue(source.is_active)
-        self.assertTrue(collection.is_active)
+        self.assertFalse(source.is_active)
+        self.assertFalse(collection.is_active)
 
     def test_filter_users_by_claims_refuses_deactivated_user_without_its_verified_email(self):
         batman = UserProfileFactory(username='batman', email='batman@gotham.com', first_name='Bat')
@@ -2629,7 +2628,7 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         ]:
             with self.subTest(claims=claims):
                 with patch('core.users.models.UserProfile.save') as save_mock:
-                    with self.assertRaises(DeactivatedAccountLoginRefused):
+                    with self.assertRaises(AuthenticationFailed):
                         self.backend.filter_users_by_claims(claims)
                 save_mock.assert_not_called()
 
@@ -2646,7 +2645,7 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
                 self.assertFalse(collection.is_active)
 
     def test_filter_users_by_claims_looks_up_the_user_once(self):
-        UserProfileFactory(username='batman')
+        UserProfileFactory(username='batman', email='batman@gotham.com')
 
         with self.assertNumQueries(1):
             users = self.backend.filter_users_by_claims(self.claim)
@@ -2657,7 +2656,7 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         batman = UserProfileFactory(username='batman', email='')
         batman.deactivate()
 
-        with self.assertRaises(DeactivatedAccountLoginRefused):
+        with self.assertRaises(AuthenticationFailed):
             self.backend.filter_users_by_claims({**self.claim, 'email': ''})
 
         batman.refresh_from_db()
@@ -2666,7 +2665,7 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
     @patch('core.common.backends.OCLOIDCAuthenticationBackend.get_userinfo')
     def test_get_or_create_user_for_active_user(self, get_userinfo_mock):
         get_userinfo_mock.return_value = self.claim
-        batman = UserProfileFactory(username='batman', email='old@gotham.com', first_name='Bat')
+        batman = UserProfileFactory(username='batman', email='batman@gotham.com', first_name='Bat')
 
         user = self.backend.get_or_create_user('access-token', None, None)
 
@@ -2695,12 +2694,11 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         self.assertEqual(batman.first_name, 'Bat')
 
         get_userinfo_mock.return_value = self.claim
-        user = self.backend.get_or_create_user('access-token', None, None)
-
-        self.assertEqual(user, batman)
+        with self.assertRaises(DeactivatedAccountLoginRefused):
+            self.backend.get_or_create_user('access-token', None, None)
         batman.refresh_from_db()
-        self.assertTrue(batman.is_active)
-        self.assertEqual(batman.first_name, 'Bruce')
+        self.assertFalse(batman.is_active)
+        self.assertEqual(batman.first_name, 'Bat')
 
     @patch('core.common.backends.OCLOIDCAuthenticationBackend.get_userinfo')
     def test_get_or_create_user_leaves_mixed_case_deactivated_user(self, get_userinfo_mock):
@@ -2708,11 +2706,9 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         old_batman = UserProfileFactory(username='Batman', email='batman@gotham.com', first_name='Bat')
         old_batman.deactivate()
 
-        user = self.backend.get_or_create_user('access-token', None, None)
-
-        self.assertNotEqual(user, old_batman)
-        self.assertEqual(user.username, 'batman')
-        self.assertTrue(user.is_active)
+        with self.assertRaises(AuthenticationFailed):
+            self.backend.get_or_create_user('access-token', None, None)
+        self.assertEqual(UserProfile.objects.filter(username__iexact='batman').count(), 1)
         old_batman.refresh_from_db()
         self.assertFalse(old_batman.is_active)
         self.assertEqual(old_batman.first_name, 'Bat')
@@ -2754,13 +2750,12 @@ class OCLOIDCAuthenticationBackendTest(OCLTestCase):
         self.assertEqual(batman.email, 'batman@gotham.com')
         self.assertEqual(batman.first_name, 'Bat')
 
-        request, response = get(self.claim)
+        _, response = get(self.claim)
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(request.user, batman)
+        self.assertEqual(response.status_code, 401)
         batman.refresh_from_db()
-        self.assertTrue(batman.is_active)
-        self.assertEqual(batman.first_name, 'Bruce')
+        self.assertFalse(batman.is_active)
+        self.assertEqual(batman.first_name, 'Bat')
 
 
 class ChecksumTest(OCLTestCase):

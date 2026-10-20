@@ -45,6 +45,9 @@ x-app: &app
     REQUIRE_AUTHENTICATION: "true"
     ALLOW_SELF_REGISTRATION: ${TERMINOLOGY_ALLOW_SELF_REGISTRATION:-false}
     SELF_REGISTRATION_EMAIL_DOMAINS: pucp.edu.pe
+    OIDC_SERVER_URL: ${TERMINOLOGY_OIDC_SERVER_URL:-}
+    OIDC_SERVER_INTERNAL_URL: http://keycloak:8080/auth
+    OIDC_REALM: ocl
     ENABLE_THROTTLING: "true"
     # Enable SMTP explicitly after provisioning the installation's sender.
     EMAIL_BACKEND: ${TERMINOLOGY_EMAIL_BACKEND:-django.core.mail.backends.dummy.EmailBackend}
@@ -136,6 +139,54 @@ services:
     volumes:
       - objects:/data
 
+  keycloak:
+    <<: *service
+    profiles: [keycloak]
+    # The fallback only renders older local-auth environments during backup/rollback.
+    # SSO deployment validation requires a release-verified SIHSALUS digest.
+    image: ${TERMINOLOGY_KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.8.1@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244}
+    mem_limit: 1024m
+    cpus: 0.75
+    read_only: true
+    tmpfs:
+      - /tmp:uid=1000,gid=0,size=64m
+      - /opt/keycloak/data:uid=1000,gid=0,size=64m
+    command: [start, --optimized, --import-realm]
+    environment:
+      KC_DB_URL: jdbc:postgresql://db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${TERMINOLOGY_KEYCLOAK_DB_PASSWORD:-}
+      KC_DB_POOL_INITIAL_SIZE: "1"
+      KC_DB_POOL_MIN_SIZE: "1"
+      KC_DB_POOL_MAX_SIZE: "5"
+      KC_HOSTNAME: https://${TERMINOLOGY_HOST}/auth
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_CACHE: ispn
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME:-sihsalus-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD:-}
+      JAVA_OPTS_KC_HEAP: -Xms128m -Xmx512m
+      TERMINOLOGY_WEB_URL: https://${TERMINOLOGY_HOST}
+      TERMINOLOGY_ALLOW_SELF_REGISTRATION: ${TERMINOLOGY_ALLOW_SELF_REGISTRATION:-false}
+      TERMINOLOGY_EMAIL_HOST: ${TERMINOLOGY_EMAIL_HOST:-smtp.gmail.com}
+      TERMINOLOGY_EMAIL_PORT: ${TERMINOLOGY_EMAIL_PORT:-587}
+      TERMINOLOGY_EMAIL_HOST_USER: ${TERMINOLOGY_EMAIL_HOST_USER:-}
+      TERMINOLOGY_EMAIL_HOST_PASSWORD: ${TERMINOLOGY_EMAIL_HOST_PASSWORD:-}
+      TERMINOLOGY_DEFAULT_FROM_EMAIL: ${TERMINOLOGY_DEFAULT_FROM_EMAIL:-webmaster@localhost}
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - type: bind
+        source: ../.env.terminology-state/keycloak-import
+        target: /opt/keycloak/data/import
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      db: {condition: service_healthy}
+    stop_grace_period: 60s
+
   bootstrap:
     <<: *app
     profiles: [maintenance]
@@ -147,6 +198,9 @@ services:
       <<: *app-env
       API_SUPERUSER_PASSWORD: ${TERMINOLOGY_ADMIN_PASSWORD:?Set the administrator password}
       API_SUPERUSER_TOKEN: ${TERMINOLOGY_ADMIN_TOKEN:?Set the administrator token}
+      TERMINOLOGY_KEYCLOAK_DB_PASSWORD: ${TERMINOLOGY_KEYCLOAK_DB_PASSWORD:-}
+      TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME: ${TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME:-sihsalus-admin}
+      TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD: ${TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD:-}
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -211,6 +265,8 @@ services:
       API_URL: https://${TERMINOLOGY_API_HOST}
       NODE_ENV: production
       WEB_PORT: "4002"
+      LOGIN_REDIRECT_URL: https://${TERMINOLOGY_HOST}/
+      OIDC_RP_CLIENT_ID: ${TERMINOLOGY_OIDC_CLIENT_ID:-}
       ALLOW_SELF_REGISTRATION: ${TERMINOLOGY_ALLOW_SELF_REGISTRATION:-false}
       ANALYTICS_API: ""
       AI_ASSISTANT_API_URL: ""

@@ -16,14 +16,25 @@ ROOT = Path(__file__).resolve().parents[2]
 CREDENTIAL_SETTING_NAMES = tuple("TERMINOLOGY_" + key for key in (
     "DB_PASSWORD", "SECRET_KEY", "ADMIN_PASSWORD", "ADMIN_TOKEN",
     "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY", "EMAIL_HOST_PASSWORD",
+    "KEYCLOAK_DB_PASSWORD", "KEYCLOAK_ADMIN_PASSWORD",
 ))
 VARIABLE_KEYS = tuple("TERMINOLOGY_" + key for key in (
     "HOST", "API_HOST", "MACHINE_ID", "BACKUP_KEEP", "EMAIL_BACKEND",
     "EMAIL_HOST", "EMAIL_PORT", "EMAIL_HOST_USER", "DEFAULT_FROM_EMAIL",
     "COMMUNITY_EMAIL", "REPORTS_EMAIL", "ADMIN_EMAIL", "ALLOW_SELF_REGISTRATION",
+    "OIDC_SERVER_URL", "OIDC_CLIENT_ID", "KEYCLOAK_ADMIN_USERNAME",
 ))
 CONFIG_KEYS = CREDENTIAL_SETTING_NAMES + VARIABLE_KEYS
-DEFAULTS = {"TERMINOLOGY_BACKUP_KEEP": "14", "TERMINOLOGY_ALLOW_SELF_REGISTRATION": "false"}
+# Older installations keep local authentication until an explicit identity migration.
+OPTIONAL_SSO_DEFAULTS = {
+    "TERMINOLOGY_OIDC_SERVER_URL": "",
+    "TERMINOLOGY_OIDC_CLIENT_ID": "",
+    "TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME": "sihsalus-admin",
+    "TERMINOLOGY_KEYCLOAK_DB_PASSWORD": "",
+    "TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD": "",
+}
+DEFAULTS = {"TERMINOLOGY_BACKUP_KEEP": "14", "TERMINOLOGY_ALLOW_SELF_REGISTRATION": "false",
+            **OPTIONAL_SSO_DEFAULTS}
 
 
 class ConfigurationError(Exception):
@@ -86,11 +97,17 @@ def receive():
     require(not subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip(),
             "The operations checkout must be clean")
     settings = payload["settings"]
-    require(isinstance(settings, dict) and set(settings) == set(CONFIG_KEYS), "Unexpected configuration keys")
+    require(isinstance(settings, dict)
+            and set(CONFIG_KEYS) - set(OPTIONAL_SSO_DEFAULTS) <= set(settings) <= set(CONFIG_KEYS),
+            "Unexpected configuration keys")
+    settings = {**OPTIONAL_SSO_DEFAULTS, **settings}
     for name, value in settings.items():
         require(isinstance(value, str) and not any(c in value for c in "\n\r\0'"),
                 "Unsupported scalar format: " + name)
-        require(bool(value) or name == "TERMINOLOGY_ADMIN_EMAIL", "Missing configuration: " + name)
+        if name in OPTIONAL_SSO_DEFAULTS and not value:
+            settings[name] = value = OPTIONAL_SSO_DEFAULTS[name]
+        require(bool(value) or name == "TERMINOLOGY_ADMIN_EMAIL" or name in OPTIONAL_SSO_DEFAULTS,
+                "Missing configuration: " + name)
     require(settings["TERMINOLOGY_BACKUP_KEEP"].isdigit()
             and int(settings["TERMINOLOGY_BACKUP_KEEP"]) >= 2, "Invalid backup retention")
     require(settings["TERMINOLOGY_EMAIL_PORT"].isdigit()
@@ -103,6 +120,15 @@ def receive():
     require(settings["TERMINOLOGY_ALLOW_SELF_REGISTRATION"] != "true"
             or settings["TERMINOLOGY_EMAIL_BACKEND"] == "django.core.mail.backends.smtp.EmailBackend",
             "Self-registration requires SMTP email verification")
+    oidc_url = settings["TERMINOLOGY_OIDC_SERVER_URL"]
+    oidc_client = settings["TERMINOLOGY_OIDC_CLIENT_ID"]
+    if oidc_url or oidc_client:
+        require(oidc_url == "https://" + settings["TERMINOLOGY_HOST"] + "/auth"
+                and oidc_client == "ocl-web", "Invalid local Keycloak URL or client")
+        for name in ("TERMINOLOGY_KEYCLOAK_DB_PASSWORD", "TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD"):
+            require(bool(settings[name]), "Missing configuration: " + name)
+        require(settings["TERMINOLOGY_EMAIL_BACKEND"] == "django.core.mail.backends.smtp.EmailBackend",
+                "Keycloak requires SMTP email verification and recovery")
     state_root = ROOT / ".env.terminology-state"
     require(state_root.is_dir(), "An initialized deployment is required")
     with (state_root / "github-config.lock").open("a") as lock:
@@ -118,6 +144,8 @@ def receive():
         # Changing these values alone cannot rotate the persisted service credentials.
         immutable = set(CREDENTIAL_SETTING_NAMES) - {"TERMINOLOGY_EMAIL_HOST_PASSWORD"}
         immutable.update({"TERMINOLOGY_HOST", "TERMINOLOGY_API_HOST", "TERMINOLOGY_MACHINE_ID"})
+        immutable.update({"TERMINOLOGY_OIDC_SERVER_URL", "TERMINOLOGY_OIDC_CLIENT_ID",
+                          "TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME"})
         for name in immutable:
             require(settings[name] == current[name], "Requires a coordinated migration or rotation: " + name)
         changed = [name for name in CONFIG_KEYS if settings[name] != current[name]]
@@ -143,7 +171,8 @@ def receive():
         candidate.write_text("\n".join(output) + "\n")
         with (state / "deploy.log").open("w") as log:
             subprocess.run(["docker", "compose", "--env-file", str(candidate), "-f",
-                            "docker-compose.terminology.yml", "config", "--quiet"],
+                            "docker-compose.terminology.yml",
+                            *(["--profile", "keycloak"] if oidc_url else []), "config", "--quiet"],
                            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
             temporary = ROOT / ".env.github-configuration"
             shutil.copy2(candidate, temporary)

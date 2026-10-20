@@ -1,7 +1,10 @@
 import base64
+import binascii
+import json
 
 import requests
 from django.conf import settings
+from django.contrib.auth.hashers import PBKDF2PasswordHasher
 from mozilla_django_oidc.contrib.drf import OIDCAuthentication
 
 from core.common.backends import OCLOIDCAuthenticationBackend
@@ -71,23 +74,33 @@ class OpenIDAuthService(AbstractAuthService):
 
     @staticmethod
     def credential_representation_from_hash(hash_, temporary=False):
-        algorithm, hashIterations, salt, hashedSaltedValue = hash_.split('$')
-
+        """Represent an existing Django PBKDF2-SHA256 password without resetting it."""
+        if not isinstance(hash_, str) or not hash_.startswith('pbkdf2_sha256$'):
+            raise ValueError('Only Django PBKDF2-SHA256 credentials can be migrated.')
+        try:
+            decoded = PBKDF2PasswordHasher().decode(hash_)
+            digest = base64.b64decode(decoded['hash'], validate=True)
+        except (ValueError, binascii.Error):
+            raise ValueError('Invalid Django PBKDF2-SHA256 credential.') from None
+        if len(digest) != 32 or not decoded['salt'] or not 0 < decoded['iterations'] <= 2147483647:
+            raise ValueError('Invalid Django PBKDF2-SHA256 credential.')
         return {
             'type': 'password',
-            'hashedSaltedValue': hashedSaltedValue,
-            'algorithm': algorithm.replace('_', '-'),
-            'hashIterations': int(hashIterations),
-            'salt': base64.b64encode(salt.encode()).decode('ascii').strip(),
+            'credentialData': json.dumps({'algorithm': 'pbkdf2-sha256', 'hashIterations': decoded['iterations']}),
+            'secretData': json.dumps({
+                'value': decoded['hash'],
+                'salt': base64.b64encode(decoded['salt'].encode()).decode('ascii')
+            }),
             'temporary': temporary
         }
 
     @classmethod
     def add_user(cls, user, username, password):
+        """Import a local account without changing its password or activation state."""
         response = requests.post(
             cls.USERS_URL,
             json={
-                'enabled': True,
+                'enabled': user.is_active,
                 'emailVerified': user.verified,
                 'firstName': user.first_name,
                 'lastName': user.last_name,
@@ -95,7 +108,8 @@ class OpenIDAuthService(AbstractAuthService):
                 'username': user.username,
                 'credentials': [cls.credential_representation_from_hash(hash_=user.password)]
             },
-            verify=False,
+            verify=True,
+            timeout=settings.OIDC_TIMEOUT,
             headers=OpenIDAuthService.get_admin_headers(username=username, password=password)
         )
         if response.status_code == 201:
@@ -105,6 +119,7 @@ class OpenIDAuthService(AbstractAuthService):
 
     @staticmethod
     def get_admin_token(username, password):
+        """Authenticate an administrator over verified TLS with a bounded timeout."""
         response = requests.post(
             OpenIDAuthService.OIDP_ADMIN_TOKEN_URL,
             data={
@@ -113,8 +128,10 @@ class OpenIDAuthService(AbstractAuthService):
                 'password': password,
                 'client_id': 'admin-cli'
             },
-            verify=False,
+            verify=True,
+            timeout=settings.OIDC_TIMEOUT,
         )
+        response.raise_for_status()
         return response.json().get('access_token')
 
     @staticmethod
@@ -129,7 +146,7 @@ class OpenIDAuthService(AbstractAuthService):
             data['client_secret'] = client_secret
         if code_verifier:
             data['code_verifier'] = code_verifier
-        response = requests.post(settings.OIDC_OP_TOKEN_ENDPOINT, data=data)
+        response = requests.post(settings.OIDC_OP_TOKEN_ENDPOINT, data=data, verify=True, timeout=settings.OIDC_TIMEOUT)
         return response.json()
 
     @staticmethod

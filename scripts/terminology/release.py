@@ -9,9 +9,9 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-APPS = ('api', 'web', 'postgres', 'redis', 'elasticsearch')
+APPS = ('api', 'web', 'postgres', 'redis', 'elasticsearch', 'keycloak')
 SERVICES = dict(api='api', worker='api', importer='api', scheduler='api', web='web',
-                db='postgres', redis='redis', es='elasticsearch', storage='storage')
+                db='postgres', redis='redis', es='elasticsearch', storage='storage', keycloak='keycloak')
 RUN_URL = 'https://github.com/sihsalus/sihsalus-terminology/actions/runs/'
 
 
@@ -29,7 +29,7 @@ def image_ref(value, repository):
 def validate(manifest):
     require(re.fullmatch(r'[0-9a-f]{40}', manifest['source_commit']), 'Invalid source commit')
     require(re.fullmatch(re.escape(RUN_URL) + r'[1-9][0-9]*', manifest['workflow_run']), 'Invalid workflow run')
-    require(set(manifest['images']) == set(APPS), 'Expected all five runtime images')
+    require(set(manifest['images']) == set(APPS), 'Expected all six runtime images')
     for app in APPS:
         image_ref(manifest['images'][app], 'ghcr.io/sihsalus/terminology-' + app)
     image_ref(manifest['storage'], 'rustfs/rustfs')
@@ -57,7 +57,7 @@ def collect(artifacts, commit, run):
     scan(storage_report, storage)
     return validate(dict(source_commit=commit, workflow_run=RUN_URL + run,
                          images=images, storage=storage, storage_scan=RUN_URL + run,
-                         runtime_security='HIGH/CRITICAL: 0 findings across all five images'))
+                         runtime_security='HIGH/CRITICAL: 0 findings across all six images'))
 
 
 def compose(env, *args):
@@ -69,6 +69,15 @@ def compose(env, *args):
 def private_env(path):
     require(not path.is_symlink() and path.is_file() and path.stat().st_mode & 0o777 == 0o600,
             'Environment must be a regular file with mode 600')
+
+
+def oidc_enabled(env):
+    """Read the provider URL with the deployment reader; never execute dotenv data."""
+    value = subprocess.check_output([
+        'bash', '-c', 'source "$1"; read_env_value TERMINOLOGY_OIDC_SERVER_URL "$2"',
+        '_', str(ROOT / 'scripts/deploy/env.sh'), str(env),
+    ], text=True, timeout=10)
+    return bool(value.strip())
 
 
 def prepare(manifest, env, output):
@@ -87,7 +96,8 @@ def prepare(manifest, env, output):
     with open(output, 'x', opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
         stream.write('\n'.join(lines) + '\n')
     try:
-        model = json.loads(compose(output, 'config', '--format', 'json'))
+        # Validate the optional provider image even before SSO is activated.
+        model = json.loads(compose(output, '--profile', 'keycloak', 'config', '--format', 'json'))
         require(model['services']['storage']['image'] == manifest['storage'], 'Storage differs from the scanned release')
         for service, app in SERVICES.items():
             reference = manifest['storage'] if app == 'storage' else manifest['images'][app]
@@ -100,14 +110,17 @@ def prepare(manifest, env, output):
 
 def verify(manifest, env):
     private_env(env)
-    ids = compose(env, 'ps', '--all', '-q').splitlines()
-    require(len(ids) == len(SERVICES), 'Expected nine runtime containers; inspect Compose status')
+    services = {service: app for service, app in SERVICES.items()
+                if service != 'keycloak' or oidc_enabled(env)}
+    # Include stopped/optional containers to expose stale providers after a rollback.
+    ids = compose(env, '--profile', 'keycloak', 'ps', '--all', '-q').splitlines()
+    require(len(ids) == len(services), f'Expected {len(services)} runtime containers; inspect Compose status')
     items = json.loads(subprocess.check_output(['docker', 'inspect', *ids], text=True, timeout=30))
     result = {}
     for item in items:
         service = item['Config']['Labels']['com.docker.compose.service']
-        require(service in SERVICES and service not in result, 'Unexpected or duplicate runtime service')
-        app = SERVICES[service]
+        require(service in services and service not in result, 'Unexpected or duplicate runtime service')
+        app = services[service]
         reference = manifest['storage'] if app == 'storage' else manifest['images'][app]
         require(item['Config']['Image'] == reference, 'Running image differs: ' + service)
         if app != 'storage':
@@ -117,7 +130,8 @@ def verify(manifest, env):
         require(state['Running'] and not state['OOMKilled'] and item['RestartCount'] == 0,
                 'Stopped, restarted or OOM-killed service: ' + service)
         health = state.get('Health', {}).get('Status')
-        require(health == 'healthy' if service in ('api', 'web', 'db', 'redis', 'es') else health in (None, 'healthy'),
+        require(health == 'healthy' if service in ('api', 'web', 'db', 'redis', 'es', 'keycloak')
+                else health in (None, 'healthy'),
                 'Missing or unhealthy healthcheck: ' + service)
         result[service] = {'image': reference, 'health': health or 'running (no healthcheck)'}
     return dict(source_commit=manifest['source_commit'], services=result)

@@ -16,6 +16,7 @@ read_env_value() {
         end = index(value, quote)
         if (end) value = substr(value, 1, end - 1)
       } else {
+        if ($0 ~ /^[^=]*=[[:space:]]+#/) value = ""
         sub(/[[:space:]]+#.*$/, "", value)
         sub(/[[:space:]]+$/, "", value)
       }

@@ -33,9 +33,14 @@ TERMINOLOGY_WEB_IMAGE=
 TERMINOLOGY_POSTGRES_IMAGE=
 TERMINOLOGY_REDIS_IMAGE=
 TERMINOLOGY_ELASTICSEARCH_IMAGE=
+TERMINOLOGY_KEYCLOAK_IMAGE=
 TERMINOLOGY_BACKUP_KEEP=14
-# Local signup requires a verified @pucp.edu.pe address and working SMTP.
+# Signup requires a verified @pucp.edu.pe address and working SMTP.
 TERMINOLOGY_ALLOW_SELF_REGISTRATION=false
+# Enable only through a reviewed identity migration: https://HOST/auth and ocl-web.
+TERMINOLOGY_OIDC_SERVER_URL=
+TERMINOLOGY_OIDC_CLIENT_ID=
+TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME=sihsalus-admin
 TERMINOLOGY_EMAIL_BACKEND=django.core.mail.backends.dummy.EmailBackend
 TERMINOLOGY_EMAIL_HOST=smtp.gmail.com
 TERMINOLOGY_EMAIL_PORT=587
@@ -51,6 +56,8 @@ TERMINOLOGY_ADMIN_PASSWORD=$(secret)
 TERMINOLOGY_ADMIN_TOKEN=$(openssl rand -hex 20)
 TERMINOLOGY_STORAGE_ACCESS_KEY=$(openssl rand -hex 12)
 TERMINOLOGY_STORAGE_SECRET_KEY=$(secret)
+TERMINOLOGY_KEYCLOAK_DB_PASSWORD=$(secret)
+TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD=$(secret)
 EOF
 chmod 600 "$OUTPUT_FILE"
 printf 'Created private terminology configuration: %s\n' "$OUTPUT_FILE"

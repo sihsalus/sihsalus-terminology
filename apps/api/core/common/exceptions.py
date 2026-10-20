@@ -30,8 +30,8 @@ class Http403(APIException):
 
 class DeactivatedAccountLoginRefused(AuthenticationFailed):
     """
-    Raised when a Keycloak sign-in's username matches a deactivated account but the claims don't carry that
-    account's email, verified by Keycloak (ocl_online#339). The account is left as it was; staff can reactivate it.
+    Raised when a Keycloak sign-in resolves to a deactivated local account.
+    Verified claims do not reactivate it; an administrator must review that decision.
     """
     default_code = 'deactivated_account'
 
