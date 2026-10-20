@@ -94,7 +94,7 @@
       "providerId": "CONFIGURE_TOTP",
       "enabled": true,
       "defaultAction": false,
-      "priority": 10,
+      "priority": 54,
       "config": {}
     },
     {
@@ -103,7 +103,7 @@
       "providerId": "UPDATE_PASSWORD",
       "enabled": true,
       "defaultAction": false,
-      "priority": 30,
+      "priority": 57,
       "config": {}
     },
     {

@@ -227,6 +227,9 @@ se conservan su ID, membresías y privilegios locales; el proveedor no concede
 permisos de edición por registrar una cuenta. La importación no envía correos.
 El registro y la recuperación iniciados por el titular sí los envían mediante
 SMTP. Revisar previamente el destinatario de cualquier prueba de entrega real.
+El registro nativo de Keycloak 26.8 confirma primero el correo y luego solicita
+crear la contraseña. El orden de acciones conserva esa secuencia; no modifica
+las contraseñas de las cuentas importadas.
 
 Username y correo se mantienen alineados entre OCL y Keycloak. Con SSO, la API
 rechaza modificarlos desde la edición de perfil, incluso para staff: un cambio

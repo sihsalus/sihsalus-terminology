@@ -178,6 +178,7 @@ class KeycloakRealmTests(unittest.TestCase):
         self.assertFalse(actions['VERIFY_PROFILE']['enabled'])
         self.assertTrue(actions['VERIFY_EMAIL']['enabled'])
         self.assertTrue(actions['UPDATE_PASSWORD']['enabled'])
+        self.assertLess(actions['VERIFY_EMAIL']['priority'], actions['UPDATE_PASSWORD']['priority'])
 
     def test_smtp_credentials_remain_native_placeholders(self):
         smtp = self.template['smtpServer']

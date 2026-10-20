@@ -261,7 +261,6 @@ def verify(mailbox):
         browser.submit(page, 'kc-register-form', {
             'username': 'rejected-' + str(index), 'email': address,
             'firstName': 'Synthetic', 'lastName': 'Researcher',
-            'password': PASSWORD, 'password-confirm': PASSWORD,
         })
         require(not users('rejected-' + str(index)), 'Non-PUCP registration was accepted.')
     require(not mailbox.messages, 'Rejected registrations unexpectedly sent email.')
@@ -274,7 +273,6 @@ def verify(mailbox):
         browser.submit(page, 'kc-register-form', {
             'username': rejected, 'email': rejected + '@pucp.edu.pe',
             'firstName': 'Synthetic', 'lastName': 'Researcher', field: 'A' * 101,
-            'password': PASSWORD, 'password-confirm': PASSWORD,
         })
         require(not users(rejected), 'Name exceeding the OCL field limit was accepted.')
     require(not mailbox.messages, 'Rejected name lengths unexpectedly sent email.')
@@ -282,9 +280,10 @@ def verify(mailbox):
     username, address = 'registered-researcher', 'registered-researcher@pucp.edu.pe'
     browser = Browser()
     page, _ = authorization(browser, register=True)
+    require('password' not in page.forms.get('kc-register-form', {}).get('fields', {}),
+            'Native registration must verify email before setting a password.')
     result = browser.submit(page, 'kc-register-form', {
         'username': username, 'email': address, 'firstName': 'Synthetic', 'lastName': 'Researcher',
-        'password': PASSWORD, 'password-confirm': PASSWORD,
     })
     created = users(username)
     print('Registration challenge:', {'status': result.status, 'path': urlparse(result.url).path,
@@ -293,8 +292,13 @@ def verify(mailbox):
     require(len(created) == 1 and created[0]['emailVerified'] is False,
             'New account must await email verification.')
     require(not parse_qs(urlparse(result.url).query).get('code'), 'Unverified registration issued a code.')
-    browser.request(mailbox.link(address, 0))
+    page = browser.request(mailbox.link(address, 0))
     require(users(username)[0]['emailVerified'] is True, 'Verification link did not confirm email.')
+    result = browser.submit(page, 'kc-passwd-update-form', {
+        'password-new': PASSWORD, 'password-confirm': PASSWORD,
+    })
+    require(result.url.startswith(CALLBACK) and parse_qs(urlparse(result.url).query).get('code'),
+            'Confirmed registration did not finish password setup and sign-in.')
     browser, access_token = login(username, PASSWORD)
     print('PASS: native registration sends a captured confirmation mail and permits verified login.')
 
