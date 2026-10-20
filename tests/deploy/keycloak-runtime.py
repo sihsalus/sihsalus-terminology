@@ -7,7 +7,7 @@ import base64
 import hashlib
 import html
 from html.parser import HTMLParser
-from http.cookiejar import CookieJar
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 import importlib.util
 import json
 import os
@@ -69,9 +69,23 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+class LoopbackCookiePolicy(DefaultCookiePolicy):
+    """Match browsers' secure-context exception for this loopback-only CI server.
+
+    Keycloak marks loopback cookies Secure even over HTTP. Python's CookieJar does
+    not implement that browser exception, so it otherwise drops the login cookie.
+    Production HTTPS and remote HTTP retain the normal cookie policy.
+    """
+    def return_ok_secure(self, cookie, request):
+        if request.type == 'http' and urlparse(request.get_full_url()).hostname == '127.0.0.1':
+            return True
+        return super().return_ok_secure(cookie, request)
+
+
 class Browser:
     def __init__(self):
-        self.opener = build_opener(HTTPCookieProcessor(CookieJar()), NoRedirect())
+        self.opener = build_opener(
+            HTTPCookieProcessor(CookieJar(policy=LoopbackCookiePolicy())), NoRedirect())
 
     def request(self, url, fields=None, headers=None):
         data = urlencode(fields).encode() if fields is not None else None
