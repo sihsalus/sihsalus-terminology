@@ -32,6 +32,7 @@ import OrgHome from '../orgs/OrgHome';
 import URLRegistry from '../url-registry/URLRegistry'
 import SigninRedirect from './SigninRedirect'
 import SignupRedirect from './SignupRedirect'
+import LocalEmailVerification from '../users/LocalEmailVerification'
 import OrgCreate from '../orgs/OrgCreate'
 import ImportHome from '../imports/ImportHome'
 import ConceptsComparison from '../concepts/ConceptsComparison'
@@ -173,6 +174,7 @@ const App = props => {
               <Route exact path="/oidc/login" component={OIDLoginCallback} />
               <Route path="/signin" component={SigninRedirect} />
               <Route path="/signup" component={SignupRedirect} />
+              <Route exact path="/accounts/:username/verify/:token/" component={LocalEmailVerification} />
               <Route exact path="/search" component={Search} />
               <Route exact path="/" component={Dashboard} />
               <Route exact path="/imports" component={ImportHome} />

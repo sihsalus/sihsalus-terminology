@@ -11,8 +11,9 @@ ROOT = Path(__file__).resolve().parents[2]
 class TerminologyComposition(unittest.TestCase):
     """A terminology deployment must not start clinical services or exhaust its host."""
 
-    def render(self, maintenance=False):
+    def render(self, maintenance=False, registration='false'):
         env = dict(os.environ, TERMINOLOGY_HOST="terminology.example.org")
+        env["TERMINOLOGY_ALLOW_SELF_REGISTRATION"] = registration
         env["TERMINOLOGY_API_HOST"] = "api.terminology.example.org"
         for key in ("DB_PASSWORD", "SECRET_KEY", "ADMIN_PASSWORD", "ADMIN_TOKEN",
                     "STORAGE_ACCESS_KEY", "STORAGE_SECRET_KEY"):
@@ -50,6 +51,13 @@ class TerminologyComposition(unittest.TestCase):
             self.assertNotIn("API_SUPERUSER_PASSWORD", services[name]["environment"])
             self.assertEqual(services[name]["environment"]["ALLOW_SELF_REGISTRATION"], "false")
             self.assertEqual(services[name]["environment"]["ENABLE_THROTTLING"], "true")
+
+    def test_registration_flag_reaches_web_and_all_api_processes(self):
+        services = self.render(maintenance=True, registration='true')
+        for name in ('api', 'worker', 'importer', 'scheduler', 'bootstrap', 'web'):
+            self.assertEqual(services[name]['environment']['ALLOW_SELF_REGISTRATION'], 'true')
+            if name != 'web':
+                self.assertEqual(services[name]['environment']['SELF_REGISTRATION_EMAIL_DOMAINS'], 'pucp.edu.pe')
 
     def test_bootstrap_is_explicit_and_bounded(self):
         services = self.render(maintenance=True)

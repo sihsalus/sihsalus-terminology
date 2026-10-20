@@ -34,7 +34,7 @@ jobs:
       - run: npm audit --package-lock-only --omit=dev --audit-level=high
       - run: npm ci --ignore-scripts
       - run: npm test
-      - run: npx eslint src/services/signedExportDownload.js src/services/signedExportDownload.test.mjs src/components/repos/VersionExportDialog.jsx src/components/repos/ExternalExportsDialog.jsx
+      - run: npx eslint src/services/signedExportDownload.js src/services/signedExportDownload.test.mjs src/components/repos/VersionExportDialog.jsx src/components/repos/ExternalExportsDialog.jsx src/components/users/LocalSignup.jsx src/components/users/LocalEmailVerification.jsx src/components/users/LocalSignIn.jsx src/components/app/SignupRedirect.jsx
       - run: NODE_ENV=production npm run build
 
   api-checks:
@@ -57,8 +57,8 @@ jobs:
           cache-dependency-path: apps/api/requirements-*.txt
       - run: python -m pip install -r requirements-dev.txt
       - run: python manage.py check
-      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access core.common.test_export_download core.middlewares.tests --verbosity 2
-      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/test_export_download.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py core/importers/export_converter.py
+      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access core.users.tests.test_self_registration core.common.test_export_download core.middlewares.tests --verbosity 2
+      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/test_export_download.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/users/serializers.py core/users/tests/test_self_registration.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py core/importers/export_converter.py
 
   images:
     needs: [api-checks, web-dependencies, operations]
@@ -259,4 +259,5 @@ jobs:
           TERMINOLOGY_COMMUNITY_EMAIL: ${{ vars.TERMINOLOGY_COMMUNITY_EMAIL }}
           TERMINOLOGY_REPORTS_EMAIL: ${{ vars.TERMINOLOGY_REPORTS_EMAIL }}
           TERMINOLOGY_ADMIN_EMAIL: ${{ vars.TERMINOLOGY_ADMIN_EMAIL }}
+          TERMINOLOGY_ALLOW_SELF_REGISTRATION: ${{ vars.TERMINOLOGY_ALLOW_SELF_REGISTRATION || 'false' }}
         run: python3 scripts/terminology/sync-github-config.py send

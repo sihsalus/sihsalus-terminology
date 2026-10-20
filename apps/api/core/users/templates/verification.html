@@ -1,23 +1,16 @@
-<html>
+<html lang="es">
 <head>
     <meta charset="utf-8">
 </head>
 <body>
 <div>
-    <div>
-        <p>Hi {{ user.username }},</p>
-        <p>
-            Welcome to the Open Concept Lab.
-            To finish activating your account, please follow this link to <a href="{{url}}" target="_blank">verify your email</a>.
-        </p>
-    </div>
-    <div>
-        <p>
-            Thanks,
-            <br/>
-            The OCL Team
-        </p>
-    </div>
+    <p>Hola {{ user.username }},</p>
+    <p>Para activar tu cuenta de SIHSALUS Terminología,
+        <a href="{{ url }}">confirma tu correo electrónico</a>.</p>
+    <p>Después de confirmarlo, inicia sesión con el usuario y la contraseña
+        que elegiste en SIHSALUS Terminología. Tu cuenta de OCL Online es independiente.</p>
+    <p>Si no solicitaste esta cuenta, puedes ignorar este mensaje.</p>
+    <p>Equipo SIHSALUS</p>
 </div>
 </body>
 </html>

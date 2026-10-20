@@ -40,6 +40,15 @@ Los informes automáticos de errores están deshabilitados salvo que se configur
 archivo privado del servidor; para desactivar el envío se utiliza
 `EMAIL_BACKEND=django.core.mail.backends.dummy.EmailBackend`.
 
+### Registro institucional
+
+El registro local es opcional: `TERMINOLOGY_ALLOW_SELF_REGISTRATION=true` habilita
+el formulario con correo `@pucp.edu.pe`, previa configuración SMTP. Cada persona
+confirma su correo antes de iniciar sesión; las cuentas de OCL Online no se
+reutilizan automáticamente. No se otorgan privilegios administrativos ni
+membresías por registrarse. Consultar la
+[guía de operación](docs/operations/terminology.md#registro-institucional).
+
 ### Imágenes
 
 El workflow **Terminology runtime** construye imágenes inmutables de API,

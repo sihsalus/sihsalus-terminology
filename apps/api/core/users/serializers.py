@@ -1,5 +1,6 @@
 import uuid
 
+from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
@@ -119,7 +120,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
             bio=validated_data.get('bio', None),
             extras=validated_data.get('extras', None),
             preferred_locale=validated_data.get('preferred_locale', None),
-            first_name=validated_data.get('name', None) or validated_data.get('first_name'),
+            first_name=validated_data.get('name', None) or validated_data.get('first_name', ''),
             last_name=validated_data.get('last_name', '')
         )
         password = validated_data.get('password', None)
@@ -147,6 +148,24 @@ class UserCreateSerializer(serializers.ModelSerializer):
         user.record_event(Event.JOINED)
 
         return user
+
+
+class UserSignupSerializer(UserCreateSerializer):
+    """Restrict public signup without changing administrator account provisioning."""
+
+    email = serializers.EmailField(required=True, max_length=254, validators=[
+        UniqueValidator(queryset=UserProfile.objects.all(), lookup='iexact',
+                        message='A user with this email already exists')
+    ])
+    password = serializers.CharField(required=True, write_only=True, trim_whitespace=False)
+
+    def validate_email(self, value):
+        """Match the complete domain; an empty allowlist keeps registration closed."""
+        local, domain = value.rsplit('@', 1)
+        domain = domain.lower()
+        if domain not in settings.SELF_REGISTRATION_EMAIL_DOMAINS:
+            raise serializers.ValidationError('Use an email address from an allowed institution.')
+        return f'{local}@{domain}'
 
 
 class AbstractFollowerSerializer(ModelSerializer):

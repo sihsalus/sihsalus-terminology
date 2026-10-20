@@ -20,10 +20,10 @@ CREDENTIAL_SETTING_NAMES = tuple("TERMINOLOGY_" + key for key in (
 VARIABLE_KEYS = tuple("TERMINOLOGY_" + key for key in (
     "HOST", "API_HOST", "MACHINE_ID", "BACKUP_KEEP", "EMAIL_BACKEND",
     "EMAIL_HOST", "EMAIL_PORT", "EMAIL_HOST_USER", "DEFAULT_FROM_EMAIL",
-    "COMMUNITY_EMAIL", "REPORTS_EMAIL", "ADMIN_EMAIL",
+    "COMMUNITY_EMAIL", "REPORTS_EMAIL", "ADMIN_EMAIL", "ALLOW_SELF_REGISTRATION",
 ))
 CONFIG_KEYS = CREDENTIAL_SETTING_NAMES + VARIABLE_KEYS
-DEFAULTS = {"TERMINOLOGY_BACKUP_KEEP": "14"}
+DEFAULTS = {"TERMINOLOGY_BACKUP_KEEP": "14", "TERMINOLOGY_ALLOW_SELF_REGISTRATION": "false"}
 
 
 class ConfigurationError(Exception):
@@ -98,6 +98,11 @@ def receive():
     require(settings["TERMINOLOGY_EMAIL_BACKEND"] in (
         "django.core.mail.backends.dummy.EmailBackend", "django.core.mail.backends.smtp.EmailBackend",
     ), "Unsupported email backend")
+    require(settings["TERMINOLOGY_ALLOW_SELF_REGISTRATION"] in ("true", "false"),
+            "Invalid self-registration flag")
+    require(settings["TERMINOLOGY_ALLOW_SELF_REGISTRATION"] != "true"
+            or settings["TERMINOLOGY_EMAIL_BACKEND"] == "django.core.mail.backends.smtp.EmailBackend",
+            "Self-registration requires SMTP email verification")
     state_root = ROOT / ".env.terminology-state"
     require(state_root.is_dir(), "An initialized deployment is required")
     with (state_root / "github-config.lock").open("a") as lock:

@@ -59,8 +59,10 @@ def get_set_from_env(name):
 
 
 REQUIRE_AUTHENTICATION = os.environ.get('REQUIRE_AUTHENTICATION', 'false').lower() in ['true', '1']
-# Private installations provision accounts through administrators instead of public signup.
+# Self-registration is opt-in; local signups must verify an allowed institutional address.
 ALLOW_SELF_REGISTRATION = os.environ.get('ALLOW_SELF_REGISTRATION', 'false').lower() in ['true', '1']
+SELF_REGISTRATION_EMAIL_DOMAINS = {domain.lower() for domain in
+                                   get_set_from_env('SELF_REGISTRATION_EMAIL_DOMAINS')}
 APPROVED_ANONYMOUS_CLIENTS = get_set_from_env('APPROVED_ANONYMOUS_CLIENTS')
 APPROVED_ANONYMOUS_API_KEYS = get_set_from_env('APPROVED_ANONYMOUS_API_KEYS')
 APPROVED_ANONYMOUS_IPS = get_set_from_env('APPROVED_ANONYMOUS_IPS')

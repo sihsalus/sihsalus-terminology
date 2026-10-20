@@ -35,7 +35,7 @@ from core.users.constants import VERIFICATION_TOKEN_MISMATCH, VERIFY_EMAIL_MESSA
 from core.users.documents import UserProfileDocument
 from core.users.search import UserProfileFacetedSearch
 from core.users.serializers import UserDetailSerializer, UserCreateSerializer, UserListSerializer, \
-    UserSummarySerializer, FollowingSerializer, UserContentSummarySerializer
+    UserSummarySerializer, FollowingSerializer, UserContentSummarySerializer, UserSignupSerializer
 from .models import UserProfile, Follow
 from ..common import ERRBIT_LOGGER
 from ..common.throttling import ThrottleUtil
@@ -305,7 +305,7 @@ class UserListView(UserBaseView,
 
 
 class UserSignup(UserBaseView, mixins.CreateModelMixin):
-    serializer_class = UserCreateSerializer
+    serializer_class = UserSignupSerializer
     permission_classes = (AllowAny, )
 
     @staticmethod
