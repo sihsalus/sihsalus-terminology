@@ -75,7 +75,7 @@ class TerminologyComposition(unittest.TestCase):
         self.assertEqual(identity['ports'][0]['published'], '8081')
         self.assertEqual(identity['volumes'][0]['target'], '/opt/keycloak/data/import')
         self.assertTrue(identity['volumes'][0]['read_only'])
-        self.assertFalse(identity['volumes'][0]['bind']['create_host_path'])
+        self.assertFalse(identity['volumes'][0]['bind'].get('create_host_path', False))
         self.assertEqual(services['api']['environment']['OIDC_SERVER_URL'], 'https://terminology.example.org/auth')
         self.assertEqual(services['web']['environment']['OIDC_RP_CLIENT_ID'], 'ocl-web')
         self.assertEqual(services['web']['environment']['LOGIN_REDIRECT_URL'], 'https://terminology.example.org/')

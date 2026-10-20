@@ -1,15 +1,18 @@
 """Check OIDC linking and authorization with synthetic identities and no services."""
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from django.contrib.auth.models import Group
 from django.core.exceptions import SuspiciousOperation
 from django.test import SimpleTestCase, override_settings
 from rest_framework.exceptions import AuthenticationFailed
-from rest_framework.test import APIRequestFactory
+from rest_framework.test import APIRequestFactory, force_authenticate
 
 from core.common.backends import OCLOIDCAuthenticationBackend
 from core.common.exceptions import DeactivatedAccountLoginRefused
 from core.users.models import UserProfile
-from core.users.views import UserPasswordResetView
+from core.users.serializers import UserDetailSerializer
+from core.users.views import UserDetailView, UserPasswordResetView
 
 
 @override_settings(SELF_REGISTRATION_EMAIL_DOMAINS={'pucp.edu.pe'})
@@ -214,3 +217,65 @@ class OIDCIdentityTest(SimpleTestCase):
             response = UserPasswordResetView.as_view()(request)
         self.assertEqual(response.status_code, 404)
         lookup.assert_called_once_with(email='synthetic@pucp.edu.pe')
+
+    @patch('core.services.auth.core.AuthService.is_sso_enabled', return_value=True)
+    def test_sso_profile_put_rejects_identifier_changes_before_save(self, _sso):
+        """Self-service and staff requests cannot desynchronize the SSO identity."""
+        for is_staff in (False, True):
+            for field, value in (('username', 'changed-member'), ('email', 'changed@pucp.edu.pe')):
+                with self.subTest(is_staff=is_staff, field=field):
+                    self.user.is_staff = is_staff
+                    request = APIRequestFactory().put('/user/', {field: value}, format='json')
+                    force_authenticate(request, user=self.user)
+                    with patch.object(self.user, 'save') as save, patch.object(self.user, 'set_checksums'):
+                        response = UserDetailView.as_view()(request, user_is_self=True)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn(field, response.data)
+                    save.assert_not_called()
+        self.assertEqual(self.user.username, 'synthetic-member')
+        self.assertEqual(self.user.email, 'synthetic@pucp.edu.pe')
+
+    @patch('core.services.auth.core.AuthService.is_sso_enabled', return_value=True)
+    def test_sso_profile_accepts_unchanged_identifiers_and_other_fields(self, _sso):
+        """Normal profile edits can echo the existing username and email."""
+        request = SimpleNamespace(user=self.user, query_params={}, path='/user/')
+        serializer = UserDetailSerializer(self.user, data={
+            'username': self.user.username, 'email': self.user.email, 'bio': 'Updated profile'
+        }, partial=True, context={'request': request})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        with patch.object(self.user, 'save') as save, patch.object(self.user, 'set_checksums'):
+            serializer.save()
+        save.assert_called_once()
+        self.assertEqual(self.user.bio, 'Updated profile')
+
+    @patch('core.services.auth.core.AuthService.is_sso_enabled', return_value=False)
+    def test_local_profile_keeps_identifier_updates(self, _sso):
+        """Installations without SSO keep their existing profile update behavior."""
+        request = SimpleNamespace(user=self.user, query_params={}, path='/user/')
+        serializer = UserDetailSerializer(self.user, data={
+            'username': 'changed-member', 'email': 'changed@pucp.edu.pe'
+        }, partial=True, context={'request': request})
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        with patch.object(self.user, 'save'), patch.object(self.user, 'set_checksums'):
+            serializer.save()
+        self.assertEqual(self.user.username, 'changed-member')
+        self.assertEqual(self.user.email, 'changed@pucp.edu.pe')
+
+    @patch('core.services.auth.core.AuthService.is_sso_enabled', return_value=True)
+    def test_sso_local_group_management_remains_staff_only(self, _sso):
+        """Local staff retain group management; SSO does not let users choose privileges."""
+        for is_staff in (False, True):
+            with self.subTest(is_staff=is_staff):
+                self.user.is_staff = is_staff
+                request = SimpleNamespace(user=self.user, query_params={}, path='/user/')
+                serializer = UserDetailSerializer(self.user, context={'request': request})
+                with patch.object(self.user, 'save'), patch.object(self.user, 'set_checksums'), \
+                        patch.object(Group.objects, 'filter') as groups, \
+                        patch.object(type(self.user.groups), 'set') as set_groups:
+                    serializer.update(self.user, {'auth_groups': ['synthetic-approved-group']})
+                if is_staff:
+                    groups.assert_called_once_with(name__in=['synthetic-approved-group'])
+                    set_groups.assert_called_once_with(groups.return_value)
+                else:
+                    groups.assert_not_called()
+                    set_groups.assert_not_called()

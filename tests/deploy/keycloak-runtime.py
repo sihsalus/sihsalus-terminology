@@ -25,7 +25,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 BASE = 'http://127.0.0.1:18081/auth'
 CALLBACK = 'http://127.0.0.1:18765/'
-PASSWORD = 'Synthetic-Research-2026!'
+PASSWORD = 'Synthetic-Investigación-2026!'
 NEW_PASSWORD = 'Synthetic-Research-Updated-2026!'
 ADMIN_PASSWORD = 'Synthetic-Admin-2026!'
 POSTGRES_IMAGE = ('postgres:14.24-alpine@sha256:'
@@ -99,15 +99,23 @@ class Browser:
         form = page.forms[form_id]
         return self.request(form['action'], {**form['fields'], **values})
 
-    def json(self, url, fields=None, bearer=None):
+    def json(self, url, fields=None, bearer=None, json_content=None):
         headers = {'Authorization': 'Bearer ' + bearer} if bearer else {}
+        headers['Accept'] = 'application/json'
         data = urlencode(fields).encode() if fields is not None else None
+        if json_content is not None:
+            data = json.dumps(json_content).encode()
+            headers['Content-Type'] = 'application/json'
         try:
             with self.opener.open(Request(url, data=data, headers=headers), timeout=20) as response:
                 return response.code, json.load(response)
         except HTTPError as error:
             with error:
-                return error.code, json.load(error)
+                body = error.read().decode('utf-8')
+                try:
+                    return error.code, json.loads(body)
+                except json.JSONDecodeError:
+                    return error.code, {}
 
 
 class Mailbox:
@@ -138,7 +146,7 @@ class Mailbox:
         raise AssertionError('Expected synthetic verification/reset mail was not received.')
 
 
-def authorization(browser, register=False):
+def authorization(browser, register=False, action=None):
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip('=')
     endpoint = 'registrations' if register else 'auth'
@@ -147,6 +155,7 @@ def authorization(browser, register=False):
         'scope': 'openid profile email', 'state': secrets.token_urlsafe(16),
         'nonce': secrets.token_urlsafe(16), 'code_challenge': challenge,
         'code_challenge_method': 'S256',
+        **({'kc_action': action} if action else {}),
     })
     return browser.request(url), verifier
 
@@ -170,6 +179,7 @@ def login(username, password, allowed=True):
     require(status == 200 and claims.get('preferred_username') == username, 'Username claim changed.')
     require(claims.get('email_verified') is True, 'Verified email claim missing.')
     require('groups' not in claims, 'Identity provider must not grant local OCL groups.')
+    return browser, token['access_token']
 
 
 def prepare_realm(path):
@@ -262,8 +272,20 @@ def verify(mailbox):
     require(not parse_qs(urlparse(result.url).query).get('code'), 'Unverified registration issued a code.')
     browser.request(mailbox.link(address, 0))
     require(users(username)[0]['emailVerified'] is True, 'Verification link did not confirm email.')
-    login(username, PASSWORD)
+    browser, access_token = login(username, PASSWORD)
     print('PASS: native registration sends a captured confirmation mail and permits verified login.')
+
+    status, _ = browser.json(BASE + '/realms/ocl/account/', bearer=access_token, json_content={
+        'username': username, 'email': 'changed-researcher@pucp.edu.pe',
+        'firstName': 'Synthetic', 'lastName': 'Researcher',
+    })
+    require(status in (401, 403, 404), 'Account REST API allowed self-service profile editing.')
+    for action in ('UPDATE_PROFILE', 'UPDATE_EMAIL'):
+        result, _ = authorization(browser, action=action)
+        require(not any('email' in form['fields'] for form in result.forms.values()),
+                'Disabled identity action exposed an email editing form.')
+        require(users(username)[0]['email'] == address, 'Identity action changed the verified email.')
+    print('PASS: account REST and application-initiated actions cannot change the OCL identity.')
 
     before = len(mailbox.messages)
     browser = Browser()
@@ -329,8 +351,9 @@ def main():
                    os.environ.get('KEYCLOAK_TEST_IMAGE', 'terminology-keycloak:ci'),
                    'start', '--optimized', '--import-realm')
             for _ in range(120):
-                status = docker('inspect', '--format', '{{.State.Health.Status}}', server).stdout.strip()
-                if status == 'healthy':
+                state = json.loads(docker('inspect', '--format', '{{json .State}}', server).stdout)
+                require(state['Running'], 'Candidate Keycloak stopped during initialization.')
+                if state.get('Health', {}).get('Status') == 'healthy':
                     break
                 time.sleep(2)
             else:
@@ -342,6 +365,8 @@ def main():
             # Synthetic setup has no private data. Avoid HTTP request/response or mail bodies in output.
             logs = docker('logs', '--tail', '80', server, check=False)
             print(logs.stdout + logs.stderr)
+            state = docker('inspect', '--format', '{{json .State}}', server, check=False)
+            print(state.stdout or state.stderr)
             raise
         finally:
             smtp.stop()

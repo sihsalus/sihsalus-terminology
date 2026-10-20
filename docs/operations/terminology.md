@@ -228,6 +228,15 @@ permisos de edición por registrar una cuenta. La importación no envía correos
 El registro y la recuperación iniciados por el titular sí los envían mediante
 SMTP. Revisar previamente el destinatario de cualquier prueba de entrega real.
 
+Username y correo se mantienen alineados entre OCL y Keycloak. Con SSO, la API
+rechaza modificarlos desde la edición de perfil, incluso para staff: un cambio
+requiere revisar y actualizar ambas identidades de forma coordinada. La consola
+de cuentas de Keycloak y las acciones de actualización de perfil/correo están
+deshabilitadas; las acciones nativas de verificar correo y cambiar/recuperar
+contraseña siguen disponibles. El perfil de OCL conserva su interfaz existente.
+Los grupos y privilegios se administran en OCL por su personal autorizado; los
+claims de grupos del proveedor nunca conceden ni retiran esos permisos.
+
 En el primer arranque, la importación mantiene el registro cerrado hasta que
 API y web estén listos. Al final de cada despliegue,
 `scripts/terminology/keycloak-setup.py reconcile` aplica SMTP y el valor revisado

@@ -292,6 +292,19 @@ class UserDetailSerializer(PrivateUserFieldsMixin, AbstractResourceSerializer):
 
         return None
 
+    def validate(self, attrs):
+        """Keep SSO identifiers synchronized with the identity provider."""
+        from core.services.auth.core import AuthService
+        if self.instance and AuthService.is_sso_enabled():
+            errors = {
+                field: 'This identifier cannot be changed while Single Sign On is enabled. Contact an administrator.'
+                for field in ('username', 'email')
+                if field in attrs and attrs[field] != getattr(self.instance, field)
+            }
+            if errors:
+                raise serializers.ValidationError(errors)
+        return super().validate(attrs)
+
     def update(self, instance, validated_data):
         request_user = self.context['request'].user
         instance.email = validated_data.get('email', instance.email)
@@ -306,10 +319,8 @@ class UserDetailSerializer(PrivateUserFieldsMixin, AbstractResourceSerializer):
         instance.extras = validated_data.get('extras', instance.extras)
         instance.updated_by = request_user
 
-        from core.services.auth.core import AuthService
-        # Standalone only (under SSO, Keycloak owns membership via set_groups), and admin-only: a group carries
-        # permissions and capability limits, so letting users pick their own groups lets them pick their own limits.
-        if not AuthService.is_sso_enabled() and request_user.is_staff:
+        # Django owns local permissions in both authentication modes. Only staff can assign groups.
+        if request_user.is_staff:
             auth_groups = validated_data.get('auth_groups', None)
             if isinstance(auth_groups, list):
                 instance.groups.set(Group.objects.filter(name__in=auth_groups))

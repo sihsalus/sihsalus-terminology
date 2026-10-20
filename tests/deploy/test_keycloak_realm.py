@@ -92,7 +92,7 @@ class KeycloakRealmTests(unittest.TestCase):
         self.assertFalse(realm['editUsernameAllowed'])
         self.assertEqual(realm['registrationAllowed'], '${TERMINOLOGY_ALLOW_SELF_REGISTRATION}')
         self.assertEqual(realm['defaultLocale'], 'es')
-        client, = realm['clients']
+        client = next(item for item in realm['clients'] if item['clientId'] == 'ocl-web')
         self.assertEqual(client['clientId'], 'ocl-web')
         self.assertTrue(client['publicClient'])
         self.assertTrue(client['standardFlowEnabled'])
@@ -104,6 +104,17 @@ class KeycloakRealmTests(unittest.TestCase):
         self.assertEqual(client['redirectUris'], ['${TERMINOLOGY_WEB_URL}/'])
         self.assertNotIn('protocolMappers', client)
         self.assertNotIn('defaultGroups', realm)
+
+    def test_account_self_service_cannot_change_the_ocl_identity(self):
+        clients = {item['clientId']: item for item in self.template['clients']}
+        self.assertFalse(clients['account']['enabled'])
+        self.assertFalse(clients['account']['standardFlowEnabled'])
+        self.assertNotIn('account-console', clients)
+        actions = {item['alias']: item for item in self.template['requiredActions']}
+        for action in ('UPDATE_PROFILE', 'UPDATE_EMAIL', 'VERIFY_PROFILE'):
+            self.assertFalse(actions[action]['enabled'])
+        for action in ('VERIFY_EMAIL', 'UPDATE_PASSWORD'):
+            self.assertTrue(actions[action]['enabled'])
 
     def test_native_email_validation_rejects_domain_lookalikes(self):
         provider, = self.template['components']['org.keycloak.userprofile.UserProfileProvider']
