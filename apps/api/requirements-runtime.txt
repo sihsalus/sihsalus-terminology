@@ -39,9 +39,9 @@ ijson==3.2.3
 pydantic==2.10.6
 minio==7.2.9
 elastic-transport==8.17
-strawberry-graphql==0.315.7
+strawberry-graphql==0.326.1
 strawberry-graphql-django==0.80.0
-graphql-core==3.2.12 # 3.3.0 drops graphql.execution.ExecutionContext, which strawberry-graphql 0.315.7 imports
+graphql-core==3.2.12 # Keep the GraphQL core version validated with our schema and optimizer.
 # Security floors for transitive HTTP and queue serialization dependencies.
 urllib3==2.8.0
 msgpack==1.2.3
