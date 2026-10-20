@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -50,7 +51,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result['images'], self.manifest['images'])
         self.assertEqual(result['storage_scan'], result['workflow_run'])
 
-    def test_rejects_findings_in_each_of_six_images(self):
+    def test_rejects_findings_in_each_of_seven_images(self):
         for file in list(self.root.glob('*/security.json')) + list(self.root.glob('*/storage.json')):
             original = file.read_text()
             data = json.loads(original)
@@ -83,6 +84,12 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.validate(manifest)
 
+    def test_manifest_requires_keycloak_even_when_sso_is_disabled(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest['images'].pop('keycloak')
+        with self.assertRaisesRegex(ValueError, 'six runtime images'):
+            release.validate(manifest)
+
     def prepare(self):
         with patch.object(release.subprocess, 'check_output', return_value=COMMIT+'\n'), \
              patch.object(release, 'compose', return_value=json.dumps(self.model)):
@@ -96,6 +103,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(candidate.count('TERMINOLOGY_SOURCE_SHA='), 1)
         self.assertIn('TERMINOLOGY_SOURCE_SHA='+COMMIT, candidate)
         self.assertEqual(self.candidate.stat().st_mode & 0o777, 0o600)
+        self.assertIn('TERMINOLOGY_KEYCLOAK_IMAGE='+self.manifest['images']['keycloak'], candidate)
+
+    def test_prepare_validates_optional_keycloak_profile(self):
+        with patch.object(release.subprocess, 'check_output', return_value=COMMIT+'\n'), \
+             patch.object(release, 'compose', return_value=json.dumps(self.model)) as compose:
+            release.prepare(self.manifest, self.env, self.candidate)
+        compose.assert_called_once_with(self.candidate, '--profile', 'keycloak', 'config', '--format', 'json')
 
     def test_prepare_never_overwrites_existing_candidate(self):
         self.candidate.write_text('existing')
@@ -110,7 +124,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(self.candidate.exists())
 
     def test_prepare_rejects_override_and_cleans_failed_candidate(self):
-        for service in ('storage', 'api'):
+        for service in ('storage', 'api', 'keycloak'):
             original = self.model['services'][service]['image']
             self.model['services'][service]['image'] = 'wrong'
             with self.subTest(service=service), self.assertRaises(ValueError):
@@ -129,19 +143,84 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.private_env(link)
 
-    def containers(self):
+    def containers(self, oidc=False):
         return [dict(Config=dict(Image=self.reference(app), Labels={
                     'com.docker.compose.service': service, 'org.opencontainers.image.revision': COMMIT}),
                      State=dict(Running=True, OOMKilled=False, Health=dict(Status='healthy')),
-                     RestartCount=0) for service, app in release.SERVICES.items()]
+                     RestartCount=0) for service, app in release.SERVICES.items()
+                if service != 'keycloak' or oidc]
 
     def verify(self, items):
+        check_output = subprocess.check_output
+
+        def inspect(args, **kwargs):
+            if args[:2] == ['docker', 'inspect']:
+                return json.dumps(items)
+            return check_output(args, **kwargs)
+
         with patch.object(release, 'compose', return_value='\n'.join(str(i) for i in range(len(items)))), \
-             patch.object(release.subprocess, 'check_output', return_value=json.dumps(items)):
+             patch.object(release.subprocess, 'check_output', side_effect=inspect):
             return release.verify(self.manifest, self.env)
 
     def test_verify_nine_healthy_services(self):
         self.assertEqual(len(self.verify(self.containers())['services']), 9)
+
+    def enable_oidc(self):
+        """Model the explicit activation flag using an unrelated synthetic host."""
+        self.env.write_text(self.original.decode() + "TERMINOLOGY_OIDC_SERVER_URL='https://identity.example.org'\n")
+
+    def test_verify_ten_healthy_services_with_oidc(self):
+        self.enable_oidc()
+        services = self.verify(self.containers(oidc=True))['services']
+        self.assertEqual(len(services), 10)
+        self.assertEqual(services['keycloak']['health'], 'healthy')
+
+    def test_oidc_requires_provider_and_disabled_oidc_rejects_stale_provider(self):
+        with self.assertRaisesRegex(ValueError, 'Expected 9'):
+            self.verify(self.containers(oidc=True))
+        self.enable_oidc()
+        with self.assertRaisesRegex(ValueError, 'Expected 10'):
+            self.verify(self.containers())
+
+    def test_keycloak_health_revision_and_digest_are_required(self):
+        self.enable_oidc()
+        for section, name, value in (
+                ('State', 'Health', {}), ('State', 'Health', {'Status': 'unhealthy'}),
+                ('State', 'Running', False), ('State', 'OOMKilled', True),
+                ('Config', 'Image', 'wrong'),
+        ):
+            items = self.containers(oidc=True)
+            provider = next(item for item in items if item['Config']['Labels']['com.docker.compose.service'] == 'keycloak')
+            provider[section][name] = value
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                self.verify(items)
+        items = self.containers(oidc=True)
+        provider = next(item for item in items if item['Config']['Labels']['com.docker.compose.service'] == 'keycloak')
+        provider['Config']['Labels']['org.opencontainers.image.revision'] = 'd'*40
+        with self.assertRaisesRegex(ValueError, 'source revision'):
+            self.verify(items)
+
+    def test_oidc_reader_supports_legacy_empty_quoted_and_exported_values(self):
+        for suffix, expected in (
+                ('', False), ('TERMINOLOGY_OIDC_SERVER_URL=\n', False),
+                ("TERMINOLOGY_OIDC_SERVER_URL=''\n", False),
+                ('export TERMINOLOGY_OIDC_SERVER_URL="" # disabled\n', False),
+                ("TERMINOLOGY_OIDC_SERVER_URL='# literal'\n", True),
+                ('TERMINOLOGY_OIDC_SERVER_URL="# literal"\n', True),
+                ('TERMINOLOGY_OIDC_SERVER_URL=#literal\n', True),
+                ("export TERMINOLOGY_OIDC_SERVER_URL='https://identity.example.org' # own realm\n", True),
+                ('TERMINOLOGY_OIDC_SERVER_URL=https://identity.example.org\n'
+                 'TERMINOLOGY_OIDC_SERVER_URL= # disabled\n', False),
+        ):
+            with self.subTest(suffix=suffix):
+                self.env.write_text(self.original.decode() + suffix)
+                self.assertIs(release.oidc_enabled(self.env), expected)
+
+    def test_oidc_reader_does_not_execute_shell_substitutions(self):
+        marker = self.root / 'must-not-exist'
+        self.env.write_text(self.original.decode() + f'TERMINOLOGY_OIDC_SERVER_URL=$(touch {marker})\n')
+        self.assertTrue(release.oidc_enabled(self.env))
+        self.assertFalse(marker.exists())
 
     def test_verify_detects_missing_service_and_runtime_drift(self):
         with self.assertRaises(ValueError):

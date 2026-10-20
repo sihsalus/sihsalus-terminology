@@ -29,6 +29,7 @@ class ReceiverTests(unittest.TestCase):
         (self.root / 'scripts/deploy').mkdir(parents=True)
         shutil.copy2(SOURCE / 'scripts/deploy/env.sh', self.root / 'scripts/deploy/env.sh')
         self.settings = {key: 'synthetic-value' for key in module.CONFIG_KEYS}
+        self.settings.update(module.OPTIONAL_SSO_DEFAULTS)
         self.settings.update(TERMINOLOGY_MACHINE_ID='a'*32, TERMINOLOGY_BACKUP_KEEP='14',
                              TERMINOLOGY_EMAIL_PORT='587', TERMINOLOGY_ADMIN_EMAIL='',
                              TERMINOLOGY_ALLOW_SELF_REGISTRATION='false',
@@ -100,6 +101,126 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(self.env.read_text(), self.original)
         self.assertEqual(self.active.read_text(), self.original)
         self.assertFalse(self.calls)
+
+    def existing_sso(self):
+        """Model an already reviewed SSO deployment, without running any service."""
+        self.settings.update(
+            TERMINOLOGY_OIDC_SERVER_URL='https://synthetic-value/auth',
+            TERMINOLOGY_OIDC_CLIENT_ID='ocl-web',
+            TERMINOLOGY_KEYCLOAK_DB_PASSWORD='synthetic-keycloak-database',
+            TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD='synthetic-keycloak-admin',
+        )
+        self.original = ''.join(key + "='" + value + "'\n" for key, value in self.settings.items())
+        for path in (self.env, self.active):
+            path.write_text(self.original)
+        self.payload['settings'] = self.settings.copy()
+
+    def test_legacy_configuration_and_payload_keep_local_authentication(self):
+        for key in module.OPTIONAL_SSO_DEFAULTS:
+            del self.payload['settings'][key]
+        self.original = ''.join(
+            line + '\n' for line in self.original.splitlines()
+            if not any(line.startswith(key + '=') for key in module.OPTIONAL_SSO_DEFAULTS))
+        for path in (self.env, self.active):
+            path.write_text(self.original)
+        self.assertEqual(self.receive()['status'], 'unchanged')
+        self.unchanged()
+        for key, value in module.OPTIONAL_SSO_DEFAULTS.items():
+            self.assertEqual(module.read_configuration(self.env)[key], value)
+
+    def test_blank_optional_admin_username_uses_default(self):
+        self.payload['settings']['TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME'] = ''
+        self.assertEqual(self.receive()['status'], 'unchanged')
+        self.unchanged()
+
+    def test_rejects_sso_activation_through_configuration_sync(self):
+        self.payload['settings'].update(
+            TERMINOLOGY_OIDC_SERVER_URL='https://synthetic-value/auth',
+            TERMINOLOGY_OIDC_CLIENT_ID='ocl-web',
+            TERMINOLOGY_KEYCLOAK_DB_PASSWORD='synthetic-keycloak-database',
+            TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD='synthetic-keycloak-admin',
+        )
+        with self.assertRaisesRegex(module.ConfigurationError, 'coordinated'):
+            self.receive()
+        self.unchanged()
+
+    def test_existing_sso_noop_preserves_configuration(self):
+        self.existing_sso()
+        self.assertEqual(self.receive()['status'], 'unchanged')
+        self.unchanged()
+
+    def test_existing_sso_allows_smtp_rotation_with_profile(self):
+        self.existing_sso()
+        self.payload['settings']['TERMINOLOGY_EMAIL_HOST_PASSWORD'] = 'rotated-synthetic-smtp'
+        result = self.receive()
+        self.assertEqual(result['changed_keys'], ['TERMINOLOGY_EMAIL_HOST_PASSWORD'])
+        self.assertEqual(result['status'], 'applied')
+        self.assertEqual(self.calls[0][-4:], ['--profile', 'keycloak', 'config', '--quiet'])
+        self.assertNotIn('rotated-synthetic-smtp', self.output)
+
+    def test_existing_sso_registration_uses_existing_smtp(self):
+        self.existing_sso()
+        self.payload['settings']['TERMINOLOGY_ALLOW_SELF_REGISTRATION'] = 'true'
+        result = self.receive()
+        self.assertEqual(result['changed_keys'], ['TERMINOLOGY_ALLOW_SELF_REGISTRATION'])
+        self.assertEqual(result['status'], 'applied')
+
+    def test_rejects_sso_disable_and_admin_rename(self):
+        self.existing_sso()
+        cases = [dict(TERMINOLOGY_OIDC_SERVER_URL='', TERMINOLOGY_OIDC_CLIENT_ID=''),
+                 dict(TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME='another-admin')]
+        for changed in cases:
+            with self.subTest(keys=list(changed)):
+                self.payload['settings'] = dict(self.settings, **changed)
+                with self.assertRaisesRegex(module.ConfigurationError, 'coordinated'):
+                    self.receive()
+                self.unchanged()
+
+    def test_sso_rejects_noncanonical_url_or_client(self):
+        self.existing_sso()
+        cases = [dict(TERMINOLOGY_OIDC_SERVER_URL=''), dict(TERMINOLOGY_OIDC_CLIENT_ID=''),
+                 dict(TERMINOLOGY_OIDC_SERVER_URL='http://synthetic-value/auth'),
+                 dict(TERMINOLOGY_OIDC_SERVER_URL='https://different-host/auth'),
+                 dict(TERMINOLOGY_OIDC_SERVER_URL='https://synthetic-value/auth/'),
+                 dict(TERMINOLOGY_OIDC_CLIENT_ID='another-client')]
+        for changed in cases:
+            with self.subTest(keys=list(changed)):
+                self.payload['settings'] = dict(self.settings, **changed)
+                with self.assertRaisesRegex(module.ConfigurationError, 'Invalid local Keycloak'):
+                    self.receive()
+                self.unchanged()
+
+    def test_sso_requires_credentials(self):
+        self.existing_sso()
+        for key in ('TERMINOLOGY_KEYCLOAK_DB_PASSWORD', 'TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD'):
+            with self.subTest(key=key):
+                self.payload['settings'] = dict(self.settings, **{key: ''})
+                with self.assertRaisesRegex(module.ConfigurationError, 'Missing configuration: ' + key):
+                    self.receive()
+                self.unchanged()
+
+    def test_sso_requires_smtp_even_when_registration_is_closed(self):
+        self.existing_sso()
+        self.payload['settings']['TERMINOLOGY_EMAIL_BACKEND'] = 'django.core.mail.backends.dummy.EmailBackend'
+        with self.assertRaisesRegex(module.ConfigurationError, 'Keycloak requires SMTP'):
+            self.receive()
+        self.unchanged()
+
+    def test_sso_credential_rotations_require_coordinated_change(self):
+        self.existing_sso()
+        for key in ('TERMINOLOGY_KEYCLOAK_DB_PASSWORD', 'TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD'):
+            with self.subTest(key=key):
+                self.payload['settings'] = dict(self.settings, **{key: 'rotated-synthetic-secret'})
+                with self.assertRaisesRegex(module.ConfigurationError, 'coordinated'):
+                    self.receive()
+                self.unchanged()
+
+    def test_keycloak_image_is_managed_by_release_not_config_sync(self):
+        self.assertNotIn('TERMINOLOGY_KEYCLOAK_IMAGE', module.CONFIG_KEYS)
+        self.payload['settings']['TERMINOLOGY_KEYCLOAK_IMAGE'] = 'unreviewed-image'
+        with self.assertRaisesRegex(module.ConfigurationError, 'configuration keys'):
+            self.receive()
+        self.unchanged()
 
     def test_registration_requires_smtp(self):
         self.payload['settings']['TERMINOLOGY_ALLOW_SELF_REGISTRATION'] = 'true'
@@ -240,6 +361,25 @@ class ReceiverTests(unittest.TestCase):
             with self.assertRaises(BlockingIOError):
                 self.receive()
         self.unchanged()
+
+
+class SecretGenerationTests(unittest.TestCase):
+    def test_generates_distinct_private_keycloak_credentials_without_enabling_sso(self):
+        """Exercise only the local secret generator; no Docker or network calls."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'synthetic.env'
+            subprocess.run(['bash', str(SOURCE / 'scripts/security/secrets_generate.sh'), str(output)],
+                           check=True, capture_output=True, text=True)
+            settings = module.read_configuration(output)
+            database = settings['TERMINOLOGY_KEYCLOAK_DB_PASSWORD']
+            admin = settings['TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD']
+            self.assertRegex(database, r'^[a-f0-9]{48}$')
+            self.assertRegex(admin, r'^[a-f0-9]{48}$')
+            self.assertNotEqual(database, admin)
+            self.assertEqual(settings['TERMINOLOGY_OIDC_SERVER_URL'], '')
+            self.assertEqual(settings['TERMINOLOGY_OIDC_CLIENT_ID'], '')
+            self.assertEqual(settings['TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME'], 'sihsalus-admin')
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == '__main__':

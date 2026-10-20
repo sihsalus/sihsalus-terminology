@@ -392,6 +392,10 @@ class UserPasswordResetView(UserBaseView):
     def post(self, request, *args, **kwargs):  # pylint: disable=unused-argument
         """Sends reset password mail"""
 
+        if AuthService.is_sso_enabled():
+            raise Http400({'error': [
+                "Single Sign On is enabled. Use the identity provider to reset your password."
+            ]})
         email = request.data.get('email')
         if not email:
             return Response(status=status.HTTP_400_BAD_REQUEST)

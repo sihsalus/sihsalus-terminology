@@ -1,5 +1,7 @@
 from unittest.mock import patch, Mock, ANY
 
+from django.test import override_settings
+
 from core.services.auth.django import DjangoAuthService
 from core.services.auth.openid import OpenIDAuthService
 from core.common.tests import OCLTestCase
@@ -21,6 +23,7 @@ class DjangoAuthServiceTest(OCLTestCase):
         self.assertTrue(len(token), 64)
 
 
+@override_settings(OIDC_TIMEOUT=10)
 class OpenIDAuthServiceTest(OCLTestCase):
     def test_get_login_redirect_url(self):
         self.assertEqual(
@@ -53,7 +56,9 @@ class OpenIDAuthServiceTest(OCLTestCase):
                 'client_secret': 'client-secret',
                 'code': 'code',
                 'redirect_uri': 'http://localhost:4000'
-            }
+            },
+            verify=True,
+            timeout=10,
         )
 
     @patch('requests.post')
@@ -71,7 +76,8 @@ class OpenIDAuthServiceTest(OCLTestCase):
                 'password': 'password',
                 'client_id': 'admin-cli'
             },
-            verify=False
+            verify=True,
+            timeout=10,
         )
 
     @patch('core.services.auth.openid.OpenIDAuthService.get_admin_token')
@@ -98,6 +104,7 @@ class OpenIDAuthServiceTest(OCLTestCase):
                 'username': user.username,
                 'credentials': ANY
             },
-            verify=False,
+            verify=True,
+            timeout=10,
             headers={'Authorization': 'Bearer token'}
         )

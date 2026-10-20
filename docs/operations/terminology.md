@@ -6,7 +6,7 @@ digest; no se compila en `gidis-terminology`.
 
 ## Preparación
 
-1. Construir y verificar las imágenes API, web, PostgreSQL, Redis y Elasticsearch
+1. Construir y verificar las imágenes API, web, PostgreSQL, Redis, Elasticsearch y Keycloak
    en el workflow `Terminology runtime`. Exigir pruebas, análisis de dependencias y escaneo de las imágenes
    satisfactorios en el mismo commit que se despliega.
    El workflow `Terminology runtime` comprueba además el almacenamiento
@@ -22,7 +22,7 @@ digest; no se compila en `gidis-terminology`.
    `/etc/machine-id` esperado, SHA fuente y referencias por digest.
 4. Instalar `terminology/sihsalus-terminology.slice` en `/etc/systemd/system/`;
    ejecutar `systemctl daemon-reload` y habilitar la unidad. Docker debe usar
-   el controlador systemd. El conjunto tiene un máximo de 5 GiB, 1.5 CPU y
+   el controlador systemd. El conjunto tiene un máximo de 6 GiB, 1.5 CPU y
    1 GiB de swap; cada servicio tiene además su límite individual.
 5. Mantener `vm.max_map_count` al menos en 262144. Reservar 10 GiB de disco
    después del pull y espacio adicional para backups y la versión anterior.
@@ -131,30 +131,35 @@ configurada en `WEB_URL`. El registro institucional se habilita por separado.
 
 Para desactivar el correo, volver a
 `TERMINOLOGY_EMAIL_BACKEND=django.core.mail.backends.dummy.EmailBackend` y
-recrear los servicios de aplicación conservando los datos. No revertir a una
+recrear los servicios de aplicación conservando los datos, únicamente cuando
+SSO y el registro estén deshabilitados. Keycloak requiere SMTP para verificar
+direcciones y recuperar contraseñas. No revertir a una
 imagen que mantenga destinatarios de OCL con SMTP habilitado.
 
 ## Registro institucional
 
 Establecer `TERMINOLOGY_ALLOW_SELF_REGISTRATION=true` en la configuración privada
 (y en las Variables del entorno `terminology` de GitHub) habilita el formulario
-`/#/signup` y el registro de la API. Requiere desplegar primero las imágenes que
+`/#/signup`: con SSO redirige al registro de Keycloak; sin SSO usa el formulario
+local y el registro de la API. Requiere desplegar primero las imágenes que
 incluyen el formulario local y la validación institucional. El despliegue y la
 sincronización rechazan esta opción cuando SMTP está deshabilitado.
 
-Compose fija `SELF_REGISTRATION_EMAIL_DOMAINS=pucp.edu.pe` en la API. Solo se
+Sin SSO, Compose fija `SELF_REGISTRATION_EMAIL_DOMAINS=pucp.edu.pe` en la API. Solo se
 aceptan correos con ese dominio completo, sin distinguir mayúsculas. No se
 admiten subdominios ni sufijos parecidos. La API rechaza registros si no se
 configura una lista de dominios; la creación administrativa mantiene su flujo.
 El navegador de esta instalación informa explícitamente la política PUCP.
 
 Las cuentas de OCL Online son independientes: cada miembro debe crear su cuenta
-local, confirmar el enlace recibido por correo y después iniciar sesión. La
-verificación utiliza el token nativo de OCL; no se atribuye caducidad temporal a
-ese token. El registro no otorga roles administrativos ni membresías en
+en esta instalación, confirmar el enlace recibido por correo y después iniciar
+sesión. Sin SSO, la verificación utiliza el token nativo de OCL; no se atribuye
+caducidad temporal a ese token. Con SSO, Keycloak aplica la restricción PUCP y
+gestiona los enlaces de verificación y recuperación. El registro no otorga roles administrativos ni membresías en
 organizaciones. Los permisos existentes de cada catálogo siguen determinando su
 lectura y edición. Una cuenta sin verificar no puede iniciar sesión; intentarlo
-reenvía el correo de verificación mediante el mecanismo existente.
+reenvía el correo de verificación mediante el mecanismo local existente cuando
+SSO está deshabilitado.
 
 Antes de habilitarlo, revisar el SHA y los digests, comprobar SMTP y ejecutar las
 pruebas sintéticas del flujo. La entrega real al buzón debe confirmarse con un
@@ -162,6 +167,88 @@ registro iniciado por su titular. No crear cuentas de compañeros usando correos
 supuestos. Para cerrar nuevos registros, volver a
 `TERMINOLOGY_ALLOW_SELF_REGISTRATION=false` y aplicar la configuración: las
 cuentas existentes conservan su acceso y sus datos.
+
+## Keycloak propio y migración de identidades
+
+El proveedor es opcional. Las instalaciones anteriores mantienen autenticación
+local al omitir las claves nuevas. Para habilitarlo mediante una actualización
+revisada, configurar estos valores en el candidato privado:
+
+| Parámetro | Valor |
+| --- | --- |
+| `TERMINOLOGY_OIDC_SERVER_URL` | `https://<TERMINOLOGY_HOST>/auth` |
+| `TERMINOLOGY_OIDC_CLIENT_ID` | `ocl-web` |
+| `TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME` | `sihsalus-admin`, salvo revisión explícita |
+| `TERMINOLOGY_KEYCLOAK_DB_PASSWORD` | Credencial propia del rol PostgreSQL `keycloak` |
+| `TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD` | Credencial propia de administración de Keycloak |
+| `TERMINOLOGY_KEYCLOAK_IMAGE` | Digest verificado del manifiesto de la versión |
+
+El realm es siempre `ocl`. URL y cliente se habilitan juntos; no se admiten
+proveedores externos intercambiando estas variables. El generador de secretos
+produce ambas contraseñas independientes y deja SSO apagado. La contraseña
+administrativa de Keycloak es distinta de la cuenta OCL `ocladmin`. No regenerar
+todo `.env.terminology` para añadir estas claves a una instalación existente.
+La sincronización de GitHub conserva las imágenes y rechaza cambios de URL,
+cliente, usuario administrador o credenciales persistidas de Keycloak; activar
+SSO y rotar esas credenciales requieren una migración coordinada.
+
+El perfil Compose `keycloak` añade el décimo servicio. Conserva los cinco
+volúmenes actuales: la base `keycloak`, con propietario y contraseña propios,
+vive en el PostgreSQL existente y limita su pool a cinco conexiones. La
+preparación revoca `CREATE ON SCHEMA public FROM PUBLIC` en la base `postgres`
+para impedir que ese nuevo rol cree objetos en el esquema de OCL. La API conserva
+su usuario PostgreSQL actual. Este cambio de ACL debe incluirse en la revisión
+operativa y en una restauración a un clúster nuevo.
+
+Keycloak escucha solo en `127.0.0.1:8081`, bajo `/auth`; la API usa internamente
+`http://keycloak:8080/auth`. Nginx publica los endpoints del realm `ocl` y los
+recursos de interfaz; las rutas administrativas permanecen bloqueadas en el
+sitio público. Administrar mediante el acceso privado al host. Para una
+instalación existente, preparar el candidato Nginx desde la configuración en
+uso y añadir únicamente las ubicaciones `/auth` al servidor web correspondiente.
+Preservar sus `server_name`, certificados y el servidor del alias anterior
+`gidis-terminology.duckdns.org`, incluida la ruta de exportaciones firmadas y su
+redirección. No reemplazar ese archivo completo con la plantilla de dos sitios.
+Revisar el diff, ejecutar `nginx -t` y recargar dentro de la ventana aprobada.
+
+Antes de detener escrituras, comprobar usernames canónicos en minúsculas,
+correos presentes y sin colisiones al ignorar mayúsculas, y compatibilidad de
+los hashes. La exportación privada rechaza identidades ambiguas o hashes no
+compatibles; no los renombra ni restablece contraseñas. El despliegue realiza
+el backup, detiene escrituras, provisiona la base y exporta las cuentas Django
+mediante `scripts/terminology/keycloak-realm.py` para el primer `--import-realm`.
+Los archivos de importación contienen hashes: conservarlos con permisos 600 en
+el journal privado y en `.env.terminology-state/keycloak-import/`, cuyo directorio
+pertenece al UID 1000 y tiene permisos 700. No publicarlos en logs ni artifacts.
+
+La importación conserva username, correo, estado de verificación y hash de
+contraseña. El primer login enlaza la identidad con la cuenta Django existente:
+se conservan su ID, membresías y privilegios locales; el proveedor no concede
+permisos de edición por registrar una cuenta. La importación no envía correos.
+El registro y la recuperación iniciados por el titular sí los envían mediante
+SMTP. Revisar previamente el destinatario de cualquier prueba de entrega real.
+El registro nativo de Keycloak 26.8 confirma primero el correo y luego solicita
+crear la contraseña. El orden de acciones conserva esa secuencia; no modifica
+las contraseñas de las cuentas importadas.
+
+Username y correo se mantienen alineados entre OCL y Keycloak. Con SSO, la API
+rechaza modificarlos desde la edición de perfil, incluso para staff: un cambio
+requiere revisar y actualizar ambas identidades de forma coordinada. La consola
+de cuentas de Keycloak y las acciones de actualización de perfil/correo están
+deshabilitadas; las acciones nativas de verificar correo y cambiar/recuperar
+contraseña siguen disponibles. El perfil de OCL conserva su interfaz existente.
+Los grupos y privilegios se administran en OCL por su personal autorizado; los
+claims de grupos del proveedor nunca conceden ni retiran esos permisos.
+
+En el primer arranque, la importación mantiene el registro cerrado hasta que
+API y web estén listos. Al final de cada despliegue,
+`scripts/terminology/keycloak-setup.py reconcile` aplica SMTP y el valor revisado
+de `TERMINOLOGY_ALLOW_SELF_REGISTRATION` mediante la API administrativa interna.
+Un realm existente no se vuelve a importar. Si la instalación ya tenía SSO y
+falta su base o realm, el despliegue se detiene: restaurar el backup de Keycloak;
+no reconstruirlo desde los hashes Django, que pueden haber quedado obsoletos
+tras cambios de contraseña en el proveedor. Desactivar SSO también exige una
+recuperación de identidades revisada; vaciar las variables no es un rollback.
 
 ## GitHub Secrets y sincronización manual
 
@@ -175,12 +262,17 @@ al entorno de despliegue.
 Guardar como **Secrets** `TERMINOLOGY_DB_PASSWORD`, `TERMINOLOGY_SECRET_KEY`,
 `TERMINOLOGY_ADMIN_PASSWORD`, `TERMINOLOGY_ADMIN_TOKEN`,
 `TERMINOLOGY_STORAGE_ACCESS_KEY`, `TERMINOLOGY_STORAGE_SECRET_KEY`,
+`TERMINOLOGY_KEYCLOAK_DB_PASSWORD`, `TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD`,
 `TERMINOLOGY_EMAIL_HOST_PASSWORD` y `TERMINOLOGY_SSH_PRIVATE_KEY`.
 Guardar como **Variables** los parámetros no secretos enumerados en
 `VARIABLE_KEYS` de `scripts/terminology/sync-github-config.py`, además de
 `TERMINOLOGY_SSH_TARGET` (`usuario@host`, puerto 22) y
 `TERMINOLOGY_SSH_KNOWN_HOSTS`. `TERMINOLOGY_ADMIN_EMAIL` puede omitirse para
 mantener desactivados los informes de errores.
+Las nuevas claves OIDC y Keycloak pueden omitirse mientras SSO esté apagado;
+se interpretan como URL/cliente/contraseñas vacíos y administrador
+`sihsalus-admin`. Una vez activado, GitHub debe contener los mismos valores que
+el despliegue aprobado, aunque la contraseña SMTP sí puede rotarse por `apply`.
 
 La clave SSH es exclusiva de esta integración. Instalar su clave pública en
 `authorized_keys` con `restrict` y un comando forzado que ejecute
@@ -207,6 +299,8 @@ evidencia y requiere revisar el journal antes de reintentar.
 No se rotan mediante este flujo las credenciales persistidas de base de datos,
 almacenamiento y administración, ni la clave Django o la identidad del host:
 requieren un procedimiento coordinado. La contraseña SMTP sí puede actualizarse.
+Esto incluye los dos secretos Keycloak y la configuración de identidad OIDC.
+`TERMINOLOGY_KEYCLOAK_IMAGE` pertenece al manifiesto de release, no a `CONFIG_KEYS`.
 
 Los secretos permanecen también en `.env.terminology` con permisos 600 para
 que la aplicación pueda arrancar y recuperarse sin depender de GitHub. El
@@ -219,6 +313,9 @@ artifacts. Cambiar un Secret en GitHub no cambia la VM hasta ejecutar `apply`.
 - Verificar el digest y revisión de las imágenes ejecutadas, salud de todos los
   servicios, límites efectivos del cgroup y ausencia de reinicios por memoria.
 - Comprobar autenticación y rechazo de operaciones no autorizadas.
+- Con Keycloak, verificar discovery y callbacks HTTPS, PKCE, rechazo de dominios
+  ajenos a PUCP, confirmación de correo y conservación de ID/membresías de una
+  cuenta migrada. Comprobar que la administración no sea accesible públicamente.
 - Crear, editar, consultar y publicar un concepto sintético desde el navegador.
 - Descargar la exportación por HTTPS y comprobar su contenido y enlaces.
 - Importar una copia de los catálogos SIHSALUS y comparar códigos, UUID, mappings
@@ -265,7 +362,8 @@ El ejecutor prefork reutiliza conexiones PostgreSQL durante 60 segundos mediante
 `DB_CONN_MAX_AGE`. Django comprueba su salud y el ciclo de tareas de Celery cierra
 las conexiones caducadas o inutilizables. La API, el coordinador y el scheduler
 conservan el valor predeterminado cero. Se mantienen dos procesos ejecutores y
-el máximo de 40 conexiones de PostgreSQL; comprobar conexiones activas, recursos
+el máximo de 40 conexiones de PostgreSQL; Keycloak dispone de un pool de hasta
+cinco conexiones dentro de ese presupuesto. Comprobar conexiones activas, recursos
 y rendimiento real después de una actualización de Django o Celery.
 
 Aceptar un lote no significa que hayan terminado todas sus tareas derivadas.
@@ -330,9 +428,9 @@ nueva aceptación clínica ni incorpora códigos SNOMED CT adicionales.
 
 1. Elegir una ejecución **completa y satisfactoria** de `Terminology runtime`
    sobre el SHA de `main` aprobado. El job `Collect verified release` solo corre
-   cuando las cinco imágenes y la operación han pasado sus verificaciones.
+   cuando las seis imágenes y la operación han pasado sus verificaciones.
    Su artifact `terminology-release-<SHA>` contiene `release.json`: SHA fuente,
-   ejecución y seis digests. Los escaneos originales permanecen en los artifacts
+   ejecución y siete digests, incluido almacenamiento. Los escaneos originales permanecen en los artifacts
    de esa misma ejecución. Descargar el manifiesto desde Actions; no reconstruirlo
    juntando resultados de ejecuciones distintas.
 2. Guardar fuera de la VM el manifiesto, la evidencia de CI y el respaldo cifrado
@@ -344,7 +442,7 @@ nueva aceptación clínica ni incorpora códigos SNOMED CT adicionales.
    anterior antes de actualizar el checkout. No cambiar el nombre de proyecto
    Compose, los volúmenes ni la ubicación del checkout que usan SSH y el timer.
 4. En el servidor, preparar un candidato privado. El comando conserva los
-   secretos y los parámetros existentes y cambia únicamente SHA y cinco imágenes.
+   secretos y los parámetros existentes y cambia únicamente SHA y seis imágenes.
    Exige el checkout del SHA fuente, digests inmutables, almacenamiento coincidente
    y un destino nuevo. No inicia contenedores ni modifica la configuración instalada.
 
@@ -375,8 +473,9 @@ python3 scripts/terminology/release.py verify \
   "$journal/release.json" "$PWD/.env.terminology" > "$journal/runtime.json"
 ```
 
-6. `verify` exige los nueve contenedores, sus digests y revisiones, cero reinicios
-   y ausencia de OOM; comprueba los cinco healthchecks existentes. Worker,
+6. `verify` exige nueve contenedores sin SSO o diez con Keycloak, sus digests y
+   revisiones, cero reinicios y ausencia de OOM; comprueba cinco healthchecks sin
+   SSO o seis con Keycloak. Worker,
    importer, scheduler y storage solo acreditan proceso en ejecución. Completar
    la sección **Aceptación**: HTTPS, autenticación, permisos, búsqueda, edición,
    publicación, exportación y recuperación. Un contenedor sano no demuestra que
@@ -400,7 +499,7 @@ restaurar automáticamente por el resultado de un healthcheck.
   restaurar PostgreSQL, uploads y objetos del mismo backup en volúmenes nuevos,
   usando su configuración e imágenes registradas; validar antes de cambiar el
   servicio activo. Conservar intactos los volúmenes originales.
-- Comprobar los nueve servicios y repetir la aceptación de la revisión recuperada.
+- Comprobar los nueve servicios, o diez con Keycloak, y repetir la aceptación de la revisión recuperada.
   Registrar el backup, los SHA de operación e imágenes y el resultado. Una copia
   cifrada verificada no sustituye el ensayo de restauración.
 
@@ -419,6 +518,9 @@ Comprueba que no haya tareas en curso en PostgreSQL, en ambos workers y en el
 broker; detiene brevemente las escrituras y guarda
 PostgreSQL, objetos, uploads, configuración y referencias de imágenes en un
 archivo cifrado. Restaura el servicio al terminar, incluso si falla la copia.
+Si existe la base Keycloak, el mismo archivo contiene `keycloak.dump` además de
+`database.dump` de OCL. El respaldo detiene también Keycloak para conservar un
+estado coherente de cuentas, contraseñas y datos de la aplicación.
 Durante una actualización, el despliegue usa `leave-stopped`: una copia correcta
 deja aplicación y almacenamiento detenidos hasta iniciar la nueva revisión,
 evitando arrancar y volver a parar inmediatamente los workers. Si el respaldo
@@ -435,6 +537,24 @@ no comienza si quedan menos de 10 GiB libres para proteger la capacidad del host
 checkout ya tenga una actualización pendiente. Las instalaciones anteriores a
 este registro deben establecerlo a partir de su despliegue verificado antes
 del siguiente respaldo.
+
+### Restaurar las identidades Keycloak
+
+Restaurar ambas bases y los archivos del mismo backup, con su configuración e
+imágenes registradas, en volúmenes nuevos. Antes de ejecutar `pg_restore` de
+`keycloak.dump`, crear el rol LOGIN `keycloak` con la contraseña privada
+conservada y la base `keycloak OWNER keycloak`; los roles del clúster no forman
+parte de un `pg_dump` de base. Aplicar la misma restricción de acceso a la base
+Keycloak y la revocación `CREATE ON SCHEMA public FROM PUBLIC` en `postgres`.
+Ejecutar la restauración como administrador PostgreSQL preservando propietarios,
+y comprobar que el rol Keycloak autentica contra su base.
+
+Restaurar `database.dump` mantiene los IDs y membresías Django; `keycloak.dump`
+mantiene las identidades y contraseñas vigentes del proveedor. No arrancar la
+aplicación con una sola de estas bases restaurada ni ejecutar el exportador como
+sustituto del backup Keycloak. Validar autenticación, permisos y recuperación de
+contraseña antes de cambiar el servicio activo. Conservar los volúmenes originales
+y los journals hasta aceptar la restauración.
 
 ## Consumo observado
 

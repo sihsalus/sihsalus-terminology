@@ -57,11 +57,33 @@ jobs:
           cache-dependency-path: apps/api/requirements-*.txt
       - run: python -m pip install -r requirements-dev.txt
       - run: python manage.py check
-      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access core.users.tests.test_self_registration core.graphql.tests.test_dependency_compatibility core.common.test_export_download core.middlewares.tests --verbosity 2
-      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/test_export_download.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/users/serializers.py core/users/tests/test_self_registration.py core/graphql/tests/test_dependency_compatibility.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py core/importers/export_converter.py
+      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access core.common.test_oidc_identity core.services.auth.test_openid_security core.users.tests.test_self_registration core.graphql.tests.test_dependency_compatibility core.common.test_export_download core.middlewares.tests --verbosity 2
+      - run: pylint core/common/backends.py core/common/test_oidc_identity.py core/services/auth/openid.py core/services/auth/test_openid_security.py core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/test_export_download.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/users/serializers.py core/users/tests/test_self_registration.py core/graphql/tests/test_dependency_compatibility.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py core/importers/export_converter.py
+
+  keycloak-checks:
+    name: Verify Keycloak account migration and email
+    if: inputs.configuration == '' || inputs.configuration == 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install aiosmtpd==1.4.6
+      - name: Build the reviewed Keycloak image
+        run: docker build --build-arg SOURCE_COMMIT="$GITHUB_SHA" -t terminology-keycloak:ci images/keycloak
+      - name: Test with synthetic accounts and a local SMTP sink
+        run: python3 -B tests/deploy/keycloak-runtime.py
+      - uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514
+        with:
+          version: v0.74.0
+          cache: true
+      - name: Scan Keycloak before integration
+        run: trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 terminology-keycloak:ci
 
   images:
-    needs: [api-checks, web-dependencies, operations]
+    needs: [api-checks, web-dependencies, operations, keycloak-checks]
     if: github.event_name != 'pull_request' && (inputs.configuration == '' || inputs.configuration == 'none')
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -77,6 +99,7 @@ jobs:
           - {app: postgres, context: images/postgres}
           - {app: redis, context: images/redis}
           - {app: elasticsearch, context: images/elasticsearch}
+          - {app: keycloak, context: images/keycloak}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: docker/setup-buildx-action@v4
@@ -185,7 +208,7 @@ jobs:
           docker compose --env-file "$RUNNER_TEMP/terminology.env" -f docker-compose.terminology.yml config --format json > "$RUNNER_TEMP/terminology.json"
           mkdir reports
           failed=0
-          # The runtime workflow builds and scans the five SIHSALUS images.
+          # The runtime workflow builds and scans the six SIHSALUS images.
           # Storage is consumed directly from its verified upstream digest.
           for service in storage; do
             image=$(jq -r --arg service "$service" '.services[$service].image' "$RUNNER_TEMP/terminology.json")
@@ -260,4 +283,9 @@ jobs:
           TERMINOLOGY_REPORTS_EMAIL: ${{ vars.TERMINOLOGY_REPORTS_EMAIL }}
           TERMINOLOGY_ADMIN_EMAIL: ${{ vars.TERMINOLOGY_ADMIN_EMAIL }}
           TERMINOLOGY_ALLOW_SELF_REGISTRATION: ${{ vars.TERMINOLOGY_ALLOW_SELF_REGISTRATION || 'false' }}
+          TERMINOLOGY_OIDC_SERVER_URL: ${{ vars.TERMINOLOGY_OIDC_SERVER_URL }}
+          TERMINOLOGY_OIDC_CLIENT_ID: ${{ vars.TERMINOLOGY_OIDC_CLIENT_ID }}
+          TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME: ${{ vars.TERMINOLOGY_KEYCLOAK_ADMIN_USERNAME || 'sihsalus-admin' }}
+          TERMINOLOGY_KEYCLOAK_DB_PASSWORD: ${{ secrets.TERMINOLOGY_KEYCLOAK_DB_PASSWORD }}
+          TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD: ${{ secrets.TERMINOLOGY_KEYCLOAK_ADMIN_PASSWORD }}
         run: python3 scripts/terminology/sync-github-config.py send
