@@ -1,4 +1,4 @@
-FROM golang:1.27.1-alpine AS gosu
+FROM golang:1.27.3-alpine AS gosu
 RUN apk add --no-cache git \
     && git clone --depth 1 --branch 1.19 https://github.com/tianon/gosu.git /src \
     && test "$(git -C /src rev-parse HEAD)" = 6456aaa0f3c854d199d0f037f068eb97515b7513

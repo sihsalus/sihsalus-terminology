@@ -33,6 +33,12 @@ ADD --checksum=sha256:e9d8c856856680427f096d156f02a414289985c930998fcb519ce5be39
     /usr/share/elasticsearch/modules/ingest-attachment/jsoup-1.23.2.jar
 RUN test -f /usr/share/elasticsearch/modules/ingest-attachment/jsoup-1.21.2.jar \
     && rm /usr/share/elasticsearch/modules/ingest-attachment/jsoup-1.21.2.jar
+# Patch native LZ4 extraction while keeping the Elasticsearch server version.
+ADD --checksum=sha256:58c8e0b813960d2a248e050c353baea73139b48a2ffc55382d42c69707e17325 --chmod=644 \
+    https://repo.maven.apache.org/maven2/at/yawk/lz4/lz4-java/1.11.4/lz4-java-1.11.4.jar \
+    /usr/share/elasticsearch/lib/lz4-java-1.11.4.jar
+RUN test -f /usr/share/elasticsearch/lib/lz4-java-1.11.1.jar \
+    && rm /usr/share/elasticsearch/lib/lz4-java-1.11.1.jar
 USER 1000:0
 ARG SOURCE_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/sihsalus/sihsalus-terminology" \

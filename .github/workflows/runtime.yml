@@ -57,8 +57,8 @@ jobs:
           cache-dependency-path: apps/api/requirements-*.txt
       - run: python -m pip install -r requirements-dev.txt
       - run: python manage.py check
-      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access core.users.tests.test_self_registration core.common.test_export_download core.middlewares.tests --verbosity 2
-      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/test_export_download.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/users/serializers.py core/users/tests/test_self_registration.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py core/importers/export_converter.py
+      - run: python manage.py test core.common.test_optional_ai core.common.test_storage_proxy core.common.test_deployment_access core.users.tests.test_self_registration core.graphql.tests.test_dependency_compatibility core.common.test_export_download core.middlewares.tests --verbosity 2
+      - run: pylint core/common/test_optional_ai.py core/common/test_storage_proxy.py core/common/test_deployment_access.py core/common/test_export_download.py core/common/search.py core/common/utils.py core/settings.py core/concepts/views.py core/users/views.py core/users/serializers.py core/users/tests/test_self_registration.py core/graphql/tests/test_dependency_compatibility.py core/middlewares/middlewares.py core/services/storages/cloud/minio.py core/importers/export_converter.py
 
   images:
     needs: [api-checks, web-dependencies, operations]
