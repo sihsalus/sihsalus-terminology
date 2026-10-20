@@ -1,11 +1,14 @@
 """First-start Keycloak export and declarative realm checks, without services."""
 import copy
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
+from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -26,6 +29,40 @@ class KeycloakRealmTests(unittest.TestCase):
 
     def export(self, rows=None):
         return EXPORT.build_realm(self.template, rows if rows is not None else [self.row], self.convert)
+
+    def export_main(self, sender):
+        """Exercise the real entry point with synthetic Django rows and settings."""
+        user_model = Mock()
+        user_model.objects.order_by.return_value.values.return_value = [self.row]
+        settings = SimpleNamespace(DEFAULT_FROM_EMAIL=sender)
+        modules = {
+            'django': Mock(), 'django.conf': SimpleNamespace(settings=settings),
+            'core.users.models': SimpleNamespace(UserProfile=user_model),
+            'core.services.auth.openid': SimpleNamespace(OpenIDAuthService=SimpleNamespace(
+                credential_representation_from_hash=self.convert)),
+        }
+        output = io.StringIO()
+        with patch.dict('sys.modules', modules), \
+                patch.object(Path, 'read_text', return_value=json.dumps(self.template)), \
+                redirect_stdout(output):
+            EXPORT.main(['--template', 'synthetic-realm.json'])
+        self.assertEqual(settings.DEFAULT_FROM_EMAIL, sender)
+        return json.loads(output.getvalue())
+
+    def test_export_main_normalizes_bare_and_formatted_senders(self):
+        for sender, name in (('noreply@example.invalid', 'SIHSALUS Terminología'),
+                             ('Equipo SIHSALUS <noreply@example.invalid>', 'Equipo SIHSALUS')):
+            with self.subTest(sender=sender):
+                smtp = self.export_main(sender)['smtpServer']
+                self.assertEqual(smtp['from'], 'noreply@example.invalid')
+                self.assertEqual(smtp['fromDisplayName'], name)
+                self.assertEqual(smtp['password'], '${TERMINOLOGY_EMAIL_HOST_PASSWORD}')
+
+    def test_export_main_rejects_invalid_senders(self):
+        for sender in ('not-an-email', 'Name <>', 'a@example.invalid,b@example.invalid',
+                       'Name\r\n <a@example.invalid>'):
+            with self.subTest(sender=sender), self.assertRaisesRegex(ValueError, 'Invalid SMTP sender'):
+                self.export_main(sender)
 
     def test_preserves_identity_status_and_credentials_without_roles(self):
         original = copy.deepcopy(self.template)
@@ -121,7 +158,8 @@ class KeycloakRealmTests(unittest.TestCase):
         # Realm imports use ComponentExportRepresentation; type is the map key.
         self.assertNotIn('providerType', provider)
         profile = json.loads(provider['config']['kc.user.profile.config'][0])
-        self.assertEqual(profile['unmanagedAttributePolicy'], 'DISABLED')
+        # A missing policy disables unmanaged attributes; DISABLED is not a native enum.
+        self.assertIsNone(profile.get('unmanagedAttributePolicy'))
         for name in ('firstName', 'lastName'):
             attribute = next(item for item in profile['attributes'] if item['name'] == name)
             maximum = attribute['validations']['length']['max']
