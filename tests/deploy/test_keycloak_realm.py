@@ -118,6 +118,8 @@ class KeycloakRealmTests(unittest.TestCase):
 
     def test_native_email_validation_rejects_domain_lookalikes(self):
         provider, = self.template['components']['org.keycloak.userprofile.UserProfileProvider']
+        # Realm imports use ComponentExportRepresentation; type is the map key.
+        self.assertNotIn('providerType', provider)
         profile = json.loads(provider['config']['kc.user.profile.config'][0])
         self.assertEqual(profile['unmanagedAttributePolicy'], 'DISABLED')
         for name in ('firstName', 'lastName'):
