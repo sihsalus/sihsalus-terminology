@@ -141,15 +141,6 @@
       "defaultAction": false,
       "priority": 90,
       "config": {}
-    },
-    {
-      "alias": "UPDATE_USER_LOCALE",
-      "name": "Update User Locale",
-      "providerId": "UPDATE_USER_LOCALE",
-      "enabled": true,
-      "defaultAction": false,
-      "priority": 1000,
-      "config": {}
     }
   ],
   "components": {

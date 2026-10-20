@@ -81,11 +81,13 @@ def main(argv=None):
     result = build_realm(template, rows, OpenIDAuthService.credential_representation_from_hash)
     sender = settings.DEFAULT_FROM_EMAIL
     name, address = parseaddr(sender)
+    if not address or any(char in sender for char in '\r\n'):
+        raise ValueError('Invalid SMTP sender address.')
     try:
         mailbox = Address(addr_spec=address)
     except (ValueError, HeaderParseError):
         raise ValueError('Invalid SMTP sender address.') from None
-    if not mailbox.username or not mailbox.domain or any(char in sender for char in '\r\n'):
+    if not mailbox.username or not mailbox.domain:
         raise ValueError('Invalid SMTP sender address.')
     result['smtpServer'].update({'from': address, 'fromDisplayName': name or 'SIHSALUS Terminología'})
     payload = json.dumps(result, ensure_ascii=False, indent=2)

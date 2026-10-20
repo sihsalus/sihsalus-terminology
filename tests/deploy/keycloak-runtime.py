@@ -144,20 +144,26 @@ class Mailbox:
         from email import policy
         from email.parser import BytesParser
         deadline = time.monotonic() + 15
+        matched_messages, link_paths = 0, set()
         while time.monotonic() < deadline:
+            matched_messages = 0
             for recipients, content in self.messages[after:]:
                 if recipient not in recipients:
                     continue
+                matched_messages += 1
                 message = BytesParser(policy=policy.default).parsebytes(content)
                 for part in message.walk():
                     if part.get_content_type() not in ('text/plain', 'text/html'):
                         continue
                     for candidate in re.findall(r'https?://[^\s<>"]+', html.unescape(part.get_content())):
+                        link_paths.add(urlparse(candidate).path)
                         if '/login-actions/action-token?' in candidate:
                             require(candidate.startswith(BASE + '/'), 'Mail action must target isolated CI.')
                             return candidate.rstrip(').')
             time.sleep(0.1)
-        raise AssertionError('Expected synthetic verification/reset mail was not received.')
+        raise AssertionError('Expected synthetic verification/reset mail action missing: '
+                             f'messages={len(self.messages[after:])}, matching={matched_messages}, '
+                             f'link_paths={sorted(link_paths)}')
 
 
 def authorization(browser, register=False, action=None):
@@ -281,6 +287,9 @@ def verify(mailbox):
         'password': PASSWORD, 'password-confirm': PASSWORD,
     })
     created = users(username)
+    print('Registration challenge:', {'status': result.status, 'path': urlparse(result.url).path,
+                                     'forms': sorted(result.forms), 'messages': len(mailbox.messages),
+                                     'requiredActions': created[0].get('requiredActions') if created else None})
     require(len(created) == 1 and created[0]['emailVerified'] is False,
             'New account must await email verification.')
     require(not parse_qs(urlparse(result.url).query).get('code'), 'Unverified registration issued a code.')

@@ -86,11 +86,13 @@ def reconcile_realm():
         raise ValueError('Self-registration must be true or false.')
     sender = required('DEFAULT_FROM_EMAIL')
     name, address = parseaddr(sender)
+    if not address or any(char in sender for char in '\r\n'):
+        raise ValueError('Invalid SMTP sender address.')
     try:
         mailbox = Address(addr_spec=address)
     except (ValueError, HeaderParseError):
         raise ValueError('Invalid SMTP sender address.') from None
-    if not mailbox.username or not mailbox.domain or any(char in sender for char in '\r\n'):
+    if not mailbox.username or not mailbox.domain:
         raise ValueError('Invalid SMTP sender address.')
     smtp = {
         'host': required('EMAIL_HOST'), 'port': required('EMAIL_PORT'),
