@@ -154,6 +154,8 @@ class KeycloakSetupTests(unittest.TestCase):
         self.assertEqual(payload['smtpServer']['starttls'], 'true')
         self.assertEqual(payload['smtpServer']['auth'], 'true')
         self.assertEqual(payload['smtpServer']['password'], 'synthetic-smtp')
+        self.assertEqual(payload['smtpServer']['from'], 'noreply@example.invalid')
+        self.assertEqual(payload['smtpServer']['fromDisplayName'], 'SIHSALUS Terminología')
         self.assertNotIn('synthetic', output.getvalue())
         self.assertEqual(requests.put.call_args.kwargs['timeout'], 20)
 
@@ -165,6 +167,27 @@ class KeycloakSetupTests(unittest.TestCase):
         payload = requests.put.call_args.kwargs['json']
         self.assertFalse(payload['registrationAllowed'])
         self.assertTrue(payload['verifyEmail'])
+
+    def test_reconciliation_separates_a_formatted_sender(self):
+        os.environ['DEFAULT_FROM_EMAIL'] = 'Equipo SIHSALUS <noreply@example.invalid>'
+        requests = self.reconciliation()
+        with patch.dict('sys.modules', {'requests': requests}), redirect_stdout(io.StringIO()):
+            SETUP.reconcile_realm()
+        smtp = requests.put.call_args.kwargs['json']['smtpServer']
+        self.assertEqual(smtp['from'], 'noreply@example.invalid')
+        self.assertEqual(smtp['fromDisplayName'], 'Equipo SIHSALUS')
+        self.assertEqual(os.environ['DEFAULT_FROM_EMAIL'], 'Equipo SIHSALUS <noreply@example.invalid>')
+
+    def test_reconciliation_rejects_invalid_sender_before_http(self):
+        for sender in ('not-an-email', 'Name <>', 'a@example.invalid,b@example.invalid',
+                       'Name\r\n <a@example.invalid>'):
+            requests = self.reconciliation()
+            with self.subTest(sender=sender), patch.dict(os.environ, DEFAULT_FROM_EMAIL=sender), \
+                    patch.dict('sys.modules', {'requests': requests}):
+                with self.assertRaisesRegex(ValueError, 'Invalid SMTP sender'):
+                    SETUP.reconcile_realm()
+            requests.post.assert_not_called()
+            requests.put.assert_not_called()
 
     def test_missing_smtp_or_invalid_flags_fail_before_http(self):
         for key, invalid in (('EMAIL_HOST_PASSWORD', ''), ('ALLOW_SELF_REGISTRATION', 'TRUE'),

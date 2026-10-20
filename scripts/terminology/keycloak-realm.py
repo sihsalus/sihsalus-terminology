@@ -7,6 +7,9 @@ This reads accounts and hashes; it never changes credentials, grants roles, or s
 """
 import argparse
 import copy
+from email.errors import HeaderParseError
+from email.headerregistry import Address
+from email.utils import parseaddr
 import json
 import os
 from pathlib import Path
@@ -67,6 +70,7 @@ def main(argv=None):
     # Django and the application are imported only when the export command actually runs.
     import django  # pylint: disable=import-outside-toplevel
     django.setup()
+    from django.conf import settings  # pylint: disable=import-outside-toplevel
     from core.services.auth.openid import OpenIDAuthService  # pylint: disable=import-outside-toplevel
     from core.users.models import UserProfile  # pylint: disable=import-outside-toplevel
 
@@ -75,6 +79,15 @@ def main(argv=None):
     rows = list(UserProfile.objects.order_by('id').values(
         'id', 'username', 'email', 'first_name', 'last_name', 'is_active', 'verified', 'password'))
     result = build_realm(template, rows, OpenIDAuthService.credential_representation_from_hash)
+    sender = settings.DEFAULT_FROM_EMAIL
+    name, address = parseaddr(sender)
+    try:
+        mailbox = Address(addr_spec=address)
+    except (ValueError, HeaderParseError):
+        raise ValueError('Invalid SMTP sender address.') from None
+    if not mailbox.username or not mailbox.domain or any(char in sender for char in '\r\n'):
+        raise ValueError('Invalid SMTP sender address.')
+    result['smtpServer'].update({'from': address, 'fromDisplayName': name or 'SIHSALUS Terminología'})
     payload = json.dumps(result, ensure_ascii=False, indent=2)
     sys.stdout.write(payload + '\n')
 

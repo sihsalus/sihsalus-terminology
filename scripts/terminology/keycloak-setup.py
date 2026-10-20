@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Native PostgreSQL provisioning and Keycloak realm configuration, inside bootstrap."""
 import argparse
+from email.errors import HeaderParseError
+from email.headerregistry import Address
+from email.utils import parseaddr
 import json
 import os
 import sys
@@ -81,9 +84,17 @@ def reconcile_realm():
     registration = required('ALLOW_SELF_REGISTRATION')
     if registration not in ('true', 'false'):
         raise ValueError('Self-registration must be true or false.')
+    sender = required('DEFAULT_FROM_EMAIL')
+    name, address = parseaddr(sender)
+    try:
+        mailbox = Address(addr_spec=address)
+    except (ValueError, HeaderParseError):
+        raise ValueError('Invalid SMTP sender address.') from None
+    if not mailbox.username or not mailbox.domain or any(char in sender for char in '\r\n'):
+        raise ValueError('Invalid SMTP sender address.')
     smtp = {
         'host': required('EMAIL_HOST'), 'port': required('EMAIL_PORT'),
-        'from': required('DEFAULT_FROM_EMAIL'), 'fromDisplayName': 'SIHSALUS Terminología',
+        'from': address, 'fromDisplayName': name or 'SIHSALUS Terminología',
         'auth': 'true', 'starttls': 'true', 'ssl': 'false',
         'user': required('EMAIL_HOST_USER'), 'password': required('EMAIL_HOST_PASSWORD'),
     }
