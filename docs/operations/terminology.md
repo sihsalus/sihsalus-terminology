@@ -91,8 +91,9 @@ certificado debe cubrir ambos nombres. Las exportaciones firmadas usan
 Redis y Elasticsearch no publican puertos. Las credenciales iniciales del usuario
 `ocladmin` están en el archivo privado; no se incluyen en logs ni en informes.
 El navegador ofrece acceso con cuentas locales cuando no hay un proveedor OIDC
-configurado. El registro público está deshabilitado; el administrador crea las
-cuentas. El envío de correo está desactivado hasta configurar y autorizar un
+configurado. El registro está deshabilitado por defecto. Puede habilitarse para correos
+PUCP según la sección de registro institucional; el administrador conserva la
+creación de cuentas gestionadas. El envío de correo está desactivado hasta configurar y autorizar un
 servicio SMTP; el acceso local usa el soporte del administrador. La API no instala el middleware que registra cuerpos de peticiones y
 respuestas, pues pueden contener credenciales.
 
@@ -126,12 +127,41 @@ aplicación mediante `django.core.mail.get_connection().open()`, cerrando despu�
 la conexión. Esta comprobación no envía mensajes ni demuestra entrega al buzón.
 El envío de un mensaje de prueba requiere acordar previamente el destinatario
 y su contenido. La recuperación de contraseña usa la URL HTTPS del navegador
-configurada en `WEB_URL`; el registro público continúa deshabilitado.
+configurada en `WEB_URL`. El registro institucional se habilita por separado.
 
 Para desactivar el correo, volver a
 `TERMINOLOGY_EMAIL_BACKEND=django.core.mail.backends.dummy.EmailBackend` y
 recrear los servicios de aplicación conservando los datos. No revertir a una
 imagen que mantenga destinatarios de OCL con SMTP habilitado.
+
+## Registro institucional
+
+Establecer `TERMINOLOGY_ALLOW_SELF_REGISTRATION=true` en la configuración privada
+(y en las Variables del entorno `terminology` de GitHub) habilita el formulario
+`/#/signup` y el registro de la API. Requiere desplegar primero las imágenes que
+incluyen el formulario local y la validación institucional. El despliegue y la
+sincronización rechazan esta opción cuando SMTP está deshabilitado.
+
+Compose fija `SELF_REGISTRATION_EMAIL_DOMAINS=pucp.edu.pe` en la API. Solo se
+aceptan correos con ese dominio completo, sin distinguir mayúsculas. No se
+admiten subdominios ni sufijos parecidos. La API rechaza registros si no se
+configura una lista de dominios; la creación administrativa mantiene su flujo.
+El navegador de esta instalación informa explícitamente la política PUCP.
+
+Las cuentas de OCL Online son independientes: cada miembro debe crear su cuenta
+local, confirmar el enlace recibido por correo y después iniciar sesión. La
+verificación utiliza el token nativo de OCL; no se atribuye caducidad temporal a
+ese token. El registro no otorga roles administrativos ni membresías en
+organizaciones. Los permisos existentes de cada catálogo siguen determinando su
+lectura y edición. Una cuenta sin verificar no puede iniciar sesión; intentarlo
+reenvía el correo de verificación mediante el mecanismo existente.
+
+Antes de habilitarlo, revisar el SHA y los digests, comprobar SMTP y ejecutar las
+pruebas sintéticas del flujo. La entrega real al buzón debe confirmarse con un
+registro iniciado por su titular. No crear cuentas de compañeros usando correos
+supuestos. Para cerrar nuevos registros, volver a
+`TERMINOLOGY_ALLOW_SELF_REGISTRATION=false` y aplicar la configuración: las
+cuentas existentes conservan su acceso y sus datos.
 
 ## GitHub Secrets y sincronización manual
 
@@ -146,7 +176,7 @@ Guardar como **Secrets** `TERMINOLOGY_DB_PASSWORD`, `TERMINOLOGY_SECRET_KEY`,
 `TERMINOLOGY_ADMIN_PASSWORD`, `TERMINOLOGY_ADMIN_TOKEN`,
 `TERMINOLOGY_STORAGE_ACCESS_KEY`, `TERMINOLOGY_STORAGE_SECRET_KEY`,
 `TERMINOLOGY_EMAIL_HOST_PASSWORD` y `TERMINOLOGY_SSH_PRIVATE_KEY`.
-Guardar como **Variables** los doce parámetros no secretos enumerados en
+Guardar como **Variables** los parámetros no secretos enumerados en
 `VARIABLE_KEYS` de `scripts/terminology/sync-github-config.py`, además de
 `TERMINOLOGY_SSH_TARGET` (`usuario@host`, puerto 22) y
 `TERMINOLOGY_SSH_KNOWN_HOSTS`. `TERMINOLOGY_ADMIN_EMAIL` puede omitirse para

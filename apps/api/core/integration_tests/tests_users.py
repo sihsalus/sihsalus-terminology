@@ -17,7 +17,7 @@ from core.users.models import UserProfile
 from core.users.tests.factories import UserProfileFactory
 
 
-@override_settings(ALLOW_SELF_REGISTRATION=True)
+@override_settings(ALLOW_SELF_REGISTRATION=True, SELF_REGISTRATION_EMAIL_DOMAINS={'fiction.com'})
 class UserSignupVerificationViewTest(OCLAPITestCase):
     @patch('core.users.models.UserProfile.send_verification_email')
     def test_signup_unverified_to_verified(self, send_mail_mock):

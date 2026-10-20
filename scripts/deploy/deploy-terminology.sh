@@ -46,6 +46,15 @@ case "${MAIL_BACKEND:-django.core.mail.backends.dummy.EmailBackend}" in
     ;;
   *) fail 'unsupported email backend; choose dummy or authenticated SMTP' ;;
 esac
+REGISTRATION="$(read_env_value TERMINOLOGY_ALLOW_SELF_REGISTRATION "$ENV_FILE")"
+case "${REGISTRATION:-false}" in
+  false) ;;
+  true)
+    [[ "$MAIL_BACKEND" == django.core.mail.backends.smtp.EmailBackend ]] \
+      || fail 'self-registration requires SMTP email verification'
+    ;;
+  *) fail 'self-registration must be true or false' ;;
+esac
 for app in API WEB POSTGRES REDIS ELASTICSEARCH; do
   ref="$(read_env_value "TERMINOLOGY_${app}_IMAGE" "$ENV_FILE")"
   [[ "$ref" =~ ^ghcr\.io/sihsalus/terminology-${app,,}@sha256:[0-9a-f]{64}$ ]] || fail 'image must use the expected repository and a verified digest'

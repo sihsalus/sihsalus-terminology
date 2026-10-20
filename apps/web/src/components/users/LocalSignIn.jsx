@@ -2,7 +2,7 @@ import React from 'react'
 import { useTranslation } from 'react-i18next'
 import { Alert, Box, Button, TextField, Typography } from '@mui/material'
 import APIService from '../../services/APIService'
-import { consumeOAuthReturnTo } from '../../common/utils'
+import { consumeOAuthReturnTo, isSelfRegistrationEnabled } from '../../common/utils'
 
 // The API already supports local accounts when no identity provider is configured.
 const LocalSignIn = () => {
@@ -36,8 +36,9 @@ const LocalSignIn = () => {
       // Stay within the hash router; never navigate to an external return URL.
       window.location.hash = '#' + (returnTo?.startsWith('/') ? returnTo : '/')
       window.location.reload()
-    } catch {
-      setFailed(true)
+    } catch(error) {
+      setFailed(error.response?.status === 401 && error.response?.data?.email ?
+        'auth.signup_check_email' : 'auth.local_sign_in_error')
     } finally {
       setPassword('')
       setBusy(false)
@@ -47,8 +48,8 @@ const LocalSignIn = () => {
   return (
     <Box component='form' onSubmit={submit} sx={{maxWidth: 400, mx: 'auto', my: 6, p: 3, display: 'grid', gap: 2}}>
       <Typography component='h1' variant='h5'>{t('auth.sign_in')}</Typography>
-      <Typography>{t('auth.managed_accounts')}</Typography>
-      {failed && <Alert severity='error'>{t('auth.local_sign_in_error')}</Alert>}
+      <Typography>{t(isSelfRegistrationEnabled() ? 'auth.local_account_help' : 'auth.managed_accounts')}</Typography>
+      {failed && <Alert severity='error'>{t(failed)}</Alert>}
       <TextField label={t('auth.username')} name='username' autoComplete='username' required
         value={username} onChange={event => setUsername(event.target.value)} disabled={busy} />
       <TextField label={t('auth.password')} name='password' type='password' autoComplete='current-password' required
@@ -56,6 +57,7 @@ const LocalSignIn = () => {
       <Button variant='contained' type='submit' disabled={busy}>
         {t(busy ? 'auth.signing_in' : 'auth.sign_in')}
       </Button>
+      {isSelfRegistrationEnabled() && <Button href='#/signup'>{t('auth.create_account')}</Button>}
     </Box>
   )
 }

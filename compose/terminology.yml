@@ -43,7 +43,8 @@ x-app: &app
     CSRF_TRUSTED_ORIGINS: https://${TERMINOLOGY_HOST},https://${TERMINOLOGY_API_HOST}
     TRUST_PROXY_HTTPS: "TRUE"
     REQUIRE_AUTHENTICATION: "true"
-    ALLOW_SELF_REGISTRATION: "false"
+    ALLOW_SELF_REGISTRATION: ${TERMINOLOGY_ALLOW_SELF_REGISTRATION:-false}
+    SELF_REGISTRATION_EMAIL_DOMAINS: pucp.edu.pe
     ENABLE_THROTTLING: "true"
     # Enable SMTP explicitly after provisioning the installation's sender.
     EMAIL_BACKEND: ${TERMINOLOGY_EMAIL_BACKEND:-django.core.mail.backends.dummy.EmailBackend}
@@ -210,6 +211,7 @@ services:
       API_URL: https://${TERMINOLOGY_API_HOST}
       NODE_ENV: production
       WEB_PORT: "4002"
+      ALLOW_SELF_REGISTRATION: ${TERMINOLOGY_ALLOW_SELF_REGISTRATION:-false}
       ANALYTICS_API: ""
       AI_ASSISTANT_API_URL: ""
     ports:

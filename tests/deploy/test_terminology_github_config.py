@@ -31,6 +31,7 @@ class ReceiverTests(unittest.TestCase):
         self.settings = {key: 'synthetic-value' for key in module.CONFIG_KEYS}
         self.settings.update(TERMINOLOGY_MACHINE_ID='a'*32, TERMINOLOGY_BACKUP_KEEP='14',
                              TERMINOLOGY_EMAIL_PORT='587', TERMINOLOGY_ADMIN_EMAIL='',
+                             TERMINOLOGY_ALLOW_SELF_REGISTRATION='false',
                              TERMINOLOGY_EMAIL_BACKEND='django.core.mail.backends.smtp.EmailBackend')
         # Omit retention to exercise its default.
         self.original = '# preserve comment\nUNMANAGED_IMAGE=image@sha256:abc\n' + ''.join(
@@ -100,6 +101,25 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(self.active.read_text(), self.original)
         self.assertFalse(self.calls)
 
+    def test_registration_requires_smtp(self):
+        self.payload['settings']['TERMINOLOGY_ALLOW_SELF_REGISTRATION'] = 'true'
+        self.payload['settings']['TERMINOLOGY_EMAIL_BACKEND'] = 'django.core.mail.backends.dummy.EmailBackend'
+        with self.assertRaisesRegex(module.ConfigurationError, 'requires SMTP'):
+            self.receive()
+        self.unchanged()
+
+    def test_registration_flag_is_strict(self):
+        self.payload['settings']['TERMINOLOGY_ALLOW_SELF_REGISTRATION'] = 'yes'
+        with self.assertRaisesRegex(module.ConfigurationError, 'Invalid self-registration'):
+            self.receive()
+        self.unchanged()
+
+    def test_registration_can_be_enabled_with_smtp(self):
+        self.payload['settings']['TERMINOLOGY_ALLOW_SELF_REGISTRATION'] = 'true'
+        result = self.receive()
+        self.assertEqual(result['changed_keys'], ['TERMINOLOGY_ALLOW_SELF_REGISTRATION'])
+        self.assertEqual(result['status'], 'applied')
+
     def test_noop_preserves_bytes_and_does_not_deploy(self):
         self.assertEqual(self.receive()['status'], 'unchanged')
         self.unchanged()
@@ -108,7 +128,7 @@ class ReceiverTests(unittest.TestCase):
         self.payload['mode'] = 'check'
         self.payload['settings']['TERMINOLOGY_EMAIL_HOST_PASSWORD'] = 'new-synthetic-password'
         result = self.receive()
-        self.assertEqual(result['settings_matched'], 18)
+        self.assertEqual(result['settings_matched'], len(module.CONFIG_KEYS) - 1)
         self.assertEqual(result['changed_keys'], ['TERMINOLOGY_EMAIL_HOST_PASSWORD'])
         self.assertNotIn('new-synthetic-password', self.output)
         self.unchanged()
