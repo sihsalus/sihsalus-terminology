@@ -318,7 +318,7 @@ const History = ({ versions, repoVersions, loading, icon, resource }) => {
                                               color: "text.secondary",
                                               fontSize: '12px'
                                             }}>
-                                            Source Versions:
+                                            {t('concept.source_versions')}:
                                           </Typography>
                                           {
                                             map(version.source_versions, repoVersion => {
@@ -339,7 +339,7 @@ const History = ({ versions, repoVersions, loading, icon, resource }) => {
                                               color: "text.secondary",
                                               fontSize: '12px'
                                             }}>
-                                            Collection Versions:
+                                            {t('concept.collection_versions')}:
                                           </Typography>
                                           {
                                             map(version.collection_versions, repoVersion => {

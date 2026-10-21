@@ -100,7 +100,7 @@ const CompareToolbar = ({
           }
         </span>
         <span style={{display: 'flex', alignItems: 'center'}}>
-          <ButtonGroup size="small" aria-label="Small button group" color='secondary'>
+          <ButtonGroup size="small" aria-label={t('common.comparison_actions')} color='secondary'>
             <ButtonControl label={t('common.statistics')} selected={metric === 'stats'} terminal onClick={() => onMetricChange('stats')} icon={<StatsIcon fontSize='inherit' />} />
             <ButtonControl label={t('common.metadata')} selected={metric === 'meta'} onClick={() => onMetricChange('meta')} icon={<RepoIcon noTooltip fontSize='inherit' />} />
             {

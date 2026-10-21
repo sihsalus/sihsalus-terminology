@@ -12,7 +12,7 @@ const ConceptTabs = ({ tab, onTabChange }) => {
       onChange={onTabChange}
       indicatorColor="primary"
       variant="fullWidth"
-      aria-label="concept tabs"
+      aria-label={t('concept.tabs')}
       sx={{width: '100%', borderBottom: '1px solid', borderColor: 'surface.n90'}}
     >
       <Tab value="metadata" label={t('common.details')} sx={TAB_STYLES} />

@@ -1,4 +1,5 @@
 import React from 'react';
+import { withTranslation } from 'react-i18next';
 import { styled } from '@mui/material/styles';
 import { Chip, Popper, Box, InputBase, Typography } from '@mui/material';
 import { ArrowDropDown } from '@mui/icons-material';
@@ -226,7 +227,7 @@ class DropDownChip extends React.Component {
               groupBy={groupBy}
               renderGroup={groupBy ? this.renderGroup : undefined}
               filterOptions={optionDisplayName ? this.filterByCodeOrName : undefined}
-              noOptionsText="No matches found"
+              noOptionsText={this.props.t('common.no_results')}
               renderOption={(props, option) => {
                 const { key, ...optionProps } = props
                 return (
@@ -273,4 +274,4 @@ class DropDownChip extends React.Component {
   }
 }
 
-export default DropDownChip;
+export default withTranslation()(DropDownChip);

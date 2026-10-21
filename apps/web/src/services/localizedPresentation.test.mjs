@@ -1,4 +1,5 @@
 /* eslint-env node, es2020 */
+/* eslint-disable spellcheck/spell-checker -- Assertions include Spanish UI text and library configuration names. */
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
@@ -10,11 +11,13 @@ import React from 'react';
 import renderer, {act} from 'react-test-renderer';
 import i18next from 'i18next';
 import * as translation from 'react-i18next';
+import moment from 'moment';
+import 'moment/locale/es.js';
 
 const require = createRequire(import.meta.url);
 const es = JSON.parse(readFileSync(new URL('../i18n/locales/es/translations.json', import.meta.url)));
 
-const load = (file, utils = {}) => {
+const load = (file, utils = {}, moduleOverrides = {}) => {
   const filename = fileURLToPath(new URL(`../components/${file}.jsx`, import.meta.url));
   const {code} = transformFileSync(filename, {
     babelrc: false, configFile: false,
@@ -25,7 +28,7 @@ const load = (file, utils = {}) => {
   const modules = {
     react: React,
     'react-i18next': translation,
-    'react-router-dom': {useHistory: () => ({}), useLocation: () => ({pathname: '/orgs/SIHSALUS/sources/'})},
+    'react-router-dom': {useHistory: () => ({}), useLocation: () => ({pathname: '/orgs/SIHSALUS/sources/'}), useParams: () => ({user: 'synthetic'})},
     '../../common/colors': {BLACK: '#000', PRIMARY_COLORS: {main: '#4836ff'}},
     '../../common/utils': {isLoggedIn: () => false, getCurrentUser: () => ({}), hasAuthGroup: () => false, ...utils},
     '../../common/constants': {MAX_SEARCH_RESULT_WINDOW: 10000},
@@ -40,6 +43,7 @@ const load = (file, utils = {}) => {
     '@mui/material/Autocomplete': {createFilterOptions: () => options => options},
     '@mui/material/ListItemText': ({primary, secondary}) => React.createElement('ListItemText', {}, primary, secondary),
     '@mui/icons-material': {Add: 'AddIcon'},
+    ...moduleOverrides,
   };
   vm.runInNewContext(code, {exports, window, require: name => {
     if (name in modules) return modules[name];
@@ -60,6 +64,29 @@ const render = async (t, Component, props) => {
   t.after(() => tree.unmount());
   return tree;
 };
+
+for (const allowed of [false, true]) {
+  test(`profile registration date uses Spanish and preserves edit permission=${allowed}`, async t => {
+    const user = Object.freeze({name: 'Synthetic Name', username: 'synthetic', date_joined: '2026-10-21T12:00:00', url: '/users/synthetic/'});
+    const formatDate = t.mock.fn(value => moment(value).locale('es').format('L'));
+    const canEditUser = t.mock.fn(() => allowed);
+    const get = t.mock.fn(async () => ({data: {}}));
+    const {Component} = load('users/UserProfile', {
+      formatDate, canEditUser, sortOrgs: value => value,
+      formatWebsiteLink: () => '', getCurrentUser: () => ({username: 'synthetic'}),
+    }, {'../../services/APIService': {users: () => ({appendToUrl: () => ({get})})}});
+    const tree = await render(t, Component, {user});
+    const dateLabel = tree.root.findAllByType('Typography').find(item => item.props.component === 'h1');
+    assert.equal(React.Children.toArray(dateLabel.props.children).join(''), 'Fecha de registro 21/10/2026');
+    assert.equal(formatDate.mock.calls[0].arguments[0], user.date_joined);
+    assert.equal(canEditUser.mock.calls[0].arguments[0], user.username);
+    assert.equal(tree.root.findAllByType('Link').length, allowed ? 1 : 0);
+    if (allowed) assert.equal(tree.root.findByType('Link').props.href, '#/users/synthetic/edit');
+    assert.equal(get.mock.callCount(), allowed ? 1 : 0);
+    assert.equal(user.date_joined, '2026-10-21T12:00:00');
+    assert.equal(tree.root.findByType('UserIcon').props.user, user);
+  });
+}
 
 test('concept summary translates labels and preserves clinical values', async t => {
   const {Component} = load('concepts/ConceptSummaryProperties');

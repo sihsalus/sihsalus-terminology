@@ -148,8 +148,8 @@ const EditMembers = ({onClose, org, members, fetchMembers}) => {
           value={selectedMembers}
           options={users}
           loading={loading}
-          loadingText={loading ? 'Loading...' : `Type atleast ${minLength} characters to search`}
-          noOptionsText={(isSearchable && !loading) ? "No results" : 'Start typing...'}
+          loadingText={loading ? t('common.loading') : t('common.search_minimum', {min: minLength})}
+          noOptionsText={(isSearchable && !loading) ? t('common.no_results') : t('common.search_minimum', {min: minLength})}
           getOptionLabel={getMemberDisplayName}
           fullWidth
           onInputChange={handleInputChange}
@@ -157,7 +157,7 @@ const EditMembers = ({onClose, org, members, fetchMembers}) => {
           renderInput={
             params => <TextField
                         {...params}
-                        label="Organization Members"
+                        label={t('org.members')}
                         variant="outlined"
                         id='org-members-input'
                         fullWidth

@@ -161,7 +161,7 @@ const AddToCollectionDialog = ({ open, onClose, concept, concepts: conceptsProp 
         } else if (response && response.status === 202) {
           setResults('pending')
         } else {
-          const msg = (response && (response.detail || response.error)) || 'Something went wrong'
+          const msg = (response && (response.detail || response.error)) || t('common.something_went_wrong')
           setError(msg)
         }
       })
@@ -187,8 +187,7 @@ const AddToCollectionDialog = ({ open, onClose, concept, concepts: conceptsProp 
           <Typography variant="body2" sx={{
             color: "text.secondary"
           }}>
-            Adding: <strong>{concepts[0].display_name || concepts[0].id}</strong>
-            {concepts[0].source && <React.Fragment> from <strong>{concepts[0].source}</strong></React.Fragment>}
+            {t(concepts[0].source ? 'addToCollection.adding_single' : 'addToCollection.adding_single_without_source', {name: concepts[0].display_name || concepts[0].id, source: concepts[0].source, interpolation: {escapeValue: false}})}
           </Typography>
         )}
         {concepts.length > 1 && (

@@ -180,7 +180,15 @@
     "waitlist": "Lista de espera",
     "try_again": "Volver a intentar",
     "web_version": "Versión de la interfaz",
-    "api_version": "Versión de la API"
+    "api_version": "Versión de la API",
+    "customize_attributes": "Personalizar atributos",
+    "tabs": "Pestañas del repositorio",
+    "search_minimum": "Escribe al menos {{min}} caracteres para buscar",
+    "view": "Ver",
+    "comparison_actions": "Controles de comparación",
+    "comparison_table": "Comparación de recursos",
+    "loading_results_for": "Cargando resultados para <strong>{{query}}</strong>",
+    "any": "Cualquiera"
   },
   "errors": {
     "401": "Se requiere iniciar sesión",
@@ -196,7 +204,9 @@
     "invalid_json": "Ingresa un JSON válido",
     "sign_in_or_register": "<login>Inicia sesión</login> o <register>crea una cuenta</register> para continuar.",
     "sign_in_to_continue": "<login>Inicia sesión</login> para continuar.",
-    "refresh_or_dashboard": "<refresh>Actualiza la página</refresh> o vuelve a tu <dashboard>tablero</dashboard>."
+    "refresh_or_dashboard": "<refresh>Actualiza la página</refresh> o vuelve a tu <dashboard>tablero</dashboard>.",
+    "select_from_suggestions": "Selecciona una de las sugerencias",
+    "invalid_value": "Valor no válido"
   },
   "dashboard": {
     "name": "Tablero",
@@ -363,7 +373,11 @@
       "add_code": "Agregar código personalizado",
       "standard_tooltip": "Código de idioma ISO 639-1",
       "nonstandard_tooltip": "El formato estándar usa códigos de idioma ISO 639-1 de dos letras. Considera actualizar este código."
-    }
+    },
+    "tabs": "Pestañas del concepto",
+    "source_versions": "Versiones de fuentes",
+    "collection_versions": "Versiones de colecciones",
+    "generated_comment_missing": "No se recibió el comentario generado."
   },
   "mapping": {
     "mappings": "Mapeos",
@@ -398,7 +412,13 @@
       },
       "to_concept": {
         "header": "Concepto de destino"
-      }
+      },
+      "auto_assign": "Asignar automáticamente",
+      "id_auto_assign": "El ID del mapeo se asignará automáticamente. <manual>Ingresar un ID manualmente</manual>.",
+      "external_id_auto_assign": "El ID externo del mapeo se asignará automáticamente. <manual>Ingresar un ID externo manualmente</manual>.",
+      "auto_id_sequence_help": "Este campo es opcional: el repositorio generará el siguiente valor de la secuencia.",
+      "auto_id_uuid_help": "Este campo es opcional: el repositorio generará un UUID con el formato xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.",
+      "mapping_url": "El nuevo mapeo estará disponible en:"
     },
     "create_mapping": "Crear mapeo",
     "view_in_source": "Ver mapeo en su fuente",
@@ -449,7 +469,10 @@
     "custom_sorting_applied_partial": "Se aplicó el orden personalizado a {{total}} mapeos.",
     "no_sort_weight": "Este mapeo no tiene un peso de ordenación asignado",
     "sort_changes_warning": "Cambios realizados: {{total}}. Al guardar, se creará una nueva versión del mapeo.",
-    "sort_success": "Mapeos actualizados."
+    "sort_success": "Mapeos actualizados.",
+    "tabs": "Pestañas del mapeo",
+    "swap_concepts": "Intercambiar conceptos de origen y destino",
+    "source_url_example": "p. ej., /orgs/IHTSDO/sources/SNOMED-CT/"
   },
   "reference": {
     "references": "Referencias",
@@ -532,7 +555,27 @@
     "remove_concept_confirm_title": "¿Quitar el concepto de la colección?",
     "remove_concept_confirm_body": "Este concepto está incluido mediante las siguientes referencias. Al quitarlo, se eliminarán esas referencias de la colección.",
     "remove_mapping_confirm_title": "¿Quitar el mapeo de la colección?",
-    "remove_mapping_confirm_body": "Este mapeo está incluido mediante las siguientes referencias. Al quitarlo, se eliminarán esas referencias de la colección."
+    "remove_mapping_confirm_body": "Este mapeo está incluido mediante las siguientes referencias. Al quitarlo, se eliminarán esas referencias de la colección.",
+    "tabs": "Pestañas de la referencia",
+    "method_label": "Método",
+    "method_to_concepts": "recorrer hasta los conceptos de destino",
+    "method_mappings_only": "solo mapeos",
+    "map_types_help": "Tipos de mapeo que se seguirán durante el recorrido, separados por comas",
+    "exclude_map_types_help": "Tipos de mapeo que se excluirán, separados por comas",
+    "exclude_map_types_placeholder": "p. ej., SAME-AS",
+    "cascade_levels_placeholder": "* o un número",
+    "cascade_levels_help": "Número de niveles que se recorrerán; * = sin límite",
+    "return_map_types_placeholder": "* o tipos específicos",
+    "return_map_types_help": "Tipos de mapeo que se incluirán en los resultados",
+    "versioning": "Versiones de las referencias",
+    "unversioned": "Sin versión",
+    "resource": "Recurso",
+    "transform_method": "Método de transformación",
+    "resource_versions": "Versiones de los recursos",
+    "extensional_enumerated": "Extensional / Enumerada",
+    "inclusion_type": "Tipo de inclusión",
+    "expression_count_one": "{{count}} expresión",
+    "expression_count_other": "{{count}} expresiones"
   },
   "repo": {
     "repos": "Repositorios",
@@ -895,7 +938,46 @@
     "property": "Propiedad",
     "properties_filters_subheader": "Propiedades del repositorio",
     "additional_metadata_filters_subheader": "Metadatos adicionales",
-    "suggested_sources": "Fuentes sugeridas"
+    "suggested_sources": "Fuentes sugeridas",
+    "statistics_table": "Estadísticas de las versiones",
+    "metadata_table": "Metadatos de las versiones",
+    "expansion_metadata_table": "Metadatos de las expansiones",
+    "default_validation_schema": "Esquema de validación predeterminado",
+    "openmrs_validation_schema": "Esquema de validación de OpenMRS",
+    "custom_openmrs_validation_schema": "Esquema de validación personalizado de OpenMRS",
+    "changes": {
+      "new": {
+        "label": "Nuevos",
+        "tooltip": "Recursos agregados en la versión más reciente"
+      },
+      "changed_retired": {
+        "label": "Retirados",
+        "tooltip": "Recursos retirados en la versión más reciente"
+      },
+      "changed_major": {
+        "label": "Cambio mayor",
+        "tooltip": "Recursos cuya suma de verificación inteligente cambió entre versiones"
+      },
+      "changed_minor": {
+        "label": "Cambio menor",
+        "tooltip": "Recursos cuya suma de verificación estándar cambió entre versiones"
+      },
+      "changed_mappings_only": {
+        "label": "Mapeos modificados",
+        "tooltip": "Conceptos cuyo único cambio está en sus mapeos"
+      },
+      "removed": {
+        "label": "Eliminados",
+        "tooltip": "Recurso eliminado en la versión más reciente"
+      }
+    },
+    "mapping_changes": {
+      "new": "Mapeos agregados",
+      "removed": "Mapeos eliminados",
+      "changed_retired": "Mapeos retirados",
+      "changed_major": "Mapeos modificados (cambio mayor)",
+      "changed_minor": "Mapeos modificados (cambio menor)"
+    }
   },
   "org": {
     "my": "Mis organizaciones",
@@ -1023,7 +1105,8 @@
     "query_url_registry": "Buscar <query>{{query}}</query> en este registro de URL",
     "query_filtered": "Buscar <query>{{query}}</query> en <resource>{{resource}}</resource>, con <field>{{field}}</field>: <value>{{value}}</value>",
     "filter_resource": "Filtrar <resource>{{resource}}</resource> por <field>{{field}}</field>: <query>{{query}}</query>",
-    "match_in_resource": "Buscar coincidencias de <query>{{query}}</query> con conceptos de <resource>{{resource}}</resource>"
+    "match_in_resource": "Buscar coincidencias de <query>{{query}}</query> con conceptos de <resource>{{resource}}</resource>",
+    "tabs": "Categorías de búsqueda"
   },
   "cloneToSource": {
     "title": "Clonar concepto(s) a una fuente",
@@ -1184,7 +1267,8 @@
     "reference_header": "Referencia",
     "error_header": "Error",
     "no_references_added": "No se agregaron referencias",
-    "add_to_collection": "Agregar a una colección"
+    "add_to_collection": "Agregar a una colección",
+    "adding_single_without_source": "Se agregará: {{name}}"
   },
   "import": {
     "upload_file_tooltip": "Subir archivo JSON, CSV o ZIP",
@@ -1231,6 +1315,17 @@
     "exception": "Excepción",
     "result": "Resultado",
     "args": "Argumentos",
-    "sub_tasks": "Subtareas"
+    "sub_tasks": "Subtareas",
+    "new_import": "Nueva importación",
+    "drop_file": "Arrastra un archivo aquí o haz clic para seleccionarlo",
+    "accepted_formats": "Formatos admitidos: {{formats}}",
+    "files": "Archivos",
+    "rejected_files": "Archivos rechazados",
+    "file_rejection": {
+      "file-invalid-type": "Este tipo de archivo no está admitido. Formatos permitidos: {{formats}}",
+      "file-too-large": "El archivo supera el tamaño máximo de {{limit}}.",
+      "too-many-files_one": "Selecciona como máximo {{count}} archivo.",
+      "too-many-files_other": "Selecciona como máximo {{count}} archivos."
+    }
   }
 }

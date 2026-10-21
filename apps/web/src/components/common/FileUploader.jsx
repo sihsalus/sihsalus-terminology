@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import './FileUploader.scss'
 import { useDropzone } from 'react-dropzone';
 import { isEmpty, isString, last, uniq, flatten, values } from 'lodash';
@@ -9,6 +10,7 @@ import LinearProgressWithLabel from './LinearProgressWithLabel';
 
 
 const FileUploader = ({ maxFiles, accept, uploadButton, onUpload, onLoading, maxSize }) => {
+  const { t } = useTranslation()
   const maxAllowedFiles = maxFiles || 1;
   const [progress, setProgress] = React.useState(0);
   const [canUpload, setCanUpload] = React.useState(false);
@@ -45,7 +47,7 @@ const FileUploader = ({ maxFiles, accept, uploadButton, onUpload, onLoading, max
       uniq(accept.split(',').map(ext => last(ext.split('/')).toLowerCase())) :
       uniq(flatten(values(accept)).map(ext => ext.replace(/^\./, '').toLowerCase()))
   ) : ['json']
-  const acceptedExtensionFormatsLabel = arrayToSentence(acceptedExtensions, ', ', ' or ');
+  const acceptedExtensionFormatsLabel = arrayToSentence(acceptedExtensions, ', ', ` ${t('common.or')} `);
 
   const files = acceptedFiles.map(file => (
     <li key={file.path}>
@@ -57,7 +59,7 @@ const FileUploader = ({ maxFiles, accept, uploadButton, onUpload, onLoading, max
       {file.path} - {humanFileSize(file.size, true)}
       <ul>
         {errors.map(e => (
-          <li key={e.code}>{e.message}</li>
+          <li key={e.code}>{t(`import.file_rejection.${e.code}`, {defaultValue: e.message, limit: humanFileSize(maxSize || 95 * 1024 * 1024, true), count: maxAllowedFiles, formats: acceptedExtensionFormatsLabel})}</li>
         ))}
       </ul>
     </li>
@@ -68,21 +70,21 @@ const FileUploader = ({ maxFiles, accept, uploadButton, onUpload, onLoading, max
       <section className="file-uploader-container">
         <div {...getRootProps({className: 'dropzone'})}>
           <input {...getInputProps()} />
-          <p>Drag and drop file here, or click to select file</p>
+          <p>{t('import.drop_file')}</p>
           <em>
             {
-              `(only ${acceptedExtensionFormatsLabel} file will be accepted)`
+              t('import.accepted_formats', {formats: acceptedExtensionFormatsLabel})
             }
           </em>
         </div>
         <LinearProgressWithLabel progress={progress} />
         <aside>
-          <h4>Files</h4>
+          <h4>{t('import.files')}</h4>
           <ul>{files}</ul>
           {
             !isEmpty(fileRejectionItems) &&
             <React.Fragment>
-              <h4>Rejected files</h4>
+              <h4>{t('import.rejected_files')}</h4>
               <ul>{fileRejectionItems}</ul>
             </React.Fragment>
           }
@@ -96,7 +98,7 @@ const FileUploader = ({ maxFiles, accept, uploadButton, onUpload, onLoading, max
               variant='outlined'
               startIcon={<UploadIcon fontSize='inherit' />}
               disabled={!canUpload}>
-              Upload
+              {t('common.upload')}
             </Button>
           </div>
         }

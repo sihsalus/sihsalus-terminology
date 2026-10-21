@@ -34,26 +34,17 @@ import { Repo } from '../mappings/FromAndTargetSource'
 import ConceptIcon from '../concepts/ConceptIcon'
 
 const diffOrder = ['new', 'changed_retired', 'changed_major', 'changed_minor', 'changed_mappings_only', 'removed']
-const sections = {
-  "new": {label: 'New', tooltip: 'Resources added in newer version'},
-  changed_retired: {label: 'Retired', tooltip: 'Resources retired in newer version'},
-  changed_major: {label: 'Major Change', tooltip: 'Resources with "smart checksum" change between versions'},
-  changed_minor: {label: 'Minor Change', tooltip: 'Resources with "standard checksum" change between versions'},
-  changed_mappings_only: {label: 'Mappings Changed', tooltip: 'Concepts whose only change is in their mappings'},
-  removed: {label: "Removed", tooltip: 'Resource removed in newer version'},
-}
-
 const MAPPING_ONLY_CHANGE_LABELS = {
-  new: 'Mappings Added',
-  removed: 'Mappings Removed',
-  changed_retired: 'Mappings Retired',
-  changed_major: 'Mappings Changed (Major)',
-  changed_minor: 'Mappings Changed (Minor)',
+  new: 'repo.mapping_changes.new',
+  removed: 'repo.mapping_changes.removed',
+  changed_retired: 'repo.mapping_changes.changed_retired',
+  changed_major: 'repo.mapping_changes.changed_major',
+  changed_minor: 'repo.mapping_changes.changed_minor',
 }
 
-const getChangedMappingsOnlyLabel = mappingChangesKeys => (
+const getChangedMappingsOnlyLabel = (mappingChangesKeys, t) => t((
   mappingChangesKeys.length === 1 ? MAPPING_ONLY_CHANGE_LABELS[mappingChangesKeys[0]] : null
-) || sections.changed_mappings_only.label
+) || 'repo.changes.changed_mappings_only.label')
 
 const ROW_SKELETON_COUNT = 4
 
@@ -81,6 +72,7 @@ const VirtuosoTableComponents = {
 
 const VersionResourcesComparison = ({version1, version2, resource, isCollection, expansion1, expansion2}) => {
   const { t } = useTranslation()
+  const sections = Object.fromEntries(diffOrder.map(key => [key, {label: t(`repo.changes.${key}.label`), tooltip: t(`repo.changes.${key}.tooltip`)}]))
   const [response, setResponse] = React.useState(null)
   const [changelog, setChangelog] = React.useState(false)
   const [loading, setLoading] = React.useState(false)
@@ -211,7 +203,7 @@ const VersionResourcesComparison = ({version1, version2, resource, isCollection,
               <DiffIcon fontSize='inherit' sx={{marginRight: '8px'}} color='warning' />
               {t('mapping.mappings')}
             </Typography>
-            <Table size="small" aria-label="purchases">
+            <Table size="small" aria-label={t('common.comparison_table')}>
               <TableHead>
                 <TableRow>
                   <TableCell>{t('common.id')}</TableCell>
@@ -262,17 +254,17 @@ const VersionResourcesComparison = ({version1, version2, resource, isCollection,
         <TableCell>{change.display_name}</TableCell>
         <TableCell>
             {section === 'changed_mappings_only'
-              ? getChangedMappingsOnlyLabel(mappingChangesKeys)
+              ? getChangedMappingsOnlyLabel(mappingChangesKeys, t)
               : sectionDefinition?.label || startCase(section)}
         </TableCell>
         <TableCell>
           <Button type='text' href={'#' + getViewURL(change, section)} size='small' startIcon={<ConceptIcon selected noTooltip fontSize='inherit' />} target='_blank' sx={{textTransform: 'none'}}>
-            View
+            {t('common.view')}
           </Button>
           {
             ['changed_retired', 'changed_major', 'changed_minor'].includes(section) &&
               <Button color='warning' type='text' href={'#' + getChangeURL(change)} size='small' startIcon={<DiffIcon fontSize='inherit' />} target='_blank' sx={{textTransform: 'none', marginLeft: '12px'}}>
-                Compare
+                {t('common.compare')}
               </Button>
           }
         </TableCell>

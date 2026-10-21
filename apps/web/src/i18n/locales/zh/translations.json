@@ -1,7 +1,18 @@
 {
   "import": {
     "count_one": "{{count}} 次导入",
-    "count_other": "{{count}} 次导入"
+    "count_other": "{{count}} 次导入",
+    "new_import": "新建导入",
+    "drop_file": "将文件拖放到此处，或点击选择文件",
+    "accepted_formats": "支持的格式：{{formats}}",
+    "files": "文件",
+    "rejected_files": "被拒绝的文件",
+    "file_rejection": {
+      "file-invalid-type": "不支持此文件类型。支持的格式：{{formats}}",
+      "file-too-large": "文件超过大小限制 {{limit}}。",
+      "too-many-files_one": "最多选择 {{count}} 个文件。",
+      "too-many-files_other": "最多选择 {{count}} 个文件。"
+    }
   },
   "common": {
     "error_details": "错误详情",
@@ -135,7 +146,15 @@
     "waitlist": "候补名单",
     "try_again": "重试",
     "web_version": "界面版本",
-    "api_version": "API 版本"
+    "api_version": "API 版本",
+    "customize_attributes": "自定义属性",
+    "tabs": "仓库选项卡",
+    "search_minimum": "请输入至少 {{min}} 个字符进行搜索",
+    "view": "查看",
+    "comparison_actions": "比较控件",
+    "comparison_table": "资源比较",
+    "loading_results_for": "正在加载 <strong>{{query}}</strong> 的结果",
+    "any": "任意"
   },
   "errors": {
     "401": "需要登录",
@@ -149,7 +168,9 @@
     "reference_404": "很抱歉，未能找到该引用。",
     "sign_in_or_register": "请<login>登录</login>或<register>创建账户</register>后继续。",
     "sign_in_to_continue": "请<login>登录</login>后继续。",
-    "refresh_or_dashboard": "<refresh>刷新页面</refresh>或返回<dashboard>仪表板</dashboard>。"
+    "refresh_or_dashboard": "<refresh>刷新页面</refresh>或返回<dashboard>仪表板</dashboard>。",
+    "select_from_suggestions": "请从建议中选择",
+    "invalid_value": "无效值"
   },
   "dashboard": {
     "name": "仪表盘",
@@ -301,7 +322,11 @@
       "add_code": "添加自定义代码",
       "standard_tooltip": "ISO 639-1 语言代码",
       "nonstandard_tooltip": "标准格式使用 ISO 639-1 双字母语言代码。请考虑更新此代码。"
-    }
+    },
+    "tabs": "概念选项卡",
+    "source_versions": "源版本",
+    "collection_versions": "集合版本",
+    "generated_comment_missing": "未收到生成的备注。"
   },
   "mapping": {
     "mappings": "映射关系",
@@ -356,10 +381,19 @@
       },
       "to_concept": {
         "header": "目标概念"
-      }
+      },
+      "auto_assign": "自动分配",
+      "id_auto_assign": "映射 ID 将自动分配。<manual>手动输入 ID</manual>。",
+      "external_id_auto_assign": "映射外部 ID 将自动分配。<manual>手动输入外部 ID</manual>。",
+      "auto_id_sequence_help": "此字段为可选项：仓库将生成序列中的下一个值。",
+      "auto_id_uuid_help": "此字段为可选项：仓库将生成格式为 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx 的 UUID。",
+      "mapping_url": "新映射的访问地址："
     },
     "create_mapping": "创建映射",
-    "view_in_source": "在其来源中查看映射"
+    "view_in_source": "在其来源中查看映射",
+    "tabs": "映射选项卡",
+    "swap_concepts": "交换源概念与目标概念",
+    "source_url_example": "例如 /orgs/IHTSDO/sources/SNOMED-CT/"
   },
   "checksums": {
     "standard": "标准校验和",
@@ -549,6 +583,45 @@
         "new_title": "新建{{resourceType}}版本：{{version}}",
         "edit_title": "编辑{{resourceType}}版本：{{version}}"
       }
+    },
+    "statistics_table": "版本统计",
+    "metadata_table": "版本元数据",
+    "expansion_metadata_table": "扩展元数据",
+    "default_validation_schema": "默认验证架构",
+    "openmrs_validation_schema": "OpenMRS 验证架构",
+    "custom_openmrs_validation_schema": "自定义 OpenMRS 验证架构",
+    "changes": {
+      "new": {
+        "label": "新增",
+        "tooltip": "较新版本中添加的资源"
+      },
+      "changed_retired": {
+        "label": "已停用",
+        "tooltip": "较新版本中停用的资源"
+      },
+      "changed_major": {
+        "label": "主要更改",
+        "tooltip": "版本间智能校验和发生变化的资源"
+      },
+      "changed_minor": {
+        "label": "次要更改",
+        "tooltip": "版本间标准校验和发生变化的资源"
+      },
+      "changed_mappings_only": {
+        "label": "映射已更改",
+        "tooltip": "仅映射发生变化的概念"
+      },
+      "removed": {
+        "label": "已移除",
+        "tooltip": "较新版本中移除的资源"
+      }
+    },
+    "mapping_changes": {
+      "new": "已添加的映射",
+      "removed": "已移除的映射",
+      "changed_retired": "已停用的映射",
+      "changed_major": "映射已更改（主要）",
+      "changed_minor": "映射已更改（次要）"
     }
   },
   "org": {
@@ -656,7 +729,27 @@
     "id_helper": "每个 ID 变为 {{path}}{id}/",
     "expression_hint": "完整的参考表达式。由上方来源/集合选择器预填充；根据需要编辑。",
     "adding_references": "正在添加参考…",
-    "request_failed": "请求失败 — 请检查您的网络连接并重试。"
+    "request_failed": "请求失败 — 请检查您的网络连接并重试。",
+    "tabs": "引用选项卡",
+    "method_label": "方法",
+    "method_to_concepts": "遍历到目标概念",
+    "method_mappings_only": "仅映射",
+    "map_types_help": "要在遍历中遵循的映射类型，以逗号分隔",
+    "exclude_map_types_help": "要排除的映射类型，以逗号分隔",
+    "exclude_map_types_placeholder": "例如 SAME-AS",
+    "cascade_levels_placeholder": "* 或数字",
+    "cascade_levels_help": "遍历的层数；* 表示无限制",
+    "return_map_types_placeholder": "* 或指定类型",
+    "return_map_types_help": "要包含在结果中的映射类型",
+    "versioning": "引用版本",
+    "unversioned": "无版本",
+    "resource": "资源",
+    "transform_method": "转换方法",
+    "resource_versions": "资源版本",
+    "extensional_enumerated": "外延式 / 枚举式",
+    "inclusion_type": "包含类型",
+    "expression_count_one": "{{count}} 个表达式",
+    "expression_count_other": "{{count}} 个表达式"
   },
   "search": {
     "filters": "筛选项",
@@ -721,7 +814,8 @@
     "query_url_registry": "在此 URL 注册表中搜索 <query>{{query}}</query>",
     "query_filtered": "在 <resource>{{resource}}</resource> 中搜索 <query>{{query}}</query>，条件为 <field>{{field}}</field>：<value>{{value}}</value>",
     "filter_resource": "按 <field>{{field}}</field>：<query>{{query}}</query> 筛选 <resource>{{resource}}</resource>",
-    "match_in_resource": "将 <query>{{query}}</query> 与 <resource>{{resource}}</resource> 中的概念进行匹配"
+    "match_in_resource": "将 <query>{{query}}</query> 与 <resource>{{resource}}</resource> 中的概念进行匹配",
+    "tabs": "搜索类别"
   },
   "url_registry": {
     "url_registry": "规范型 URL 注册库",
@@ -787,5 +881,8 @@
         "import": "超出限制的行会保留在项目中，但不会被匹配。"
       }
     }
+  },
+  "addToCollection": {
+    "adding_single_without_source": "将添加：{{name}}"
   }
 }

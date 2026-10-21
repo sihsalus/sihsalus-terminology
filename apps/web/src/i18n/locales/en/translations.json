@@ -179,7 +179,15 @@
     "waitlist": "Waitlist",
     "try_again": "Try again",
     "web_version": "Web version",
-    "api_version": "API version"
+    "api_version": "API version",
+    "customize_attributes": "Customize attributes",
+    "tabs": "Repository tabs",
+    "search_minimum": "Type at least {{min}} characters to search",
+    "view": "View",
+    "comparison_actions": "Comparison controls",
+    "comparison_table": "Resource comparison",
+    "loading_results_for": "Loading results for <strong>{{query}}</strong>",
+    "any": "Any"
   },
   "errors": {
     "401": "Login is required",
@@ -195,7 +203,9 @@
     "reference_404": "Sorry, this reference could not be found.",
     "sign_in_or_register": "<login>Sign in</login> or <register>create an account</register> to continue.",
     "sign_in_to_continue": "<login>Sign in</login> to continue.",
-    "refresh_or_dashboard": "<refresh>Refresh the page</refresh> or return to your <dashboard>dashboard</dashboard>."
+    "refresh_or_dashboard": "<refresh>Refresh the page</refresh> or return to your <dashboard>dashboard</dashboard>.",
+    "select_from_suggestions": "Please select from suggestions",
+    "invalid_value": "Invalid value"
   },
   "success": {
     "queued": "Successfully Queued"
@@ -368,7 +378,11 @@
       "add_code": "Add custom code",
       "standard_tooltip": "ISO 639-1 language code",
       "nonstandard_tooltip": "The standard format uses two-letter ISO 639-1 language codes. Consider updating this code."
-    }
+    },
+    "tabs": "Concept tabs",
+    "source_versions": "Source versions",
+    "collection_versions": "Collection versions",
+    "generated_comment_missing": "No generated comment was returned."
   },
   "mapping": {
     "mapping": "Mapping",
@@ -451,10 +465,19 @@
       },
       "to_concept": {
         "header": "Target Concept"
-      }
+      },
+      "auto_assign": "Auto-assign",
+      "id_auto_assign": "The mapping ID will be assigned automatically. <manual>Enter an ID manually</manual>.",
+      "external_id_auto_assign": "The mapping external ID will be assigned automatically. <manual>Enter an external ID manually</manual>.",
+      "auto_id_sequence_help": "This field is optional: the repository will generate the next value in the sequence.",
+      "auto_id_uuid_help": "This field is optional: the repository will generate a UUID in the format xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.",
+      "mapping_url": "Your new mapping will be available at:"
     },
     "create_mapping": "Create Mapping",
-    "view_in_source": "View mapping in its source"
+    "view_in_source": "View mapping in its source",
+    "tabs": "Mapping tabs",
+    "swap_concepts": "Swap source and target concepts",
+    "source_url_example": "e.g. /orgs/IHTSDO/sources/SNOMED-CT/"
   },
   "reference": {
     "expression": "Expression",
@@ -537,7 +560,27 @@
     "id_helper": "Each ID becomes {{path}}{id}/",
     "expression_hint": "Full reference expression. Seeded from the source / collection selector above; edit as needed.",
     "adding_references": "Adding references…",
-    "request_failed": "Request failed — check your network connection and try again."
+    "request_failed": "Request failed — check your network connection and try again.",
+    "tabs": "Reference tabs",
+    "method_label": "Method",
+    "method_to_concepts": "traverse to target concepts",
+    "method_mappings_only": "mappings only",
+    "map_types_help": "Comma-separated map types to follow during traversal",
+    "exclude_map_types_help": "Comma-separated map types to exclude",
+    "exclude_map_types_placeholder": "e.g. SAME-AS",
+    "cascade_levels_placeholder": "* or a number",
+    "cascade_levels_help": "Number of traversal hops; * = unlimited",
+    "return_map_types_placeholder": "* or specific types",
+    "return_map_types_help": "Which map types to include in results",
+    "versioning": "Reference Versioning",
+    "unversioned": "Unversioned",
+    "resource": "Resource",
+    "transform_method": "Transform Method",
+    "resource_versions": "Resource Versions",
+    "extensional_enumerated": "Extensional / Enumerated",
+    "inclusion_type": "Inclusion Type",
+    "expression_count_one": "{{count}} expression",
+    "expression_count_other": "{{count}} expressions"
   },
   "checksums": {
     "standard": "Standard Checksum",
@@ -902,7 +945,46 @@
     "could_not_clear_processing": "Could not clear the processing state",
     "export_not_ready_tooltip": "Export is still being generated for this version",
     "expansion_processing_tooltip": "This expansion is still being built",
-    "suggested_sources": "Suggested Sources"
+    "suggested_sources": "Suggested Sources",
+    "statistics_table": "Version statistics",
+    "metadata_table": "Version metadata",
+    "expansion_metadata_table": "Expansion metadata",
+    "default_validation_schema": "Default validation schema",
+    "openmrs_validation_schema": "OpenMRS Validation Schema",
+    "custom_openmrs_validation_schema": "Custom OpenMRS validation schema",
+    "changes": {
+      "new": {
+        "label": "New",
+        "tooltip": "Resources added in newer version"
+      },
+      "changed_retired": {
+        "label": "Retired",
+        "tooltip": "Resources retired in newer version"
+      },
+      "changed_major": {
+        "label": "Major Change",
+        "tooltip": "Resources with \"smart checksum\" change between versions"
+      },
+      "changed_minor": {
+        "label": "Minor Change",
+        "tooltip": "Resources with \"standard checksum\" change between versions"
+      },
+      "changed_mappings_only": {
+        "label": "Mappings Changed",
+        "tooltip": "Concepts whose only change is in their mappings"
+      },
+      "removed": {
+        "label": "Removed",
+        "tooltip": "Resource removed in newer version"
+      }
+    },
+    "mapping_changes": {
+      "new": "Mappings Added",
+      "removed": "Mappings Removed",
+      "changed_retired": "Mappings Retired",
+      "changed_major": "Mappings Changed (Major)",
+      "changed_minor": "Mappings Changed (Minor)"
+    }
   },
   "org": {
     "my": "My Organizations",
@@ -1029,7 +1111,8 @@
     "query_url_registry": "Search for <query>{{query}}</query> in this URL registry",
     "query_filtered": "Search for <query>{{query}}</query> in <resource>{{resource}}</resource>, with <field>{{field}}</field>: <value>{{value}}</value>",
     "filter_resource": "Filter <resource>{{resource}}</resource> by <field>{{field}}</field>: <query>{{query}}</query>",
-    "match_in_resource": "Match <query>{{query}}</query> to concepts in <resource>{{resource}}</resource>"
+    "match_in_resource": "Match <query>{{query}}</query> to concepts in <resource>{{resource}}</resource>",
+    "tabs": "Search categories"
   },
   "url_registry": {
     "url_registry": "Canonical URL registry",
@@ -1060,7 +1143,8 @@
     "reference_header": "Reference",
     "error_header": "Error",
     "no_references_added": "No references added",
-    "add_to_collection": "Add to Collection"
+    "add_to_collection": "Add to Collection",
+    "adding_single_without_source": "Adding: {{name}}"
   },
   "import": {
     "upload_file_tooltip": "Upload JSON/CSV/ZIP File",
@@ -1107,7 +1191,18 @@
     "exception": "Exception",
     "result": "Result",
     "args": "Args",
-    "sub_tasks": "Sub Tasks"
+    "sub_tasks": "Sub Tasks",
+    "new_import": "New import",
+    "drop_file": "Drag and drop a file here, or click to select one",
+    "accepted_formats": "Accepted formats: {{formats}}",
+    "files": "Files",
+    "rejected_files": "Rejected files",
+    "file_rejection": {
+      "file-invalid-type": "This file type is not supported. Accepted formats: {{formats}}",
+      "file-too-large": "This file exceeds the size limit of {{limit}}.",
+      "too-many-files_one": "Select no more than {{count}} file.",
+      "too-many-files_other": "Select no more than {{count}} files."
+    }
   },
   "cloneToSource": {
     "title": "Clone Concept(s) to Source",

@@ -113,7 +113,7 @@ const VersionMeta = ({version1, version2, isCollection, expansion1, expansion2})
 
   return (
     <TableContainer sx={{ maxHeight: 'calc(var(--app-height) - 270px)' }}>
-      <Table size='small' stickyHeader aria-label="version metadata table" sx={tableSx}>
+      <Table size='small' stickyHeader aria-label={t('repo.metadata_table')} sx={tableSx}>
         <TableHead>
           <TableRow>
             <TableCell sx={{...headCellStyle, width: COLUMN_WIDTHS[0]}} />
@@ -256,7 +256,7 @@ const VersionMeta = ({version1, version2, isCollection, expansion1, expansion2})
       </Table>
       {
         isCollection &&
-          <Table size='small' stickyHeader aria-label="expansion metadata table" sx={tableSx}>
+          <Table size='small' stickyHeader aria-label={t('repo.expansion_metadata_table')} sx={tableSx}>
             <TableHead>
               <TableRow>
                 <TableCell sx={{...headCellStyle, width: COLUMN_WIDTHS[0]}} />

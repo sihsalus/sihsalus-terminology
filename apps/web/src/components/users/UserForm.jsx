@@ -119,7 +119,7 @@ const UserForm = ({ user }) => {
               sx={{width: '35%', marginLeft: '10px'}}
             />
             <Typography component="div" sx={{width: 'calc(30% - 10px - 16px)', fontSize: '12px', marginLeft: '16px'}}>
-              <span style={{opacity: 0.7}}>Your URL will be:</span><br />
+              <span style={{opacity: 0.7}}>{t('common.your_url_will_be')}:</span><br />
               <span style={{display: 'flex', flexWrap: 'wrap'}}>{window.location.origin}/#/users/<b>{user.username}</b>/</span>
             </Typography>
           </div>

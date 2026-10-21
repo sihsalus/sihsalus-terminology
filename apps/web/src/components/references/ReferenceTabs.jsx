@@ -12,7 +12,7 @@ const ReferenceTabs = ({ tab, onTabChange }) => {
       onChange={onTabChange}
       indicatorColor="primary"
       variant="fullWidth"
-      aria-label="mapping tabs"
+      aria-label={t('reference.tabs')}
       sx={{width: '100%', borderBottom: '1px solid', borderColor: 'surface.n90'}}
     >
       <Tab value="metadata" label={t('common.metadata')} sx={TAB_STYLES} />

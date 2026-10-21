@@ -90,10 +90,10 @@ const CascadeSelector = ({ onChange, conceptUrl, collectionUrl, showPreviewDefau
     <Box>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
         <FormControl size="small" sx={{ minWidth: 220 }}>
-          <InputLabel>Cascade</InputLabel>
+          <InputLabel>{t('reference.cascade')}</InputLabel>
           <Select
             value={selectedPresetId}
-            label="Cascade"
+            label={t('reference.cascade')}
             onChange={e => setSelectedPresetId(e.target.value)}
           >
             {PRESETS.map(preset => (
@@ -117,54 +117,54 @@ const CascadeSelector = ({ onChange, conceptUrl, collectionUrl, showPreviewDefau
           }}
         >
           <FormControl size="small" fullWidth>
-            <InputLabel>Method</InputLabel>
+            <InputLabel>{t('reference.method_label')}</InputLabel>
             <Select
               value={customParams.method}
-              label="Method"
+              label={t('reference.method_label')}
               onChange={handleCustomParamChange('method')}
             >
-              <MenuItem value="sourcetoconcepts">sourcetoconcepts — traverse to target concepts</MenuItem>
-              <MenuItem value="sourcemappings">sourcemappings — mappings only</MenuItem>
+              <MenuItem value="sourcetoconcepts">sourcetoconcepts — {t('reference.method_to_concepts')}</MenuItem>
+              <MenuItem value="sourcemappings">sourcemappings — {t('reference.method_mappings_only')}</MenuItem>
             </Select>
           </FormControl>
 
           <TextField
             size="small"
-            label="Map Types"
-            placeholder="e.g. Q-AND-A,CONCEPT-SET"
+            label={t('mapping.map_types')}
+            placeholder={t('cloneToSource.map_types_placeholder')}
             value={customParams.mapTypes}
             onChange={handleCustomParamChange('mapTypes')}
-            helperText="Comma-separated map types to follow during traversal"
+            helperText={t('reference.map_types_help')}
             fullWidth
           />
 
           <TextField
             size="small"
-            label="Exclude Map Types"
-            placeholder="e.g. SAME-AS"
+            label={t('cloneToSource.exclude_map_types')}
+            placeholder={t('reference.exclude_map_types_placeholder')}
             value={customParams.excludeMapTypes}
             onChange={handleCustomParamChange('excludeMapTypes')}
-            helperText="Comma-separated map types to exclude"
+            helperText={t('reference.exclude_map_types_help')}
             fullWidth
           />
 
           <TextField
             size="small"
-            label="Cascade Levels"
-            placeholder="* or a number"
+            label={t('cloneToSource.cascade_levels')}
+            placeholder={t('reference.cascade_levels_placeholder')}
             value={customParams.cascadeLevels}
             onChange={handleCustomParamChange('cascadeLevels')}
-            helperText="Number of traversal hops; * = unlimited"
+            helperText={t('reference.cascade_levels_help')}
             fullWidth
           />
 
           <TextField
             size="small"
-            label="Return Map Types"
-            placeholder="* or specific types"
+            label={t('cloneToSource.return_map_types')}
+            placeholder={t('reference.return_map_types_placeholder')}
             value={customParams.returnMapTypes}
             onChange={handleCustomParamChange('returnMapTypes')}
-            helperText="Which map types to include in results"
+            helperText={t('reference.return_map_types_help')}
             fullWidth
           />
         </Box>
@@ -193,7 +193,7 @@ const CascadeSelector = ({ onChange, conceptUrl, collectionUrl, showPreviewDefau
                   onChange={e => setTransform(e.target.checked)}
                 />
               }
-              label="Transform"
+              label={t('reference.transform')}
               sx={{ mr: 0, '& .MuiFormControlLabel-label': { fontSize: '0.875rem' } }}
             />
             <Tooltip
@@ -214,7 +214,7 @@ const CascadeSelector = ({ onChange, conceptUrl, collectionUrl, showPreviewDefau
         <Chip
           size="small"
           icon={<CodeIcon />}
-          label={showPreview ? 'Hide API call' : 'Preview API call'}
+          label={showPreview ? t('cloneToSource.hide_api_call') : t('cloneToSource.preview_api_call')}
           variant="outlined"
           clickable
           onClick={() => setShowPreview(v => !v)}

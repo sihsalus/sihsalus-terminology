@@ -137,7 +137,7 @@ const ConceptHeader = ({concept, repo, onClose, repoURL, onEdit, onRetire, onCre
               sx={{textTransform: 'none'}}
               onClick={() => setAddToCollectionOpen(true)}
             >
-              Add to Collection
+              {t('addToCollection.add_to_collection')}
             </Button>
           )}
           {hasAccess && isSource && (

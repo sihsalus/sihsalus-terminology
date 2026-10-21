@@ -1,4 +1,5 @@
 import React from 'react';
+import { Trans } from 'react-i18next';
 import { Box, LinearProgress } from '@mui/material'
 import { BLACK } from '../../common/colors'
 
@@ -10,7 +11,7 @@ const AutocompleteLoading = ({ text }) => {
         {
           text &&
             <div className='col-xs-12' style={{width: '100%', textAlign: 'center', marginBottom: '10px', color: BLACK}}>
-              Loading results for <b>{ text }</b>
+              <Trans i18nKey="common.loading_results_for" values={{query: text}} components={{strong: <b />}} shouldUnescape />
             </div>
         }
         <div className='col-xs-8'>
