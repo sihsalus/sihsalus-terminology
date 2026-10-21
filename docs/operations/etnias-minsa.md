@@ -2,8 +2,11 @@
 
 Revisión: 21 de octubre de 2026. Seguimiento: [sihsalus/sihsalus#400](https://github.com/sihsalus/sihsalus/issues/400).
 
-Estado: corrección aplicada y verificada en el borrador `HEAD` del OCL local.
-La publicación y la adopción por OpenMRS siguen pendientes.
+Estado: versiones `etnias/2026-10-21-01` y `MINSA-ETNIAS/2026-10-21-01`
+publicadas en el OCL local por solicitud del usuario. La candidata
+[content `1.25.41`](https://github.com/sihsalus/sihsalus-content/pull/277)
+incorpora el export; la revisión institucional y el despliegue siguen
+pendientes.
 
 ## Identidad y mecanismo
 
@@ -170,8 +173,9 @@ La lectura posterior a los cambios y las consultas a la API verificaron:
 
 - Los 60 códigos de referencia coinciden con la tabla oficial consultada;
   58 tienen un mapping `SAME-AS` hacia la identidad clínica correspondiente.
-- Se conservan los 62 IDs y UUID clínicos, las denominaciones originales y los
-  64 mappings anteriores, incluidos sus pesos. `HEAD` tiene ahora 122 mappings.
+- Se conservan los 62 IDs y UUID clínicos, las denominaciones originales y las
+  identidades, tipos y extremos de los 64 mappings anteriores. La nueva versión
+  tiene 122 mappings.
 - Cada uno de los cinco sinónimos devuelve la identidad clínica esperada.
   El índice nativo encuentra Aimara al buscar el código mapeado `2`; esa misma
   búsqueda numérica también devuelve el ID interno `2` y no es una resolución
@@ -179,21 +183,36 @@ La lectura posterior a los cambios y las consultas a la API verificaron:
 - Las consultas exactas de códigos `2`, `41`, `42`, `56` y `58` devuelven los
   mappings esperados. El código desconocido `99999` devuelve HTTP 404.
 - La versión publicada `2026-06-30` conserva sus 62 conceptos, nombres y
-  64 mappings. `MINSA-ETNIAS` solo tiene `HEAD`, sin versión publicada.
+  64 mappings. Ambas fuentes tienen ahora la versión publicada `2026-10-21-01`.
+
+Antes de publicar se registró en OCL el `sort_weight` de las 62 respuestas
+`Q-AND-A`: del `1` al `62`, contrastados por UUID y destino mediante consultas
+de solo lectura en DEV y QLTY. El export anterior omitía esos pesos; el
+importador podía convertirlos en `NULL` al actualizar. La nueva versión conserva
+el orden persistido mediante metadata explícita en la fuente canónica.
+
+Se descargaron y compararon los exports nativos publicados con los recursos
+verificados, incluidos nombres, UUID, relaciones y pesos:
+
+| Fuente y versión | Conceptos | Mappings | SHA-256 del ZIP nativo |
+| --- | --- | --- | --- |
+| `etnias/2026-10-21-01` | 62 | 122 | `6c5728c4e521159b371aafb3bbd65d772176ebd69b70a57ce26716ec82ec5c14` |
+| `MINSA-ETNIAS/2026-10-21-01` | 60 | 0 | `5bec1789937bee9bd36419d52eb7d6b03c56bac2fd6008fa4bf9e58ee7f08d68` |
 
 Se utilizaron operaciones nativas de la API y su índice existente. El cambio
 en Git documenta el catálogo y su consumo; no introduce código de aplicación,
 loaders, SQL ni un índice adicional.
 
-La corrección modifica `HEAD` del OCL local. La versión publicada de `etnias`
-`2026-06-30` se conserva; content `1.25.40` y los ambientes DEV/QLTY aún consumen
-sus exports anteriores. El [pendiente de transición de OCL](https://github.com/sihsalus/sihsalus-content/blob/main/docs/audits/2026-10-16-ocl-institutional-transition.md)
+La candidata content `1.25.41` actualiza únicamente los dos ZIP de etnias. El loader crea los
+términos MINSA y sus equivalencias nativas; los 60 conceptos de referencia no se
+añaden como otros conceptos clínicos. DEV/QLTY aún consumen content `1.25.40`.
+El [pendiente de transición de OCL](https://github.com/sihsalus/sihsalus-content/blob/main/docs/audits/2026-10-16-ocl-institutional-transition.md)
 conserva los requisitos de orden de respuestas y conjuntos.
 
-Antes de adoptar la corrección en OpenMRS: revisión del catálogo, publicación
-nativa de versiones, exports oficiales, instalación nueva, actualización y
-reinicio preservando UUID, observaciones y pesos. Frontend y consumidores deben
-usar el mapping para los códigos oficiales. Los casos de aceptación incluyen
+La adopción en OpenMRS requiere revisión del catálogo y evidencia de instalación
+nueva, actualización y reinicio preservando UUID, observaciones y pesos.
+Frontend y consumidores deben usar el mapping para los códigos oficiales.
+Los casos de aceptación incluyen
 buscar por código y sinónimo, guardar/reabrir una selección existente y hacer
 visible una identidad sin equivalencia. La aceptación clínica e integrada
 requiere evidencia propia; el issue #400 mantiene ese alcance pendiente.
