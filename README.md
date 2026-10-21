@@ -80,6 +80,9 @@ usa ese manifiesto para preparar la configuración y comprobar los contenedores.
 Publicar el artifact no despliega la versión.
 La [guía de operación](docs/operations/terminology.md) cubre Compose, HTTPS,
 límites, importación y backups. `gidis-terminology` descarga imágenes por digest.
+La [equivalencia de etnias con MINSA](docs/operations/etnias-minsa.md) documenta
+los códigos oficiales, sus mappings y sinónimos en el catálogo local, y la
+separación entre el borrador de OCL y las versiones consumidas por OpenMRS.
 La [verificación del 7 de octubre](docs/operations/verification-2026-10-07.md)
 registra el recorrido sintético, la restauración aislada de base y archivos,
 el diagnóstico opcional de Flower y el DNS institucional pendiente.
