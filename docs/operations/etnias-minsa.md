@@ -141,6 +141,9 @@ nombres sin tipo (`name_type: null`), idioma `es`, sin preferencia de idioma:
 La búsqueda ayuda a localizar la opción. La pertenencia étnica se registra
 mediante la identificación declarada por la persona; encontrar un sinónimo no
 autoriza una asignación automática.
+En OpenMRS, la búsqueda global de «Ticuna» también puede devolver su concepto de
+lengua; «Aguaruna» aparece igualmente en otro catálogo. El selector debe limitar
+la selección a las respuestas de Etnia y conservar el UUID del concepto étnico.
 
 ## Consulta por código
 
