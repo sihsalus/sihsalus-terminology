@@ -1,4 +1,5 @@
 import React from 'react';
+import { Trans } from 'react-i18next';
 import Autocomplete from '@mui/material/Autocomplete';
 import { TextField, IconButton, Tooltip, Button as MuiButton } from '@mui/material';
 import {
@@ -248,7 +249,7 @@ class MappingForm extends FormComponent {
 
   getIdHelperText() {
     const { parent, fields } = this.state
-    const { edit, source } = this.props
+    const { edit, source, t } = this.props
     const id = fields.id.value || "[generated-mapping-id]"
     const parentURL = edit ? this.props.parentURL : get(parent, 'url');
     return (
@@ -256,27 +257,27 @@ class MappingForm extends FormComponent {
         {
           source.autoid_mapping_mnemonic &&
             <React.Fragment>
-              <a onClick={this.toggleManualMnemonic} style={ANCHOR_UNDERLINE_STYLES}>Auto-assign</a><br/>
+              <a onClick={this.toggleManualMnemonic} style={ANCHOR_UNDERLINE_STYLES}>{t('mapping.form.auto_assign')}</a><br/>
             </React.Fragment>
         }
         {
           source.autoid_mapping_mnemonic === 'sequential' &&
             <React.Fragment>
-              <span>This is optional since the parent repository is set can to take care of generating the ID. The ID will be generated to next in sequence.</span><br/>
+              <span>{t('mapping.form.auto_id_sequence_help')}</span><br/>
             </React.Fragment>
         }
         {
           source.autoid_mapping_mnemonic === 'uuid' &&
             <React.Fragment>
-              <span>This is optional since the parent repository is set to take care of generating the ID. The ID will be generated in UUID format xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.</span><br/>
+              <span>{t('mapping.form.auto_id_uuid_help')}</span><br/>
             </React.Fragment>
         }
-        <span>Alphanumeric characters, @, hyphens, periods, and underscores are allowed.</span>
+        <span>{t('repo.version.form.id.helper_text')}</span>
         <br />
         {
           parentURL &&
             <span>
-              <span>Your new mapping will live at: <br />
+              <span>{t('mapping.form.mapping_url')} <br />
                 { `${window.location.origin}/#${parentURL}mappings/` }
               </span>
               <span><b>{id}</b>/</span>
@@ -287,7 +288,7 @@ class MappingForm extends FormComponent {
   }
 
   getExternalIdHelperText() {
-    const { source } = this.props
+    const { source, t } = this.props
     if(!source)
       return ''
     return (
@@ -295,16 +296,16 @@ class MappingForm extends FormComponent {
         {
           source.autoid_mapping_external_id &&
             <React.Fragment>
-              <a onClick={this.toggleManualExternalId} style={ANCHOR_UNDERLINE_STYLES}>Auto-assign</a><br/>
+              <a onClick={this.toggleManualExternalId} style={ANCHOR_UNDERLINE_STYLES}>{t('mapping.form.auto_assign')}</a><br/>
             </React.Fragment>
         }
         {
           source.autoid_mapping_external_id === 'sequence' &&
-            <span>This is optional since the parent repository is set to take care of generating the External ID. The External ID will be generated to next in sequence.</span>
+            <span>{t('mapping.form.auto_id_sequence_help')}</span>
         }
         {
           source.autoid_mapping_external_id === 'uuid' &&
-            <span>This is optional since the parent repository is set to take care of generating the External ID. The External ID will be generated in UUID format xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.</span>
+            <span>{t('mapping.form.auto_id_uuid_help')}</span>
         }
         {
           !source.autoid_mapping_external_id && ''
@@ -457,7 +458,7 @@ class MappingForm extends FormComponent {
                   {
                     get(source, 'autoid_mapping_mnemonic') && !manualMnemonic ?
                       <span style={{fontWeight: '500', borderLeft: '3px solid lightgray', padding: '10px 5px'}}>
-                        Mapping ID will be auto-assigned (<a style={ANCHOR_UNDERLINE_STYLES} onClick={this.toggleManualMnemonic}>click here</a> to override with manual entry)
+                        <Trans t={t} i18nKey='mapping.form.id_auto_assign' components={{manual: <a style={ANCHOR_UNDERLINE_STYLES} onClick={this.toggleManualMnemonic} />}} />
                       </span> :
                     <TextField
                       error={Boolean(fields.id.errors[0])}
@@ -501,7 +502,7 @@ class MappingForm extends FormComponent {
               {
                 get(source, 'autoid_mapping_external_id') && !manualExternalId && !edit ?
                   <span style={{fontWeight: '500', borderLeft: '3px solid lightgray', padding: '10px 5px'}}>
-                    Mapping External ID will be auto-assigned (<a style={ANCHOR_UNDERLINE_STYLES} onClick={this.toggleManualExternalId}>click here</a> to override with manual entry)
+                    <Trans t={t} i18nKey='mapping.form.external_id_auto_assign' components={{manual: <a style={ANCHOR_UNDERLINE_STYLES} onClick={this.toggleManualExternalId} />}} />
                   </span> :
                 <TextField
                   id="external_id"
@@ -631,8 +632,8 @@ class MappingForm extends FormComponent {
           }
         </CardSection>
         <div className='col-xs-12 padding-0' style={{margin: '4px 0', width: '100%', textAlign: 'center'}}>
-          <Tooltip arrow title="Swap From and To Concepts">
-            <IconButton color="primary" onClick={this.swapConcepts} size="large">
+          <Tooltip arrow title={t('mapping.swap_concepts')}>
+            <IconButton aria-label={t('mapping.swap_concepts')} color="primary" onClick={this.swapConcepts} size="large">
               <SwapIcon />
             </IconButton>
           </Tooltip>
@@ -646,7 +647,7 @@ class MappingForm extends FormComponent {
                     <TextField
                       id="to_source_url"
                       label={t('mapping.to_source_url')}
-                      placeholder="e.g. /orgs/IHTSDO/sources/SNOMED-CT/"
+                      placeholder={t('mapping.source_url_example')}
                       variant="outlined"
                       fullWidth
                       onChange={this.onTextFieldChange}

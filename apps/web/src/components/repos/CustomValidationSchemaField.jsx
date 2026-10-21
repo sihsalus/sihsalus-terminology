@@ -22,15 +22,15 @@ const CustomValidationSchemaField = ({value, onChange, style}) => {
           <MenuItem value="None">
             <SelectItemText
               value='None'
-              primaryText='None'
-              secondaryText="Default validation schema"
+              primaryText={t('common.none')}
+              secondaryText={t('repo.default_validation_schema')}
             />
           </MenuItem>
           <MenuItem value='OpenMRS'>
             <SelectItemText
               value='OpenMRS'
-              primaryText='OpenMRS Validation Schema'
-              secondaryText="Custom OpenMRS Validation schema"
+              primaryText={t('repo.openmrs_validation_schema')}
+              secondaryText={t('repo.custom_openmrs_validation_schema')}
             />
           </MenuItem>
         </Select>

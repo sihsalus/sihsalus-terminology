@@ -23,8 +23,9 @@ const load = (file, api = {}, utils = {}) => {
     '../../services/APIService': api,
     '../../common/utils': utils,
     '../users/LocalSignup': 'LocalSignup',
+    '../users/LocalSignIn': 'LocalSignIn',
   };
-  vm.runInNewContext(code, { exports, window, require: name => {
+  vm.runInNewContext(code, { exports, window, URLSearchParams, require: name => {
     assert.ok(name in modules, `Unexpected import ${name}`);
     return modules[name];
   } }, { filename });
@@ -119,3 +120,49 @@ test('unverified local login explains email confirmation and offers registration
   assert.equal(tree.root.findByType('Alert').props.children, 'auth.signup_check_email');
   assert.ok(tree.root.findAllByType('Button').some(button => button.props.href === '#/signup'));
 });
+
+test('signup redirect exposes a translated retry after an SSO URL failure', async t => {
+  let calls = 0;
+  const { Component, window } = load('app/SignupRedirect', {}, {
+    isSelfRegistrationEnabled: () => true,
+    isSSOConfigured: () => true,
+    getRegisterURL: async () => {
+      calls++;
+      if(calls === 1) throw new Error('Synthetic browser failure');
+      return 'https://identity.example.test/register';
+    },
+  });
+  const tree = await render(Component);
+  t.after(() => tree.unmount());
+  assert.equal(tree.root.findByType('Alert').props.children, 'auth.redirect_failed');
+  await act(async () => tree.root.findByType('Alert').props.action.props.onClick());
+  assert.equal(calls, 2);
+  assert.equal(window.location.href, 'https://identity.example.test/register');
+});
+
+test('sign-in redirect preserves returnTo and translates its pending state', async t => {
+  const getLoginURL = t.mock.fn(async () => 'https://identity.example.test/login');
+  const { Component, window } = load('app/SigninRedirect', {}, {
+    isSSOConfigured: () => true, getLoginURL,
+  });
+  const tree = await render(Component, {location: {search: '?returnTo=https%3A%2F%2Fterminology.example%2F%23%2Fsearch'}});
+  t.after(() => tree.unmount());
+  assert.equal(getLoginURL.mock.calls[0].arguments[0], 'https://terminology.example/#/search');
+  assert.equal(window.location.href, 'https://identity.example.test/login');
+  assert.equal(tree.root.findByType('h4').props.children, 'auth.redirecting');
+});
+
+for(const search of ['', '?returnTo=https%3A%2F%2Fterminology.example%2F%23%2Fsearch%2F%3Fq%3Ddemo']) {
+  test(`local sign-in prepares an explicit return route only: ${Boolean(search)}`, async t => {
+    const getLoginURL = t.mock.fn(async () => 'https://terminology.example/#/signin');
+    const { Component, window } = load('app/SigninRedirect', {}, {
+      isSSOConfigured: () => false, getLoginURL,
+    });
+    const tree = await render(Component, {location: {search}});
+    t.after(() => tree.unmount());
+    assert.equal(tree.root.findAllByType('LocalSignIn').length, 1);
+    assert.equal(window.location.href, '');
+    assert.equal(getLoginURL.mock.callCount(), search ? 1 : 0);
+    if(search) assert.equal(getLoginURL.mock.calls[0].arguments[0], 'https://terminology.example/#/search/?q=demo');
+  });
+}

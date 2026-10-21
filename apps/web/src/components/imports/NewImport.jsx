@@ -201,7 +201,7 @@ class NewImport extends React.Component {
       <React.Fragment>
         <h3 style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
           <span>
-            New Import
+            {t('import.new_import')}
           </span>
           <span>
             <ButtonGroup color='primary' size='small' disabled={isUploading}>
@@ -405,7 +405,7 @@ class NewImport extends React.Component {
             disabled={!canUpload || isUploading}
             onClick={this.onUpload}
           >
-            Upload
+            {t('common.upload')}
           </Button>
         </div>
         <div className='col-xs-12 padding-0' style={{marginTop: '10px'}}>

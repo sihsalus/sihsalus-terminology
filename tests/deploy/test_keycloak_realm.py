@@ -129,6 +129,8 @@ class KeycloakRealmTests(unittest.TestCase):
         self.assertFalse(realm['editUsernameAllowed'])
         self.assertEqual(realm['registrationAllowed'], '${TERMINOLOGY_ALLOW_SELF_REGISTRATION}')
         self.assertEqual(realm['defaultLocale'], 'es')
+        self.assertEqual(realm['loginTheme'], 'sihsalus')
+        self.assertEqual(realm['emailTheme'], 'sihsalus')
         client = next(item for item in realm['clients'] if item['clientId'] == 'ocl-web')
         self.assertEqual(client['clientId'], 'ocl-web')
         self.assertTrue(client['publicClient'])
@@ -186,6 +188,40 @@ class KeycloakRealmTests(unittest.TestCase):
         self.assertEqual(smtp['starttls'], 'true')
         self.assertEqual(smtp['password'], '${TERMINOLOGY_EMAIL_HOST_PASSWORD}')
         self.assertEqual(self.export()['smtpServer'], smtp)
+
+    def test_theme_extends_native_templates_and_is_packaged(self):
+        theme = ROOT / 'images/keycloak/themes/sihsalus'
+        login = (theme / 'login/theme.properties').read_text()
+        self.assertIn('parent=keycloak.v2\n', login)
+        self.assertIn('styles=css/styles.css css/sihsalus.css\n', login)
+        self.assertIn('darkMode=false\n', login)
+        self.assertEqual((theme / 'email/theme.properties').read_text(), 'parent=keycloak\nlocales=es\n')
+        self.assertFalse(list(theme.rglob('*.ftl')), 'Authentication templates must remain upstream')
+        self.assertIn('COPY --chown=1000:0 themes/sihsalus /opt/keycloak/themes/sihsalus',
+                      (ROOT / 'images/keycloak/Dockerfile').read_text())
+        css = (theme / 'login/resources/css/sihsalus.css').read_text()
+        self.assertIn('--sihsalus-primary: #4836ff;', css)
+        self.assertIn('radial-gradient(', css)
+        self.assertNotIn('url(', css, 'Background must not fetch external assets')
+
+    def test_email_messages_preserve_native_parameters_and_formatted_duration(self):
+        path = ROOT / 'images/keycloak/themes/sihsalus/email/messages/messages_es.properties'
+        messages = dict(line.split('=', 1) for line in path.read_text().splitlines()
+                        if line and not line.startswith('#'))
+        for prefix, parameters, duration in (
+                ('emailVerification', {'0', '2', '3'}, '3'),
+                ('passwordReset', {'0', '2', '3'}, '3'),
+                ('executeActions', {'0', '2', '3', '4'}, '4')):
+            for suffix in ('Body', 'BodyHtml'):
+                message = messages[prefix + suffix]
+                with self.subTest(message=prefix + suffix):
+                    self.assertEqual(set(re.findall(r'\{(\d+)\}', message)), parameters)
+                    self.assertIn('caduca en {' + duration + '}.', message)
+                    rendered = message.replace('{' + duration + '}', '30 minutos')
+                    self.assertIn('30 minutos.', rendered)
+                    self.assertNotIn('minutos minutos', rendered)
+                    if suffix == 'BodyHtml':
+                        self.assertIn('href="{0}"', message)
 
 
 if __name__ == '__main__':

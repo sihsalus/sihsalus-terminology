@@ -30,6 +30,7 @@ import { createSimilarRepoHref } from '../repos/utils';
 import { MAX_SEARCH_RESULT_WINDOW } from '../../common/constants';
 
 const ResultsToolbar = props => {
+  const { t } = useTranslation()
   const { numSelected, title, onFiltersToggle, disabled, isFilterable, onDisplayChange, display, order, orderBy, onOrderByChange, sortConfig, noCardDisplay, toolbarControl, appliedFilters, availableFilterFields, openFilters, bulkActions, leftControls, displayOptions, resource } = props;
   const countableFilters = availableFilterFields ? pick(appliedFilters, availableFilterFields) : appliedFilters
   const filtersCount = resource === 'references' ? flatten(values(countableFilters))?.length : flatten(values(countableFilters).map(v => values(v))).length
@@ -74,7 +75,7 @@ const ResultsToolbar = props => {
           variant="subtitle1"
           component="div"
         >
-          {numSelected} selected
+          {t('search.selected_count', {count: numSelected})}
         </Typography>
       ) : (
         title ?
@@ -231,7 +232,7 @@ const SearchResults = props => {
     if(title)
       return title
     if(props.isMatch)
-      return 'Matched Candidates'
+      return t('search.matched_candidates')
     const total = results?.total
     if(isNumber(total) && !isNaN(total)) {
       const isMore = total && total === 10000;
@@ -395,7 +396,10 @@ const SearchResults = props => {
                           -1 :
                           (isResultWindowCapped ? Math.floor(MAX_SEARCH_RESULT_WINDOW / pageSize) * pageSize : totalResults)
 
-  const defaultLabelDisplayedRows = ({ from, to, count }) => `${from}–${to} of ${count !== -1 ? (isResultWindowCapped ? totalResults : count)?.toLocaleString() : (props.isMatch ? 'many' : `more than ${to?.toLocaleString()}`)}`
+  const defaultLabelDisplayedRows = ({ from, to, count }) => t(
+    count !== -1 ? 'search.pagination_range' : (props.isMatch ? 'search.pagination_many' : 'search.pagination_more_than'),
+    {from: from.toLocaleString(), to: to.toLocaleString(), total: (count !== -1 ? (isResultWindowCapped ? totalResults : count) : to).toLocaleString()}
+  )
 
   return (
     <Box sx={{ width: '100%', background: 'inherit', height: '100%', ...props.sx }}>

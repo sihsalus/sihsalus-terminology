@@ -4,6 +4,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import upperFirst from 'lodash/upperFirst'
 import Typography from '@mui/material/Typography'
+import Box from '@mui/material/Box'
 import Card from '@mui/material/Card'
 import CardContent from '@mui/material/CardContent'
 import Stack from '@mui/material/Stack'
@@ -18,6 +19,7 @@ import CommunityBlog from './CommunityBlog'
 
 
 const UsageWidget = ({ username }) => {
+  const { t } = useTranslation()
 
   /*eslint no-undef: 0*/
   const analyticsUrl = window.ANALYTICS_API || process.env.ANALYTICS_API
@@ -59,7 +61,7 @@ const UsageWidget = ({ username }) => {
             color: "text.secondary",
             mb: 1
           }}>
-          Your Activity This Month
+          {t('dashboard.usage_title')}
         </Typography>
         {loading ? (
           <Stack
@@ -70,17 +72,17 @@ const UsageWidget = ({ username }) => {
         ) : summary ? (
           <Stack spacing={0.5}>
             <Stack direction="row" sx={{
-              justifyContent: "space-between"
+              justifyContent: "space-between", gap: 1, flexWrap: 'wrap'
             }}>
-              <Typography variant="body2">API Requests</Typography>
+              <Typography variant="body2">{t('dashboard.api_requests')}</Typography>
               <Typography variant="body2" sx={{ fontWeight: 700 }}>{(summary.total_requests || 0).toLocaleString()}</Typography>
             </Stack>
             {topOp && (
               <Stack direction="row" sx={{
-                justifyContent: "space-between"
+                justifyContent: "space-between", gap: 1, flexWrap: 'wrap'
               }}>
-                <Typography variant="body2">Top Operation</Typography>
-                <Typography variant="body2" sx={{ fontWeight: 600 }}>{topOp.operation_type}</Typography>
+                <Typography variant="body2">{t('dashboard.top_operation')}</Typography>
+                <Typography variant="body2" sx={{ fontWeight: 600, overflowWrap: 'anywhere' }}>{topOp.operation_type}</Typography>
               </Stack>
             )}
             <Button
@@ -88,13 +90,13 @@ const UsageWidget = ({ username }) => {
               href={`#/users/${username}/usage`}
               sx={{ textTransform: 'none', mt: 0.5, alignSelf: 'flex-start', p: 0 }}
             >
-              View full dashboard
+              {t('dashboard.view_usage')}
             </Button>
           </Stack>
         ) : (
           <Typography variant="body2" sx={{
             color: "text.secondary"
-          }}>No usage data yet.</Typography>
+          }}>{t('dashboard.no_usage')}</Typography>
         )}
       </CardContent>
     </Card>
@@ -158,26 +160,26 @@ const UserDashboard = ({ user }) => {
     return allEvents.events
   }
   return (
-    <div className='col-xs-12 padding-0'>
-      <div className='col-xs-9' style={{maxWidth: 'calc(100% - 360px)', minWidth: '500px'}}>
-        <div className='col-xs-12 padding-0' style={{marginTop: '8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
+    <Box sx={{display: 'grid', gridTemplateColumns: {xs: 'minmax(0, 1fr)', lg: 'minmax(0, 1fr) 360px'}, gap: 2, width: '100%', alignItems: 'start'}}>
+      <Box sx={{minWidth: 0}}>
+        <Box sx={{mt: 1, display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 1}}>
           <Typography sx={{fontSize: '22px', color: 'secondary.main'}}>
             {upperFirst(t('dashboard.anonymous_heading'))}
           </Typography>
           <EventsButtonGroup selected={scope} onClick={onScopeChange} />
-        </div>
+        </Box>
         <DashboardEvents isLoading={loading} events={getScopeEvents()} />
-      </div>
-      <div className='col-xs-3 padding-0' style={{minWidth: '360px', minHeight: '370px'}}>
-        <div className='col-xs-12' style={{background: WHITE, borderRadius: '10px', border: `1px solid ${SURFACE_COLORS.nv80}`}}>
+      </Box>
+      <Box sx={{minWidth: 0}}>
+        <Box sx={{display: 'flow-root', px: 2, background: WHITE, borderRadius: '10px', border: `1px solid ${SURFACE_COLORS.nv80}`}}>
           <Events user={user} events={selfEvents.events} onLoadMore={selfEvents.headers?.next ? fetchEventsForSelf : false} showAvatar maxHeight="245px" dashboard />
-        </div>
-        <div className='col-xs-12 padding-0' style={{marginTop: '8px'}}>
+        </Box>
+        <Box sx={{mt: 1}}>
           <UsageWidget username={user?.username} />
-        </div>
+        </Box>
         <CommunityBlog sx={{marginTop: '8px'}} />
-      </div>
-    </div>
+      </Box>
+    </Box>
   )
 }
 export default UserDashboard

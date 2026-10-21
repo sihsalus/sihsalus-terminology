@@ -122,7 +122,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                   lineHeight: "32px"
                 }}
               >
-                Reference Versioning
+                {t('reference.versioning')}
               </ListSubheader>
 
               {/* Resource Versioned: true/false */}
@@ -134,7 +134,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.versioning === "unversioned"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Unversioned" />
+                <ListItemText primary={t('reference.unversioned')} />
               </ListItemButton>
 
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("versioning", "repository")}>
@@ -145,7 +145,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.versioning === "repository"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Repository" />
+                <ListItemText primary={t('repo.repo')} />
               </ListItemButton>
 
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("versioning", "resource")}>
@@ -156,7 +156,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.versioning === "resource"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Resource" />
+                <ListItemText primary={t('reference.resource')} />
               </ListItemButton>
             </ul>
           </li>
@@ -175,7 +175,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                   lineHeight: "32px"
                 }}
               >
-                Transform Method
+                {t('reference.transform_method')}
               </ListSubheader>
 
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("definition_type", "none")}>
@@ -186,7 +186,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.definition_type === "none"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="None" />
+                <ListItemText primary={t('common.none')} />
               </ListItemButton>
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("definition_type", "intensional")}>
                 <ListItemIcon sx={{ minWidth: "auto" }}>
@@ -196,7 +196,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.definition_type === "intensional"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Resource Versions" />
+                <ListItemText primary={t('reference.resource_versions')} />
               </ListItemButton>
 
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("definition_type", "extensional")}>
@@ -207,7 +207,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.definition_type === "extensional"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Extensional / Enumerated" />
+                <ListItemText primary={t('reference.extensional_enumerated')} />
               </ListItemButton>
             </ul>
           </li>
@@ -226,7 +226,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                   lineHeight: "32px"
                 }}
               >
-                Cascade
+                {t('reference.cascade')}
               </ListSubheader>
 
               {/* None => cascade=false */}
@@ -238,7 +238,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.cascade === "any"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Any" />
+                <ListItemText primary={t('common.any')} />
               </ListItemButton>
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("cascade", "none")}>
                 <ListItemIcon sx={{ minWidth: "auto" }}>
@@ -248,7 +248,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.cascade === "none"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="None" />
+                <ListItemText primary={t('common.none')} />
               </ListItemButton>
 
               {/* SourceToConcepts => cascade=source_to_concepts */}
@@ -260,7 +260,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.cascade === "sourcetoconcepts"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Source to Concepts" />
+                <ListItemText primary={t('reference.source_to_concepts')} />
               </ListItemButton>
 
               {/* SourceMappings => cascade=source_mappings */}
@@ -272,7 +272,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.cascade === "sourcemappings"}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Source Mappings" />
+                <ListItemText primary={t('reference.source_mappings')} />
               </ListItemButton>
             </ul>
           </li>
@@ -291,7 +291,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                   lineHeight: "32px"
                 }}
               >
-                Inclusion Type
+                {t('reference.inclusion_type')}
               </ListSubheader>
 
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("inclusion_type", 'include')}>
@@ -302,7 +302,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.inclusion_type === 'include'}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Include" />
+                <ListItemText primary={t('reference.include')} />
               </ListItemButton>
 
               <ListItemButton sx={{ padding: 0 }} onClick={() => toggleGroupValue("inclusion_type", 'exclude')}>
@@ -313,7 +313,7 @@ const ReferenceFilters = ({ onChange, heightToSubtract }) => {
                     checked={filters.inclusion_type === 'exclude'}
                   />
                 </ListItemIcon>
-                <ListItemText primary="Exclude" />
+                <ListItemText primary={t('reference.exclude')} />
               </ListItemButton>
             </ul>
           </li>

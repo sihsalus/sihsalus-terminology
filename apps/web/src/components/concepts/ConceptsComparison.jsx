@@ -254,8 +254,8 @@ const ConceptsComparison = () => {
         {attr: 'updated_by', type: 'text'},
         {attr: 'created_on', type: 'date'},
         {attr: 'updated_on', type: 'date'},
-        {attr: 'checksums.standard', type: 'text', label: 'Checksums Standard'},
-        {attr: 'checksums.smart', type: 'text', label: 'Checksums Smart'},
+        {attr: 'checksums.standard', type: 'text', label: t('checksums.standard')},
+        {attr: 'checksums.smart', type: 'text', label: t('checksums.smart')},
       ]
     },
   }

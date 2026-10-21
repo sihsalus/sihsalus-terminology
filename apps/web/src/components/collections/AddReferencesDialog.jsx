@@ -541,7 +541,7 @@ const AddReferencesDialog = ({ open, onClose, collectionUrl, onSuccess }) => {
             <Typography variant="caption" sx={{
               color: "text.secondary"
             }}>
-              {expressionList.length} expression{expressionList.length !== 1 ? 's' : ''} · {includeExclude}
+              {t('reference.expression_count', {count: expressionList.length})} · {t(includeExclude === 'include' ? 'reference.include' : 'reference.exclude')}
             </Typography>
           )}
         </Box>

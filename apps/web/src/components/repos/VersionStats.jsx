@@ -69,7 +69,7 @@ const VersionStats = ({version1, version2}) => {
   }
   return (
     <TableContainer sx={{ maxHeight: 'calc(var(--app-height) - 270px)' }}>
-      <Table size='small' stickyHeader aria-label="sticky table">
+      <Table size='small' stickyHeader aria-label={t('repo.statistics_table')}>
         <TableHead>
           <TableRow>
             <TableCell sx={{...headCellStyle, width: '20%'}} />

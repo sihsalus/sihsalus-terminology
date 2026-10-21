@@ -214,7 +214,7 @@ class ConceptForm extends FormComponent  {
       const output = (get(response, 'data.output') || '').trim()
 
       if (!output)
-        throw new Error('No generated comment was returned.')
+        throw new Error(t('concept.generated_comment_missing'))
 
       this.setFieldValue('comment', output)
     } catch (error) {

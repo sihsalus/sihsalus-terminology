@@ -1,21 +1,25 @@
 $black: #000;
-$white: #FFF;
 footer.footer-container {
-    bottom: 0;
-    left: 0;
-    right: 0;
-    position: absolute;
-    background: transparent;
-    height: 30px;
-    padding: 8px 26px;
+    flex-shrink: 0;
+    width: 100%;
+    min-height: 30px;
+    padding: 6px 0;
     font-size: 12px;
     justify-content: flex-end;
-    .footer-company {
-        padding: 0 2px;
+    flex-wrap: wrap;
+    gap: 4px;
+    .footer-attribution {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
     }
     .footer-divider-vertical {
-        margin: 0 5px;
+        margin: 0 2px;
         background: $black;
         width: 1px;
+        height: 14px;
+    }
+    .app-version-container {
+        overflow-wrap: anywhere;
     }
 }

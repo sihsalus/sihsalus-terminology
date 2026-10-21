@@ -9,7 +9,7 @@ import {
   uniqBy, cloneDeep, isEqual, without, capitalize, last, nth, uniq, flatten, pickBy, upperFirst
 } from 'lodash';
 import {
-  DATE_FORMAT, TIME_FORMAT, DATETIME_FORMAT, OCL_SERVERS_GROUP, OCL_FHIR_SERVERS_GROUP, HAPI_FHIR_SERVERS_GROUP,
+  TIME_FORMAT, OCL_SERVERS_GROUP, OCL_FHIR_SERVERS_GROUP, HAPI_FHIR_SERVERS_GROUP,
   OPENMRS_URL, DEFAULT_FHIR_SERVER_FOR_LOCAL_ID, OPERATIONS_PANEL_GROUP, ID_REGEX,
   RESERVED_ROUTE_KEYWORDS, OCL_CLIENT_HEADERS
 } from './constants';
@@ -23,9 +23,9 @@ export const isAtGlobalSearch = () => window.location.hash.includes('#/search') 
 
 export const isAtRoot = () => currentPath() === '#/';
 
-export const formatDate = date => moment(date).format(DATE_FORMAT);
+export const formatDate = date => moment(date).locale(moment.locale()).format('L');
 export const formatTime = date => moment(date).format(TIME_FORMAT);
-export const formatDateTime = date => moment(date).format(DATETIME_FORMAT);
+export const formatDateTime = date => moment(date).locale(moment.locale()).format('L LT');
 
 export const formatWebsiteLink = (value, style, text) => {
   if(value && value.trim()) {
@@ -661,6 +661,7 @@ export const setUpRecentHistory = history => {
   });
 }
 
+// eslint-disable-next-line spellcheck/spell-checker -- The product name is Spanish.
 export const getSiteTitle = () => get(getAppliedServerConfig(), 'info.site.title', 'SIHSALUS Terminología');
 
 export const getRandomColor = () => `#${Math.floor(Math.random()*16777215).toString(16)}`;

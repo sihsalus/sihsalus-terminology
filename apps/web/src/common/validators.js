@@ -1,26 +1,27 @@
 import {has, forEach, isEmpty, isNumber} from "lodash";
+import i18n from 'i18next';
 
 export const MESSAGES = {
-  REQUIRED: 'This field can not be blank',
-  SELECTED: 'Please select from suggestions',
-  PATTERN: 'Invalid value'
+  get REQUIRED() { return i18n.t('errors.mandatory_field'); },
+  get SELECTED() { return i18n.t('errors.select_from_suggestions'); },
+  get PATTERN() { return i18n.t('errors.invalid_value'); }
 };
 
 export const VALUE_NOT_SELECTED = 'VALUE_NOT_SELECTED';
 
 export const  required = (msg='') => getValidator(
   value => isEmpty(value) && !isNumber(value),
-  (msg) ? msg : MESSAGES.REQUIRED,
+  msg, 'REQUIRED',
 );
 
 export const selected = (msg='') => getValidator(
   value => ('' + value).length && value === VALUE_NOT_SELECTED,
-  (msg) ? msg : MESSAGES.SELECTED,
+  msg, 'SELECTED',
 );
 
 export const matchPattern = (pattern, msg='') => getValidator(
   value => value?.length && !value.match(pattern)?.length,
-  (msg) ? msg : MESSAGES.PATTERN,
+  msg, 'PATTERN',
 );
 
 
@@ -37,10 +38,11 @@ export const applyValidatorsOn = fields => {
   });
 };
 
-const getValidator = (isInvalidFunction, message, type='error') => {
+const getValidator = (isInvalidFunction, message, defaultMessage, type='error') => {
   return {
     isInvalid: isInvalidFunction,
-    message,
+    // Forms can keep a validator while the user changes the interface language.
+    get message() { return message || MESSAGES[defaultMessage]; },
     type,
   };
 }

@@ -1,8 +1,10 @@
 main.content {
-    display: inline-block;
+    display: block;
     width: 100%;
-    height: calc(var(--app-height) - 95px);
-    overflow: hidden;
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    overflow: auto;
 }
 div.rounded-input {
     border-radius: 100px;

@@ -78,7 +78,7 @@ def prepare_database(require_existing=False):
 
 
 def reconcile_realm():
-    """Apply the reviewed SMTP/registration settings; startup import skips existing realms."""
+    """Apply reviewed SMTP, registration and themes; startup import skips existing realms."""
     import requests  # pylint: disable=import-outside-toplevel
 
     registration = required('ALLOW_SELF_REGISTRATION')
@@ -119,6 +119,7 @@ def reconcile_realm():
     response = requests.put(endpoint, headers=headers, json={
         'registrationAllowed': registration == 'true',
         'resetPasswordAllowed': True, 'verifyEmail': True, 'smtpServer': smtp,
+        'loginTheme': 'sihsalus', 'emailTheme': 'sihsalus',
     }, timeout=20)
     response.raise_for_status()
     print(json.dumps({'realm': 'ocl', 'smtp_configured': True,

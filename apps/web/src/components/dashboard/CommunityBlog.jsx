@@ -53,12 +53,12 @@ const CommunityBlog = ({ sx }) => {
     <Card variant='outlined' sx={{height: 'calc(298px - var(--announcement-height, 0px))', borderRadius: '10px', display: 'inline-block', width: '100%', overflow: 'auto', ...sx}}>
       <CardHeader
         avatar={
-          <Avatar sx={{ bgcolor: 'primary.main' }} aria-label="recipe">
+          <Avatar sx={{ bgcolor: 'primary.main' }}>
             <OCLLogo color={WHITE} width="30px" height="16px" />
           </Avatar>
         }
         title={t('dashboard.community_blog')}
-        sx={{paddingBottom: 0, '.MuiCardHeader-title': {color: 'surface.dark', fontWeight: 'bold'}}}
+        sx={{paddingBottom: 0, '.MuiCardHeader-content': {minWidth: 0}, '.MuiCardHeader-title': {color: 'surface.dark', fontWeight: 'bold', overflowWrap: 'anywhere'}}}
       />
       <CardContent sx={{padding: '0px 16px 16px 16px'}}>
         {
@@ -74,7 +74,7 @@ const CommunityBlog = ({ sx }) => {
                       <ListItemText
                         primary={item.title}
                         secondary={formatDate(item.published)}
-                        sx={{'.MuiListItemText-primary': { fontSize: '14px'}, '.MuiListItemText-secondary': { fontSize: '12px'}}}
+                        sx={{minWidth: 0, overflowWrap: 'anywhere', '.MuiListItemText-primary': { fontSize: '14px'}, '.MuiListItemText-secondary': { fontSize: '12px'}}}
                       />
                     </ListItemButton>
                   </ListItem>

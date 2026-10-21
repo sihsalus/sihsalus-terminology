@@ -243,12 +243,22 @@ claims de grupos del proveedor nunca conceden ni retiran esos permisos.
 En el primer arranque, la importación mantiene el registro cerrado hasta que
 API y web estén listos. Al final de cada despliegue,
 `scripts/terminology/keycloak-setup.py reconcile` aplica SMTP y el valor revisado
-de `TERMINOLOGY_ALLOW_SELF_REGISTRATION` mediante la API administrativa interna.
+de `TERMINOLOGY_ALLOW_SELF_REGISTRATION`, y selecciona `sihsalus` como tema de
+login y correo mediante la API administrativa interna.
 Un realm existente no se vuelve a importar. Si la instalación ya tenía SSO y
 falta su base o realm, el despliegue se detiene: restaurar el backup de Keycloak;
 no reconstruirlo desde los hashes Django, que pueden haber quedado obsoletos
 tras cambios de contraseña en el proveedor. Desactivar SSO también exige una
 recuperación de identidades revisada; vaciar las variables no es un rollback.
+
+La selección del tema persiste en la base. Para revertir a una imagen anterior
+sin `sihsalus`, guardar los valores actuales y obtener aprobación de la revisión
+y digests de destino; antes de cambiar la imagen, configurar `loginTheme=keycloak.v2`
+y `emailTheme=keycloak` mediante la API administrativa interna. Continuar con los
+scripts de la revisión de destino para que `reconcile` no vuelva a seleccionar
+el tema retirado. Seguir los pasos de [reversión del tema](../../images/keycloak/themes/README.md#reversión-a-una-imagen-sin-el-tema)
+y verificar los formularios y el correo; el fallback de Keycloak no se ha validado
+como mecanismo de recuperación de esta instalación.
 
 ## GitHub Secrets y sincronización manual
 

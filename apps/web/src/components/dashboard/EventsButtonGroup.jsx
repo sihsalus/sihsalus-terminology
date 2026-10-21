@@ -7,9 +7,15 @@ import Button from '@mui/material/Button'
 
 const EventButton = ({ label, selected, terminal, onClick }) => {
   return (
-    <Button id={label} sx={[{
+    <Button aria-pressed={selected} sx={[{
       textTransform: 'none',
-      fontWeight: 'bold'
+      fontWeight: 'bold',
+      minWidth: 0,
+      flex: '1 1 auto',
+      whiteSpace: 'normal',
+      lineHeight: 1.4,
+      px: 1,
+      '& .MuiButton-startIcon': {ml: 0, mr: 0.5}
     }, selected ? {
       backgroundColor: 'surface.s90'
     } : {
@@ -26,7 +32,7 @@ const EventButton = ({ label, selected, terminal, onClick }) => {
 const EventsButtonGroup = ({ onClick, selected }) => {
   const { t } = useTranslation()
   return (
-    <ButtonGroup size="small" aria-label="Small button group" color='secondary'>
+    <ButtonGroup size="small" aria-label={t('dashboard.activity_filters')} color='secondary' sx={{maxWidth: '100%', width: {xs: '100%', sm: 'auto'}}}>
       <EventButton label={t('common.all')} selected={selected === 'all'} terminal onClick={() => onClick('all')} />
       <EventButton label={t('common.following')} selected={selected === 'following'} onClick={() => onClick('following')} />
       <EventButton label={startCase(t('org.my'))} selected={selected === 'orgs'} terminal onClick={() => onClick('orgs')} />

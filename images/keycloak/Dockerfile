@@ -4,6 +4,7 @@ RUN /opt/keycloak/bin/kc.sh build --db=postgres --health-enabled=true --metrics-
 
 FROM quay.io/keycloak/keycloak:26.8.1@sha256:79c623a22abacf3fe6c00a5fb30f5b7843d717b234033b80995891c06116d244
 COPY --from=builder /opt/keycloak/ /opt/keycloak/
+COPY --chown=1000:0 themes/sihsalus /opt/keycloak/themes/sihsalus
 ENV KC_DB=postgres \
     KC_HEALTH_ENABLED=true \
     KC_METRICS_ENABLED=true \

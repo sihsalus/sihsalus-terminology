@@ -1,11 +1,13 @@
 import React from 'react';
 import moment from 'moment';
+import { useTranslation } from 'react-i18next';
 import { DatePicker, PickerDay } from "@mui/x-date-pickers";
 import { Tooltip, Badge } from '@mui/material';
 import { isEmpty, get } from 'lodash';
 
 
 const ChipDatePicker = props => {
+  const { t } = useTranslation();
   const ref = React.useRef(null);
   const [value, setValue] = React.useState(null)
   const { date, defaultValue, badgedDates } = props;
@@ -26,7 +28,7 @@ const ChipDatePicker = props => {
     const count = get(badgedDates, fDate)
     if(count) {
       return (
-        <Tooltip title={`${count} imports`} arrow>
+        <Tooltip title={t('import.count', { count })} arrow>
           <Badge badgeContent={count} color="primary" variant="dot" overlap="circular">
             <PickerDay {...dayProps} />
           </Badge>
@@ -60,7 +62,7 @@ const ChipDatePicker = props => {
             }}
             value={value}
             onChange={onChange}
-            format="MM/DD/YYYY"
+            format="L"
             slots={{
               day: CustomPickerDay
             }}

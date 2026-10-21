@@ -149,7 +149,10 @@ class KeycloakSetupTests(unittest.TestCase):
             SETUP.reconcile_realm()
         payload = requests.put.call_args.kwargs['json']
         self.assertEqual(set(payload), {
-            'registrationAllowed', 'resetPasswordAllowed', 'verifyEmail', 'smtpServer'})
+            'registrationAllowed', 'resetPasswordAllowed', 'verifyEmail', 'smtpServer',
+            'loginTheme', 'emailTheme'})
+        self.assertEqual(payload['loginTheme'], 'sihsalus')
+        self.assertEqual(payload['emailTheme'], 'sihsalus')
         self.assertTrue(payload['registrationAllowed'])
         self.assertEqual(payload['smtpServer']['starttls'], 'true')
         self.assertEqual(payload['smtpServer']['auth'], 'true')

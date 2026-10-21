@@ -1,7 +1,7 @@
 import React from 'react'
+import { useTranslation } from 'react-i18next'
 import Property from './Property'
 
-import startCase from 'lodash/startCase'
 import keys from 'lodash/keys'
 import get from 'lodash/get'
 import map from 'lodash/map'
@@ -9,6 +9,7 @@ import without from 'lodash/without'
 
 
 const ConceptSummaryProperties = ({concept}) => {
+  const { t } = useTranslation()
   const getProperties = () => {
     if(concept.property?.length > 0) {
       let values = []
@@ -17,7 +18,7 @@ const ConceptSummaryProperties = ({concept}) => {
         let label = prop?.display || prop?.code
         let value;
         if(['concept_class', 'datatype'].includes(label))
-          label = startCase(label)
+          label = t(`concept.${label}`)
           value = get(prop, get(without(keys(prop), 'code'), '0'))
           values.push(<Property key={label} code={label} value={value} />)
         }
@@ -25,8 +26,8 @@ const ConceptSummaryProperties = ({concept}) => {
       return values
     }
     return [
-      <Property key={1} code='Concept Class' value={concept.concept_class} />,
-      <Property key={2} code='Datatype' value={concept.datatype} />,
+      <Property key={1} code={t('concept.concept_class')} value={concept.concept_class} />,
+      <Property key={2} code={t('concept.datatype')} value={concept.datatype} />,
     ]
   }
 

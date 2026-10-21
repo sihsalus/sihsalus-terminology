@@ -1,6 +1,6 @@
 import React from 'react';
 import { useHistory, useLocation } from 'react-router-dom';
-import { useTranslation } from 'react-i18next'
+import { Trans, useTranslation } from 'react-i18next'
 import Drawer from '@mui/material/Drawer'
 import Divider from '@mui/material/Divider'
 import ListItemButton from '@mui/material/ListItemButton';
@@ -37,7 +37,7 @@ const Suggestion = ({ placeholder }) => (
 const Option = ({ placeholder, selected, onClick, nested, onKeyDown, text, id, isMatchOp }) => {
   const { t } = useTranslation()
   return (
-    <ListItemButton id={id} sx={{padding: '12px'}} selected={selected} onClick={event => onClick(event, nested)} onKeyDown={onKeyDown}>
+    <ListItemButton id={id} sx={{padding: '12px', flexWrap: 'wrap'}} selected={selected} onClick={event => onClick(event, nested)} onKeyDown={onKeyDown}>
       <ListItemAvatar sx={{minWidth: '32px'}}>
         {
           isMatchOp ?
@@ -45,8 +45,8 @@ const Option = ({ placeholder, selected, onClick, nested, onKeyDown, text, id, i
             <SearchIcon color={selected ? 'primary' : undefined } />
         }
       </ListItemAvatar>
-      <ListItemText primary={placeholder} sx={{paddingRight: '4px'}} />
-      <span style={{display: 'flex', alignItems: 'center', color: '#47464f', fontSize: '12px', textAlign: 'right'}}>
+      <ListItemText primary={placeholder} sx={{paddingRight: '4px', minWidth: 0, overflowWrap: 'anywhere'}} />
+      <span style={{display: 'flex', alignItems: 'center', maxWidth: '100%', marginLeft: 'auto', color: '#47464f', fontSize: '12px', textAlign: 'right'}}>
         {
           selected &&
             <Icon
@@ -103,6 +103,7 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
   if (canMatchSemantic)
     lastIndex += 1
   const inputPlaceholder = input || '...'
+  const searchPrompt = (key, values) => <Trans i18nKey={`search.${key}`} shouldUnescape values={{query: inputPlaceholder, ...values}} components={{query: <b />, resource: <b />, owner: <b />, field: <b />, value: <b />}} />
   const onClickOption = (event, nested) => {
     event.persist()
     initiateSearch(event, !nested, event?.currentTarget?.id === 'match_repo' && canMatchSemantic)
@@ -295,6 +296,7 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
           padding: 0,
           top: 'calc(14px + var(--announcement-height, 0px))',
           width: '600px',
+          maxWidth: 'calc(100vw - 24px)',
           margin: '0 auto',
           minHeight: '64px'
         },
@@ -339,10 +341,10 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
                 FACET_FILTER_CONFIG[activeFilterType] ?
                   (
                     activeFilterValue ?
-                      <span>{t('common.search')} <b>{t(FACET_FILTER_CONFIG[activeFilterType].resourceLabelKey)}</b> {t('search.filtered_by')} <b>{t(FACET_FILTER_CONFIG[activeFilterType].labelKey)}</b> "<b>{activeFilterValue}</b>" {t('common.for')} "<b>{inputPlaceholder}</b>"</span> :
-                      <span>{t('search.filter')} <b>{t(FACET_FILTER_CONFIG[activeFilterType].resourceLabelKey)}</b> {t('common.by')} <b>{t(FACET_FILTER_CONFIG[activeFilterType].labelKey)}</b> "<b>{inputPlaceholder}</b>"</span>
+                      searchPrompt('query_filtered', {resource: t(FACET_FILTER_CONFIG[activeFilterType].resourceLabelKey).toLowerCase(), field: t(FACET_FILTER_CONFIG[activeFilterType].labelKey).toLowerCase(), value: activeFilterValue}) :
+                      searchPrompt('filter_resource', {resource: t(FACET_FILTER_CONFIG[activeFilterType].resourceLabelKey).toLowerCase(), field: t(FACET_FILTER_CONFIG[activeFilterType].labelKey).toLowerCase()})
                   ) :
-                  <span>{t('common.search')} <b>{t(BROWSE_CONFIG[activeFilterType]?.labelKey)}</b> {t('common.for')} "<b>{inputPlaceholder}</b>"</span>
+                  searchPrompt('query_in_resource', {resource: t(`search.${activeFilterType}`).toLowerCase()})
               }
               icon
               selected
@@ -368,7 +370,7 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
                   id='search_repo'
                   nested
                   index={1}
-                  placeholder={<span>{t('common.search')} <b>{repo}</b> {t('common.for')} "<b>{inputPlaceholder}</b>"</span>}
+                  placeholder={searchPrompt('query_in_resource', {resource: repo})}
                   icon
                   selected={focus == 1}
                   onClick={onClickOption}
@@ -381,7 +383,7 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
                   id='search_owner'
                   nested
                   index={1}
-                  placeholder={<span>{t('common.search')} <b>{owner}</b> {repoType} {t('common.for')} "<b>{inputPlaceholder}</b>"</span>}
+                  placeholder={searchPrompt('query_in_owner', {owner})}
                   icon
                   selected={focus == 1}
                   onClick={onClickOption}
@@ -394,7 +396,7 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
                   id='search'
                   nested
                   index={1}
-                  placeholder={<span>{t('search.search_this_url_registry')}"<b>{inputPlaceholder}</b>"</span>}
+                  placeholder={searchPrompt('query_url_registry')}
                   icon
                   selected={focus == 1}
                   onClick={onClickOption}
@@ -404,7 +406,7 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
             <Option
               id='search_global'
               index={2}
-              placeholder={<span>{t('search.search_all_site')}"<b>{inputPlaceholder}</b>"</span>}
+              placeholder={searchPrompt('query_global')}
               selected={focus ===  (isNested ? 2 : 1)}
               icon
               onClick={onClickOption}
@@ -416,7 +418,7 @@ const SearchInputDrawer = ({open, onClose, input, initiateSearch, inputProps, is
                   id='match_repo'
                   nested
                   index={3}
-                  placeholder={<span>{t('common.match')} "<b>{inputPlaceholder}</b>" {t('common.to_concepts_in')} <b>{repo}</b></span>}
+                  placeholder={searchPrompt('match_in_resource', {resource: repo})}
                   selected={focus == 3}
                   onClick={onClickOption}
                   onKeyDown={event => onItemKeyDown(event, 3)}

@@ -1,5 +1,6 @@
 import 'core-js/features/url-search-params';
 import React from 'react';
+import { withTranslation } from 'react-i18next';
 import ReactDiffViewer from 'react-diff-viewer';
 import { Link } from 'react-router-dom';
 import {
@@ -365,7 +366,7 @@ class Comparison extends React.Component {
                 <TableHead>
                   <TableRow colSpan="12">
                     <TableCell colSpan="2" style={{width: '10%'}}>
-                      <Tooltip arrow title='Customize attributes' placement='top'>
+                      <Tooltip arrow title={this.props.t('common.customize_attributes')} placement='top'>
                         <IconButton onClick={this.onDrawerClick} size="large">
                           <SettingsIcon />
                         </IconButton>
@@ -455,4 +456,4 @@ class Comparison extends React.Component {
   }
 }
 
-export default Comparison;
+export default withTranslation()(Comparison);

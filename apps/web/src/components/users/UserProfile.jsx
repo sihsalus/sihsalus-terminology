@@ -101,7 +101,7 @@ const UserProfile = ({ user }) => {
           </React.Fragment>
       }
       <Typography component='h1' sx={{color: 'surface.light', marginTop: '16px', fontSize: '12px'}}>
-        Joined {formatDate(user?.date_joined)}
+        {t('user.joined_on')} {formatDate(user?.date_joined)}
       </Typography>
       {
         canEdit &&
