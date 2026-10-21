@@ -24,6 +24,7 @@ import ExternalIdLabel from '../common/ExternalIdLabel';
 const borderColor = 'rgba(0, 0, 0, 0.12)'
 
 const LocalePrimary = ({ locale }) => {
+  const { t } = useTranslation()
   const locale_type = locale.name_type || locale.description_type
   return (
     <React.Fragment>
@@ -33,7 +34,7 @@ const LocalePrimary = ({ locale }) => {
         {
           locale?.retired && locale?.retire_reason &&
             <span className='flex-vertical-center' style={{margin: '0 4px'}}>
-              <Tooltip arrow title={<><strong>Retire reason</strong>: {locale.retire_reason}</>} placement='top-start'>
+              <Tooltip arrow title={<><strong>{t('concept.retire_reason')}</strong>: {locale.retire_reason}</>} placement='top-start'>
                 <InfoIcon sx={{color: '#000000de'}} fontSize='inherit' />
               </Tooltip>
             </span>
@@ -86,7 +87,7 @@ const LocaleItem = ({ locale, url }) => {
       <ListItem
         sx={{color: 'surface.contrastText', paddingTop: 0, paddingBottom: 0, paddingLeft: 0, paddingRight: '24px' }}
         secondaryAction={
-          <IconButton edge="end" aria-label="copy" sx={{color: 'surface.contrastText'}} onClick={onCopyClick} size='small'>
+          <IconButton edge="end" aria-label={t('common.click_to_copy')} sx={{color: 'surface.contrastText'}} onClick={onCopyClick} size='small'>
             <CopyIcon fontSize='inherit' />
           </IconButton>
         }
@@ -140,6 +141,7 @@ const LocaleList = ({url, lang, locales}) => {
 }
 
 const Locales = ({ concept, locales, title, repo }) => {
+  const { t } = useTranslation()
   const [retired, setRetried] = React.useState(false)
   const hasRetired = Boolean(find(locales, {retired: true}))
   const visibleLocales = retired ? locales : reject(locales, {retired: true})
@@ -186,7 +188,7 @@ const Locales = ({ concept, locales, title, repo }) => {
             } : {
               backgroundColor: null
             }]} onClick={() => setRetried(!retired)}>
-              <b>Show Retired</b>
+              <b>{t('concept.show_retired')}</b>
             </Button> :
           null
         }

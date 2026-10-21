@@ -733,10 +733,10 @@ const RepoHome = () => {
               onClose={() => setDeleteTarget(false)}
               onSubmit={onDeleteRepo}
               loading={deletingRepo}
-              entityType={isVersionObject(getTargetVersion(deleteTarget)) ? getTargetVersion(deleteTarget).type : repo.type.replace(' Version', '')}
+              entityType={isVersionObject(getTargetVersion(deleteTarget)) ? t('repo.repo_version') : t(isCollection ? 'repo.collection' : 'repo.source')}
               entityId={isVersionObject(getTargetVersion(deleteTarget)) ? `${getTargetVersion(deleteTarget).short_code} [${getTargetVersion(deleteTarget).version}]` : (repo.short_code || repo.id)}
-              relationship={isVersionObject(getTargetVersion(deleteTarget)) ? '' :  'versions, '}
-              associationsLabel='concepts and mappings'
+              relationship={isVersionObject(getTargetVersion(deleteTarget)) ? '' : `${t('common.versions').toLowerCase()}, `}
+              associationsLabel={t('repo.concepts_and_mappings')}
               warning={!isVersionObject(getTargetVersion(deleteTarget))}
             />
         }

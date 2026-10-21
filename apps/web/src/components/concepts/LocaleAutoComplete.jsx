@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   Alert, TextField, Box, Divider, Autocomplete, Dialog, DialogContent, DialogActions, DialogTitle, Button, Chip, Tooltip, Skeleton
 } from '@mui/material';
@@ -9,30 +10,10 @@ import { get, isEmpty, uniqBy, compact, map, find, filter } from 'lodash'
 import GroupHeader from '../common/GroupHeader';
 import GroupItems from '../common/GroupItems';
 
-const SITE_TITLE = 'OCL'
-
-const CUSTOM_MODEL_CONFIG = {
-  multiple: {
-    title: 'Add custom language code(s)',
-    warning: 'OCL is optimized for 2-letter and 4-letter language codes (e.g. “en” or “en-GB”). Only use custom codes if absolutely necessary.',
-    label: 'Custom language code(s)',
-    helperText: 'Custom language codes may only have letters and hyphens, e.g. "eng". Use a comma or space to separate multiple custom codes',
-    validation: 'Letters and “-” are allowed for language codes. Comma or space can be used to separate custom codes if applicable. No other characters e.g. numbers are accepted.',
-    tooltip: 'Language codes in OCL use the syntax “en” or “en-GB” in accordance with ISO 639-1, with an optional 2-letter country code following BCP47. OCL allows language codes in other formats, however these codes may limit certain features or be incompatible with client systems, like OpenMRS. Letters and “-” are allowed for language codes.'
-  },
-  single: {
-    title: 'Add custom language code',
-    warning: 'OCL is optimized for 2-letter and 4-letter language codes (e.g. “en” or “en-GB”). Only use custom codes if absolutely necessary.',
-    helperText: 'Custom language code may only have letters and hyphens, e.g. "eng".',
-    label: 'Custom language code',
-    validation: 'Letters and “-” are allowed for language code. No other characters e.g. numbers are accepted.',
-    tooltip: 'Language codes in OCL use the syntax “en” or “en-GB” in accordance with ISO 639-1, with an optional 2-letter country code following BCP47. OCL allows language codes in other formats, however these codes may limit certain features or be incompatible with client systems, like OpenMRS. Letters and “-” are allowed for language codes.'
-  }
-}
-
 const CustomLocaleDialog = ({ open, onClose, onSave, isMultiple }) => {
+  const { t } = useTranslation()
   const [input, setInput] = React.useState('')
-  const config = isMultiple ? CUSTOM_MODEL_CONFIG.multiple : CUSTOM_MODEL_CONFIG.single
+  const labelSuffix = isMultiple ? 'multiple' : 'single'
   const [error, setError] = React.useState(false)
   const onChange = event => {
     const isValid = event.target.checkValidity()
@@ -48,17 +29,17 @@ const CustomLocaleDialog = ({ open, onClose, onSave, isMultiple }) => {
   const pattern = isMultiple ? "[a-zA-Z-, ]+" : "[a-zA-Z-]+"
   return (
     <Dialog open={open}>
-      <DialogTitle>{config.title}</DialogTitle>
+      <DialogTitle>{t(`concept.custom_locale.title_${labelSuffix}`)}</DialogTitle>
       <DialogContent>
         <Alert severity="warning">
-          {config.warning}
+          {t('concept.custom_locale.warning')}
         </Alert>
         <div className='col-xs-12 no-side-padding flex-vertical-center' style={{marginTop: '20px'}}>
           <TextField
             size='small'
             autoFocus
             margin="dense"
-            label={config.label}
+            label={t(`concept.custom_locale.label_${labelSuffix}`)}
             fullWidth
             variant="outlined"
             slotProps={{
@@ -67,20 +48,21 @@ const CustomLocaleDialog = ({ open, onClose, onSave, isMultiple }) => {
             }}
             value={input}
             onChange={onChange}
-            helperText={config.helperText}
+            helperText={t(`concept.custom_locale.help_${labelSuffix}`)}
             error={error}
           />
         </div>
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose} variant='text'>Cancel</Button>
-        <Button onClick={() => onSave(input)} variant='contained' disabled={error}>Save</Button>
+        <Button onClick={onClose} variant='text'>{t('common.cancel')}</Button>
+        <Button onClick={() => onSave(input)} variant='contained' disabled={error}>{t('common.save')}</Button>
       </DialogActions>
     </Dialog>
   )
 }
 
 const LocaleAutoComplete = ({ cachedLocales, id, multiple, required, onChange, label, error, helperText, size, fullWidth, placeholder, custom, limit, disabled, value, optionsLimit, ...rest }) => {
+  const { t } = useTranslation()
   const [locales, setLocales] = React.useState(cachedLocales || [])
   const _fullWidth = !(fullWidth === false)
   const [input, setInput] = React.useState('')
@@ -164,7 +146,7 @@ const LocaleAutoComplete = ({ cachedLocales, id, multiple, required, onChange, l
       result = result.slice(0, _limit)
 
       if(custom)
-        result.push({id: 'custom', name: 'Add custom code'})
+        result.push({id: 'custom', name: t('concept.custom_locale.add_code')})
     }
     return result
   };
@@ -235,7 +217,7 @@ const LocaleAutoComplete = ({ cachedLocales, id, multiple, required, onChange, l
                         <span className='flex-vertical-center' style={{cursor: 'pointer'}}>
                           <AddIcon fontSize='small' style={{marginRight: '5px'}}/>
                           <span>
-                            Add custom code
+                            {t('concept.custom_locale.add_code')}
                           </span>
                         </span> :
                       <span style={{width: '100%', display: 'flex'}}>
@@ -283,7 +265,7 @@ const LocaleAutoComplete = ({ cachedLocales, id, multiple, required, onChange, l
                 const isValid = isValidOption(option)
                 const { key, ...tagProps } = getItemProps({ index })
                 return (
-                  <Tooltip key={key || index} title={isValid ? 'ISO-639-1 language code' : `${SITE_TITLE}'s data model supports ISO-639-1 (two digit) codes as standard. Consider updating.`}>
+                  <Tooltip key={key || index} title={t(isValid ? 'concept.custom_locale.standard_tooltip' : 'concept.custom_locale.nonstandard_tooltip')}>
                     <Chip
                       size='small'
                       icon={option?.locale ? <span>{option.locale}</span> : undefined}

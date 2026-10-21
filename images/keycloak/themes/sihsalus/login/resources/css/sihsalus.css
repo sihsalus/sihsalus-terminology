@@ -1,0 +1,103 @@
+/* Extends Keycloak 26.8.1 keycloak.v2; native forms and PatternFly remain upstream. */
+:root {
+  --sihsalus-primary: #4836ff;
+  --sihsalus-primary-dark: #3521bd;
+  --keycloak-card-top-color: var(--sihsalus-primary);
+  --pf-v5-global--primary-color--100: var(--sihsalus-primary);
+  --pf-v5-global--primary-color--200: var(--sihsalus-primary-dark);
+  --pf-v5-global--link--Color: var(--sihsalus-primary-dark);
+  --pf-v5-global--link--Color--hover: #24138d;
+}
+
+.login-pf #keycloak-bg {
+  min-height: 100vh;
+  color: #28233d;
+  background:
+    radial-gradient(ellipse at 5% 8%, rgba(143, 121, 255, 0.27), transparent 46%),
+    radial-gradient(ellipse at 96% 90%, rgba(72, 54, 255, 0.16), transparent 44%),
+    linear-gradient(135deg, #f1edff 0%, #fbfaff 48%, #ece8ff 100%);
+}
+
+#keycloak-bg .pf-v5-c-login {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  min-height: 100svh;
+  padding: clamp(1.5rem, 5vw, 3rem) 1rem;
+}
+
+#keycloak-bg .pf-v5-c-login__container {
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+  max-width: 34rem;
+  gap: 1.5rem;
+  margin-inline: auto;
+  padding: 0;
+}
+
+#kc-header {
+  margin: 0;
+  padding: 0;
+}
+
+#kc-header-wrapper {
+  color: var(--sihsalus-primary-dark) !important;
+  font-size: clamp(1.25rem, 4.5vw, 1.6rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  text-transform: none;
+}
+
+#keycloak-bg .pf-v5-c-login__main {
+  overflow: hidden;
+  border: 1px solid #e2dcf8;
+  border-radius: 1rem;
+  background-color: #fff;
+  box-shadow: 0 16px 48px rgba(48, 28, 112, 0.1);
+}
+
+#kc-page-title {
+  color: #28233d;
+  font-size: 1.65rem;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+#keycloak-bg .pf-v5-c-login__main-footer-band {
+  background-color: #f8f6ff;
+}
+
+#keycloak-bg .pf-v5-c-button.pf-m-primary {
+  --pf-v5-c-button--m-primary--BackgroundColor: var(--sihsalus-primary);
+  --pf-v5-c-button--m-primary--hover--BackgroundColor: var(--sihsalus-primary-dark);
+  --pf-v5-c-button--m-primary--focus--BackgroundColor: var(--sihsalus-primary-dark);
+  --pf-v5-c-button--m-primary--active--BackgroundColor: var(--sihsalus-primary-dark);
+  --pf-v5-c-button--BorderRadius: 0.5rem;
+  min-height: 2.75rem;
+  font-weight: 600;
+}
+
+#keycloak-bg .pf-v5-c-form-control > input,
+#keycloak-bg .pf-v5-c-button.pf-m-control {
+  min-height: 2.75rem;
+  font-size: 1rem;
+}
+
+#keycloak-bg :is(a, button, select):focus-visible {
+  outline: 2px solid var(--sihsalus-primary-dark);
+  outline-offset: 2px;
+}
+
+#keycloak-bg .instruction,
+#keycloak-bg .kc-feedback-text {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 575px) {
+  #keycloak-bg .pf-v5-c-login__main-header,
+  #keycloak-bg .pf-v5-c-login__main-body {
+    padding-inline: 1.25rem;
+  }
+}

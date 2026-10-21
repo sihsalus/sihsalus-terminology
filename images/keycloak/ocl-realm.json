@@ -1,6 +1,8 @@
 {
   "realm": "ocl",
   "displayName": "SIHSALUS Terminología",
+  "loginTheme": "sihsalus",
+  "emailTheme": "sihsalus",
   "enabled": true,
   "sslRequired": "external",
   "registrationAllowed": "${TERMINOLOGY_ALLOW_SELF_REGISTRATION}",

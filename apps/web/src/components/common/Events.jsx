@@ -9,23 +9,24 @@ import TimelineSeparator from '@mui/lab/TimelineSeparator';
 import TimelineConnector from '@mui/lab/TimelineConnector';
 import TimelineContent from '@mui/lab/TimelineContent';
 import TimelineDot from '@mui/lab/TimelineDot';
+import Box from '@mui/material/Box';
+import IconButton from '@mui/material/IconButton';
 import Typography from '@mui/material/Typography';
 import Tooltip from '@mui/material/Tooltip';
 import MoreIcon from '@mui/icons-material/ExpandCircleDownOutlined';
 import { getCurrentUser, getSiteTitle } from '../../common/utils'
+import { getEventDescription } from '../../common/eventDescription.mjs'
 import EntityIcon from '../common/EntityIcon';
 import Link from '../common/Link'
 import UserIcon from '../users/UserIcon'
 
 const EventDescription = ({ event, isFirst, isLast, isJoined }) => {
-  const { event_type, description, referenced_object} = event;
+  const { t } = useTranslation()
+  const { event_type, referenced_object} = event;
   const getDescription = () => {
-    let eventDescription = description
-    if(isJoined)
-      eventDescription += ' ' + getSiteTitle()
+    const eventDescription = getEventDescription(event, t, getSiteTitle())
     let rel;
     if(event_type && !isEmpty(referenced_object)) {
-      eventDescription = `${event_type} ${referenced_object.type} `
       if(['Source Version', 'Collection Version'].includes(referenced_object.type)) {
         rel = `${referenced_object.short_code}/${referenced_object.id}`
       } else
@@ -39,16 +40,17 @@ const EventDescription = ({ event, isFirst, isLast, isJoined }) => {
       <Typography sx={[{
         fontSize: '14px',
         alignItems: 'center',
-        display: 'block'
+        display: 'block',
+        overflowWrap: 'anywhere'
       }, isFirst ? {
         marginTop: 0
       } : {
         marginTop: (isLast ? (isJoined ? 0 : '10px') : '6px')
       }]}>
-        {eventDescription}
+        {eventDescription}{rel ? ' ' : ''}
         {
           rel ?
-            <Link href={'#' + (event.referenced_object?.version_url || event.referenced_object?.url)} label={rel} sx={{fontSize: '14px', paddingLeft: 0, minWidth: 'auto', paddingTop: '1px'}} /> :
+            <Link href={'#' + (event.referenced_object?.version_url || event.referenced_object?.url)} label={rel} sx={{fontSize: '14px', paddingLeft: 0, minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', textAlign: 'left', paddingTop: '1px'}} /> :
           null
         }
       </Typography>
@@ -83,6 +85,7 @@ const Event = ({ event, isFirst, isLast }) => {
       </TimelineSeparator>
       <TimelineContent sx={[{
         padding: '8px 16px 0px 16px',
+        minWidth: 0,
         color: 'rgba(0, 0, 0, 0.87)'
       }, isJoined ? {
         paddingTop: '0'
@@ -100,12 +103,14 @@ const Events = ({ user, events, onLoadMore, showAvatar, maxHeight, dashboard }) 
   const isSelf = Boolean(currentUser?.username && currentUser?.username === user.username)
   return (
     <div className='col-xs-12 padding-0'>
-      <Typography component='h3' sx={{margin: '16px 0 0 0', fontWeight: 'bold', display: 'flex', alignItems: 'center'}}>
+      <Typography component='h3' sx={{margin: '16px 0 0 0', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: 2}}>
         {
           showAvatar &&
-            <UserIcon noTooltip user={user} sx={{width: '40px', height: '40px', marginRight: '16px'}} color='primary' />
+            <UserIcon noTooltip user={user} sx={{width: '40px', height: '40px', flexShrink: 0}} color='primary' />
         }
-        {`${isSelf ? t('user.your') : (user.name + "'s")} ${t('user.recent_activity')}`}
+        <Box component='span' sx={{minWidth: 0, overflowWrap: 'anywhere'}}>
+          {isSelf ? t('user.your_recent_activity') : t('user.recent_activity_for', {name: user.name || user.username})}
+        </Box>
       </Typography>
       <Timeline
         id="events-timeline"
@@ -120,7 +125,7 @@ const Events = ({ user, events, onLoadMore, showAvatar, maxHeight, dashboard }) 
           },
           p: 0,
           marginTop: 0,
-          maxHeight: maxHeight || '420px',
+          maxHeight: dashboard ? {xs: 'none', lg: maxHeight || '420px'} : maxHeight || '420px',
           overflow: 'auto'
         }}
       >
@@ -133,10 +138,10 @@ const Events = ({ user, events, onLoadMore, showAvatar, maxHeight, dashboard }) 
           onLoadMore &&
             <TimelineItem sx={dashboard ? {height: '34px', minHeight: '34px'} : {}}>
               <TimelineSeparator>
-                <Tooltip title='Show more'>
-                  <TimelineDot sx={{backgroundColor: 'transparent', boxShadow: 'none', cursor: 'pointer', marginTop: 0}} onClick={onLoadMore}>
+                <Tooltip title={t('common.load_more')}>
+                  <IconButton size='small' aria-label={t('common.load_more')} onClick={onLoadMore}>
                     <MoreIcon sx={{color: 'primary.60'}} />
-                  </TimelineDot>
+                  </IconButton>
                 </Tooltip>
               </TimelineSeparator>
               <TimelineContent sx={{m: 0, height: 0}} />

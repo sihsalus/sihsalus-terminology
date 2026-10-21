@@ -137,9 +137,10 @@ const OrgHome = () => {
             open={deleteOrg}
             onClose={() => setDeleteOrg(false)}
             onSubmit={onDelete}
-            entityType={org.type}
+            entityType={t('org.org')}
             entityId={org.id}
-            relationship={t('repo.repos').toLowerCase()}
+            relationship=""
+            associationsLabel={t('repo.repos').toLowerCase()}
             warning
           />
 

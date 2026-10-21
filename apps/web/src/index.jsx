@@ -1,4 +1,7 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { esES as materialEs, zhCN as materialZh } from '@mui/material/locale';
+import { esES as pickerEs, zhCN as pickerZh } from '@mui/x-date-pickers/locales';
 import { createRoot } from 'react-dom/client';
 import Fade from '@mui/material/Fade';
 import { LocalizationProvider } from '@mui/x-date-pickers';
@@ -121,16 +124,30 @@ const v5Theme = createTheme(theme, {
 })
 
 
+const materialLocales = { es: materialEs, zh: materialZh };
+const pickerLocales = { es: pickerEs, zh: pickerZh };
+const dateLocales = { es: 'es', zh: 'zh-cn', en: 'en' };
+
+const LocalizedApplication = () => {
+  const { i18n } = useTranslation();
+  const language = (i18n.resolvedLanguage || i18n.language || 'es').split('-')[0];
+  const localizedTheme = React.useMemo(
+    () => createTheme(v5Theme, materialLocales[language] || {}, pickerLocales[language] || {}),
+    [language],
+  );
+  return (
+    <HashRouter>
+      <StyledEngineProvider injectFirst>
+        <ThemeProvider theme={localizedTheme}>
+          <LocalizationProvider dateAdapter={AdapterMoment} adapterLocale={dateLocales[language] || 'en'}>
+            <LayoutContext subPages={(<App />)} />
+          </LocalizationProvider>
+        </ThemeProvider>
+      </StyledEngineProvider>
+    </HashRouter>
+  );
+};
+
 const container = document.getElementById('root');
 const root = createRoot(container);
-root.render(
-  <HashRouter>
-    <StyledEngineProvider injectFirst>
-      <ThemeProvider theme={v5Theme}>
-        <LocalizationProvider dateAdapter={AdapterMoment}>
-          <LayoutContext subPages ={(<App />)} />
-        </LocalizationProvider>
-      </ThemeProvider>
-    </StyledEngineProvider>
-  </HashRouter>
-);
+root.render(<LocalizedApplication />);

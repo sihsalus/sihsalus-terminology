@@ -173,12 +173,18 @@
     "update_comment": "Update comment",
     "undo": "Undo",
     "advanced": "Advanced",
-    "type_to_search": "Type to search"
+    "type_to_search": "Type to search",
+    "open_navigation": "Open navigation",
+    "account_menu": "Account menu",
+    "waitlist": "Waitlist",
+    "try_again": "Try again",
+    "web_version": "Web version",
+    "api_version": "API version"
   },
   "errors": {
-    "404": "Sorry your page could not be found.",
     "401": "Login is required",
     "403": "Access to this page is not authorized",
+    "404": "Sorry your page could not be found.",
     "mandatory_field": "This field cannot be blank",
     "already_queued": "Already queued",
     "invalid_json": "Please enter valid JSON",
@@ -186,7 +192,10 @@
     "network_error": "Network Error",
     "concept_404": "Sorry, this concept could not be found.",
     "mapping_404": "Sorry, this mapping could not be found.",
-    "reference_404": "Sorry, this reference could not be found."
+    "reference_404": "Sorry, this reference could not be found.",
+    "sign_in_or_register": "<login>Sign in</login> or <register>create an account</register> to continue.",
+    "sign_in_to_continue": "<login>Sign in</login> to continue.",
+    "refresh_or_dashboard": "<refresh>Refresh the page</refresh> or return to your <dashboard>dashboard</dashboard>."
   },
   "success": {
     "queued": "Successfully Queued"
@@ -201,7 +210,39 @@
     "anonymous_heading": "What's new?",
     "community_blog": "Community Blog",
     "events_scope_sign_in": "You need to be signed in to see content from publishers you follow",
-    "no_events": "There are no updates to show yet."
+    "no_events": "There are no updates to show yet.",
+    "activity_filters": "Filter activity",
+    "usage_title": "API usage",
+    "api_requests": "API requests",
+    "top_operation": "Most frequent operation",
+    "view_usage": "View usage",
+    "no_usage": "No usage data yet.",
+    "event_actions": {
+      "created": "created",
+      "updated": "updated",
+      "deleted": "deleted",
+      "joined": "joined",
+      "retired": "retired",
+      "unretired": "reactivated",
+      "released": "released",
+      "unreleased": "unreleased",
+      "followed": "followed",
+      "unfollowed": "unfollowed",
+      "subscribed": "subscribed to"
+    },
+    "event_objects": {
+      "organization": "an organization",
+      "source": "a source",
+      "collection": "a collection",
+      "concept": "a concept",
+      "mapping": "a mapping",
+      "source_version": "a source version",
+      "collection_version": "a collection version",
+      "user": "a user"
+    },
+    "welcome_title": "Welcome to SIHSALUS Terminology",
+    "welcome_description": "Browse and manage concept catalogs with your team.",
+    "welcome_registration": "Create an account with your PUCP email and verify it to sign in. Access to team catalogs depends on their permissions."
   },
   "bookmarks": {
     "name": "Bookmarks",
@@ -234,7 +275,9 @@
     "email_verified_sign_in": "Your email is verified. Sign in to continue.",
     "sign_in_to_continue": "Sign in to continue.",
     "update_password": "Update password",
-    "session_expired": "Your session has expired. Please log in to continue."
+    "session_expired": "Your session has expired. Please log in to continue.",
+    "redirecting": "Redirecting…",
+    "redirect_failed": "Unable to open sign-in. Please try again."
   },
   "custom_attributes": {
     "label": "Custom attributes",
@@ -311,7 +354,21 @@
     "success_update": "Successfully updated concept",
     "error_create": "Couldn't create concept",
     "error_update": "Couldn't update concept",
-    "view_in_source": "View concept in its source"
+    "view_in_source": "View concept in its source",
+    "retire_reason": "Reason for retirement",
+    "show_retired": "Show retired",
+    "custom_locale": {
+      "title_single": "Add a custom language code",
+      "title_multiple": "Add custom language codes",
+      "label_single": "Custom language code",
+      "label_multiple": "Custom language codes",
+      "help_single": "Use only letters and hyphens, for example, “eng”.",
+      "help_multiple": "Use only letters and hyphens, for example, “eng”. Separate codes with commas or spaces.",
+      "warning": "Codes such as “en” or “en-GB” are recommended. Use custom codes only when necessary, as they may limit features or be incompatible with other systems.",
+      "add_code": "Add custom code",
+      "standard_tooltip": "ISO 639-1 language code",
+      "nonstandard_tooltip": "The standard format uses two-letter ISO 639-1 language codes. Consider updating this code."
+    }
   },
   "mapping": {
     "mapping": "Mapping",
@@ -904,7 +961,9 @@
     "about_me": "About me",
     "about_me_description": "Create an introduction for visiting your profile (200 characters).",
     "user_has_not_created_public_repos_suffix": "has not created any public repositories",
-    "recent_activity": "recent activity"
+    "recent_activity": "recent activity",
+    "your_recent_activity": "Your recent activity",
+    "recent_activity_for": "Recent activity for {{name}}"
   },
   "search": {
     "filters": "Filters",
@@ -957,7 +1016,20 @@
     "select_all_references": "Select all references",
     "select_all_repos": "Select all repositories",
     "select_all_orgs": "Select all organizations",
-    "select_all_users": "Select all users"
+    "select_all_users": "Select all users",
+    "selected_count_one": "{{count}} selected",
+    "selected_count_other": "{{count}} selected",
+    "matched_candidates": "Matched candidates",
+    "pagination_range": "{{from}}–{{to}} of {{total}}",
+    "pagination_many": "{{from}}–{{to}} of many",
+    "pagination_more_than": "{{from}}–{{to}} of more than {{total}}",
+    "query_in_resource": "Search for <query>{{query}}</query> in <resource>{{resource}}</resource>",
+    "query_in_owner": "Search for <query>{{query}}</query> in <owner>{{owner}}</owner>'s catalogs",
+    "query_global": "Search for <query>{{query}}</query> across all catalogs",
+    "query_url_registry": "Search for <query>{{query}}</query> in this URL registry",
+    "query_filtered": "Search for <query>{{query}}</query> in <resource>{{resource}}</resource>, with <field>{{field}}</field>: <value>{{value}}</value>",
+    "filter_resource": "Filter <resource>{{resource}}</resource> by <field>{{field}}</field>: <query>{{query}}</query>",
+    "match_in_resource": "Match <query>{{query}}</query> to concepts in <resource>{{resource}}</resource>"
   },
   "url_registry": {
     "url_registry": "Canonical URL registry",
@@ -1013,6 +1085,8 @@
     "new_import_footer": "OCL processes bulk import asynchronously. A bulk import may include creates, updates, or deletes for multiple owners and repositories. <0> Read More...</0>",
     "provide_npm_name_and_version": "Provide NPM package name and version to be fetched from <0>FHIR package registry</0>:",
     "existing_imports": "Existing Imports",
+    "count_one": "{{count}} import",
+    "count_other": "{{count}} imports",
     "result_expiry_message": "Results will expire after <0>72 hours</0> from the task's start time",
     "filter_tooltip": "Filter by queue or status",
     "refresh_list_tooltip": "Refresh List",

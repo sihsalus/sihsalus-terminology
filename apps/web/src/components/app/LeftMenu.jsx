@@ -135,7 +135,7 @@ const LeftMenu = ({ isOpen, onClose }) => {
             <ListItemText primary={t('user.my_mapping_projects')} />
             {
               isInWaitlist() &&
-                <Chip size='small' variant='contained' label='Waitlist' color='primary' />
+                <Chip size='small' variant='contained' label={t('common.waitlist')} color='primary' />
             }
           </ListItemButton>
         </ListItem>
@@ -146,7 +146,7 @@ const LeftMenu = ({ isOpen, onClose }) => {
           disablePadding
           sx={{ display: 'block', padding: 1, borderRadius: '100px' }}
           secondaryAction={
-            <Button edge="end" aria-label="delete" variant='text' color='primary' sx={{textTransform: 'none'}}>
+            <Button edge="end" aria-label={t('common.create')} variant='text' color='primary' sx={{textTransform: 'none'}}>
               <b>{t('common.create')}</b>
             </Button>
           }

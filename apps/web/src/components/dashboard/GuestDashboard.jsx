@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import Typography from '@mui/material/Typography'
+import Box from '@mui/material/Box'
 import APIService from '../../services/APIService'
 import DashboardEvents from './DashboardEvents';
 import EventsButtonGroup from './EventsButtonGroup';
@@ -51,32 +52,32 @@ const GuestDashboard = () => {
 
 
   return (
-    <div className='col-xs-12 padding-0'>
-      <div className='col-xs-9' style={{maxWidth: 'calc(100% - 360px)', minWidth: '500px'}}>
-        <div className='col-xs-12 padding-0' style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between'}}>
+    <Box sx={{display: 'grid', gridTemplateColumns: {xs: 'minmax(0, 1fr)', lg: 'minmax(0, 1fr) 360px'}, gap: 2, width: '100%', alignItems: 'start'}}>
+      <Box sx={{minWidth: 0}}>
+        <Box sx={{display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 1}}>
           <Typography sx={{fontSize: '22px', color: 'secondary.main'}}>
             {(t('dashboard.anonymous_heading'))}
           </Typography>
           <EventsButtonGroup selected={scope} onClick={onScopeChange} />
-        </div>
+        </Box>
         {
           ['all', 'highlights'].includes(scope) ?
             <DashboardEvents events={getScopeEvents()} sx={{marginTop: '16px'}} highlight isLoading={loading} />:
-          <div className='col-xs-12 padding-0' style={{height: 'calc(86vh - var(--announcement-height, 0px))', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column'}}>
+          <Box sx={{minHeight: 'min(400px, calc(var(--app-height) - var(--app-header-height, 64px) - 96px))', py: 3, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', textAlign: 'center', '& svg': {maxWidth: '100%'}}}>
             <EmptyOverview
               label={t('dashboard.events_scope_sign_in')}
               action={
                 <Button className='no-anchor-styles' label={t('auth.sign_in')} sx={{ backgroundColor: 'primary.main', maxWidth: '100%', minWidth: '92px', color: '#FFF !important', marginTop: '16px' }} href='#' onClick={e => { e.preventDefault(); getLoginURL().then(url => { window.location.href = url }) }} component='a' />
               }
             />
-          </div>
+          </Box>
         }
-      </div>
-      <div className='col-xs-3 padding-0' style={{minWidth: '360px'}}>
+      </Box>
+      <Box sx={{minWidth: 0}}>
         <DashboardBanners />
         <CommunityBlog sx={{marginTop: '8px'}} />
-      </div>
-    </div>
+      </Box>
+    </Box>
   )
 }
 

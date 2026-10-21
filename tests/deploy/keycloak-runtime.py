@@ -42,8 +42,9 @@ class Page(HTMLParser):
     """Read native login forms and preserve their hidden anti-CSRF fields."""
     def __init__(self, text, url, status):
         super().__init__(convert_charrefs=True)
-        self.url, self.status = url, status
+        self.url, self.status, self.text = url, status, text
         self.forms, self.links = {}, []
+        self.stylesheets, self.body_id, self.color_scheme = [], None, None
         self.current = None
         self.feed(text)
 
@@ -58,6 +59,12 @@ class Page(HTMLParser):
                 self.current['fields'][attrs['name']] = attrs.get('value', '')
         elif tag == 'a' and attrs.get('href'):
             self.links.append(urljoin(self.url, attrs['href']))
+        elif tag == 'link' and attrs.get('rel') == 'stylesheet' and attrs.get('href'):
+            self.stylesheets.append(urljoin(self.url, attrs['href']))
+        elif tag == 'body':
+            self.body_id = attrs.get('id')
+        elif tag == 'meta' and attrs.get('name') == 'color-scheme':
+            self.color_scheme = attrs.get('content')
 
     def handle_endtag(self, tag):
         if tag == 'form':
@@ -140,7 +147,7 @@ class Mailbox:
         self.messages.append((tuple(envelope.rcpt_tos), envelope.content))
         return '250 Message accepted by synthetic test sink'
 
-    def link(self, recipient, after):
+    def link(self, recipient, after, expected_subject=None):
         from email import policy
         from email.parser import BytesParser
         deadline = time.monotonic() + 15
@@ -152,10 +159,16 @@ class Mailbox:
                     continue
                 matched_messages += 1
                 message = BytesParser(policy=policy.default).parsebytes(content)
-                for part in message.walk():
-                    if part.get_content_type() not in ('text/plain', 'text/html'):
-                        continue
-                    for candidate in re.findall(r'https?://[^\s<>"]+', html.unescape(part.get_content())):
+                if expected_subject:
+                    require(str(message['Subject']) == expected_subject, 'Spanish theme email subject missing.')
+                parts = {part.get_content_type(): part.get_content() for part in message.walk()
+                         if part.get_content_type() in ('text/plain', 'text/html')}
+                require(set(parts) == {'text/plain', 'text/html'}, 'Expected both native email formats.')
+                for body in parts.values():
+                    require(re.search(r'El enlace caduca en [0-9]+ (?:segundos?|minutos?|horas?|días?)\.', body),
+                            'Spanish email duration is missing or repeats its unit.')
+                for body in parts.values():
+                    for candidate in re.findall(r'https?://[^\s<>"]+', html.unescape(body)):
                         link_paths.add(urlparse(candidate).path)
                         if '/login-actions/action-token?' in candidate:
                             require(candidate.startswith(BASE + '/'), 'Mail action must target isolated CI.')
@@ -178,6 +191,21 @@ def authorization(browser, register=False, action=None):
         **({'kc_action': action} if action else {}),
     })
     return browser.request(url), verifier
+
+
+def verify_theme(browser, page):
+    """Check the actual candidate resources and inherited native page, not an HTML fixture."""
+    require(page.body_id == 'keycloak-bg', 'Expected keycloak.v2 native page structure.')
+    require(page.color_scheme == 'light', 'SIHSALUS theme must keep its readable light variant.')
+    inherited = next((url for url in page.stylesheets if url.endswith('/login/sihsalus/css/styles.css')), None)
+    custom = next((url for url in page.stylesheets if url.endswith('/login/sihsalus/css/sihsalus.css')), None)
+    require(inherited and custom, 'Native page did not load the SIHSALUS theme stylesheets.')
+    require(page.stylesheets.index(inherited) < page.stylesheets.index(custom),
+            'Custom styles must follow the inherited stylesheet.')
+    for url, expected in ((inherited, '.pf-v5-c-login__container'), (custom, '--sihsalus-primary: #4836ff;')):
+        require(url.startswith(BASE + '/resources/'), 'Theme resources must stay on the isolated server.')
+        response = browser.request(url)
+        require(response.status == 200 and expected in response.text, 'Candidate theme resource missing.')
 
 
 def login(username, password, allowed=True):
@@ -242,6 +270,10 @@ def verify(mailbox):
         'username': 'ci-admin', 'password': ADMIN_PASSWORD,
     })
     require(status == 200 and token.get('access_token'), 'CI bootstrap administrator unavailable.')
+    theme_browser = Browser()
+    theme_page, _ = authorization(theme_browser)
+    verify_theme(theme_browser, theme_page)
+    require('Usuario o correo electrónico' in theme_page.text, 'Spanish login theme messages missing.')
 
     def users(username):
         status, result = admin.json(BASE + '/admin/realms/ocl/users?' + urlencode({
@@ -280,6 +312,8 @@ def verify(mailbox):
     username, address = 'registered-researcher', 'registered-researcher@pucp.edu.pe'
     browser = Browser()
     page, _ = authorization(browser, register=True)
+    verify_theme(browser, page)
+    require('Crear tu cuenta' in page.text, 'Spanish registration title missing.')
     require('password' not in page.forms.get('kc-register-form', {}).get('fields', {}),
             'Native registration must verify email before setting a password.')
     result = browser.submit(page, 'kc-register-form', {
@@ -292,7 +326,7 @@ def verify(mailbox):
     require(len(created) == 1 and created[0]['emailVerified'] is False,
             'New account must await email verification.')
     require(not parse_qs(urlparse(result.url).query).get('code'), 'Unverified registration issued a code.')
-    page = browser.request(mailbox.link(address, 0))
+    page = browser.request(mailbox.link(address, 0, expected_subject='Verifica tu correo electrónico'))
     require(users(username)[0]['emailVerified'] is True, 'Verification link did not confirm email.')
     result = browser.submit(page, 'kc-passwd-update-form', {
         'password-new': PASSWORD, 'password-confirm': PASSWORD,
@@ -320,14 +354,17 @@ def verify(mailbox):
     reset_link = next((link for link in page.links if '/login-actions/reset-credentials' in link), None)
     require(reset_link, 'Native forgotten-password link missing.')
     page = browser.request(reset_link)
+    verify_theme(browser, page)
+    require('Recuperar contraseña' in page.text, 'Spanish password recovery title missing.')
     browser.submit(page, 'kc-reset-password-form', {'username': username})
-    page = browser.request(mailbox.link(address, before))
+    page = browser.request(mailbox.link(address, before, expected_subject='Recupera tu contraseña'))
     browser.submit(page, 'kc-passwd-update-form', {
         'password-new': NEW_PASSWORD, 'password-confirm': NEW_PASSWORD,
     })
     login(username, NEW_PASSWORD)
     login(username, PASSWORD, allowed=False)
     print('PASS: native password recovery sends captured mail and replaces the synthetic password.')
+    print('PASS: inherited SIHSALUS CSS and Spanish messages; both email formats use one duration unit.')
 
 
 def docker(*args, check=True):

@@ -67,6 +67,7 @@
         "lang": "en_US",
         "skipWords": [
           "paded",
+          "minmax",
           "csv",
           "uploader",
           "noreferrer",

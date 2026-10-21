@@ -15,72 +15,76 @@ import './Header.scss';
 import HeaderControls from './HeaderControls';
 import LeftMenu from './LeftMenu'
 
-const DrawerHeader = styled('div')(({ theme }) => ({
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'flex-end',
-  padding: theme.spacing(0, 1),
-  // necessary for content to be below app bar
-  ...theme.mixins.toolbar,
-}));
-
-const AppBar = styled(MuiAppBar, {
-  shouldForwardProp: (prop) => prop !== 'open',
-})(({ theme }) => ({
+const AppBar = styled(MuiAppBar)(({ theme }) => ({
   zIndex: theme.zIndex.drawer + 1,
-  transition: theme.transitions.create(['width', 'margin'], {
-    easing: theme.transitions.easing.sharp,
-    duration: theme.transitions.duration.leavingScreen,
-  }),
 }));
 
 const Header = props => {
   const { t } = useTranslation()
   const user = getCurrentUser()
   const [open, setOpen] = React.useState(false);
+  const [headerHeight, setHeaderHeight] = React.useState(null);
+  const headerRef = React.useRef(null);
   const handleDrawerOpen = () => setOpen(!open);
 
+  React.useLayoutEffect(() => {
+    const element = headerRef.current;
+    const measure = () => setHeaderHeight(element.getBoundingClientRect().height);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
   return (
-    <Box sx={{ display: 'flex' }}>
+    <Box sx={{ display: 'flex', '--app-header-height': headerHeight ? `${headerHeight}px` : { xs: '112px', md: '64px' } }}>
       <CssBaseline />
-      <AppBar position="fixed" open={open} sx={theme => ({
-        zIndex: theme.zIndex.drawer + 1,
-        top: 'var(--announcement-height, 0px)'
-      })} style={{backgroundColor: COLORS.surface.n96, color: COLORS.surface.contrastText, boxShadow: 'none'}}>
-        <Toolbar style={{paddingRight: '16px'}}>
-          <div className='col-xs-12 padding-0 flex-vertical-center'>
-            <div className='col-xs-4 padding-0 flex-vertical-center'>
-              {
-                Boolean(user?.url) &&
-                  <IconButton
-                    color="inherit"
-                    aria-label="open drawer"
-                    onClick={handleDrawerOpen}
-                    edge="start"
-                    size='large'
-                    sx={{
-                      mr: 2,
-                    }}
-                  >
-                    <MenuIcon fontSize='inherit' />
-                  </IconButton>
-              }
-              <Typography component='a' href='/#/' variant='subtitle1' sx={{fontWeight: 700, color: 'primary.main', textDecoration: 'none'}}>
-                {getSiteTitle()}
-              </Typography>
-            </div>
-            <div className='col-xs-4 padding-0' style={{textAlign: 'center'}}>
-              <SearchInput size='small' style={{width: '100%'}} placeholder={t('search.input_placeholder')} />
-            </div>
-            <HeaderControls />
-          </div>
+      <AppBar ref={headerRef} position="fixed" sx={{
+        top: 'var(--announcement-height, 0px)',
+        backgroundColor: COLORS.surface.n96,
+        color: COLORS.surface.contrastText,
+        boxShadow: 'none',
+      }}>
+        <Toolbar className='site-header-toolbar' sx={{
+          display: 'grid',
+          gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', md: 'minmax(180px, 1fr) minmax(220px, 1.4fr) auto' },
+          gridTemplateAreas: { xs: '"brand controls" "search search"', md: '"brand search controls"' },
+          columnGap: { xs: 1, md: 2 },
+          rowGap: 1,
+          py: { xs: 1, md: 0 },
+          px: { xs: 1.5, sm: 2 },
+          minHeight: { xs: 112, md: 64 },
+        }}>
+          <Box sx={{ gridArea: 'brand', display: 'flex', alignItems: 'center', minWidth: 0, minHeight: 48 }}>
+            {
+              Boolean(user?.url) &&
+                <IconButton
+                  color="inherit"
+                  aria-label={t('common.open_navigation')}
+                  aria-expanded={open}
+                  onClick={handleDrawerOpen}
+                  edge="start"
+                  sx={{ mr: 0.5, flexShrink: 0, minWidth: 44, minHeight: 44 }}
+                >
+                  <MenuIcon />
+                </IconButton>
+            }
+            <Typography component='a' href='/#/' variant='subtitle1' sx={{
+              fontWeight: 700, color: 'primary.main', textDecoration: 'none',
+              fontSize: { xs: '0.875rem', sm: '1rem' }, lineHeight: 1.3, overflowWrap: 'anywhere',
+            }}>
+              {getSiteTitle()}
+            </Typography>
+          </Box>
+          <Box sx={{ gridArea: 'search', minWidth: 0 }}>
+            <SearchInput size='small' style={{width: '100%'}} placeholder={t('search.input_placeholder')} />
+          </Box>
+          <HeaderControls />
         </Toolbar>
       </AppBar>
-      <Box component="main" sx={{ flexGrow: 1, minWidth: 0, paddingTop: 0, paddingBottom: 1.25, paddingLeft: 2, paddingRight: 2 }}>
-        <DrawerHeader sx={{ marginTop: 'var(--announcement-height, 0px)' }} />
-        {
-          props.children
-        }
+      <Box component="main" sx={{ flexGrow: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100dvh', paddingTop: 0, px: { xs: 1.5, sm: 2 } }}>
+        <Box aria-hidden sx={{ height: 'var(--app-header-height)', flexShrink: 0, marginTop: 'var(--announcement-height, 0px)' }} />
+        {props.children}
       </Box>
       <LeftMenu isOpen={open} onClose={handleDrawerOpen} />
     </Box>

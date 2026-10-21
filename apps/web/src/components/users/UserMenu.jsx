@@ -16,7 +16,7 @@ import CommunityIcon from '@mui/icons-material/GroupsOutlined';
 import SettingsIcon from '@mui/icons-material/SettingsOutlined';
 import find from 'lodash/find';
 import { useLocation } from 'react-router-dom'
-import { getCurrentUser, logoutUser, isLoggedIn, getLoginURL, getRegisterURL, isSelfRegistrationEnabled } from '../../common/utils'
+import { getCurrentUser, logoutUser, isLoggedIn, isSelfRegistrationEnabled } from '../../common/utils'
 import { LANGUAGES } from '../../common/constants';
 import Button from '../common/Button';
 import Link from '../common/Link';
@@ -71,8 +71,8 @@ const UserMenu = ({ isOpen, onClose }) => {
                 </ListItemButton>
               </List> :
             <div className='col-xs-12 padding-0' style={{marginBottom: '24px'}}>
-              <Button className='no-anchor-styles' label={t('auth.sign_in')} sx={{ backgroundColor: 'surface.s90', maxWidth: '100%', minWidth: '92px' }} href='#' onClick={e => { e.preventDefault(); getLoginURL(window.location.href).then(url => { window.location.href = url }) }} component='a' />
-              {isSelfRegistrationEnabled() && <Link sx={{fontSize: '14px', marginLeft: '16px'}} label={t('auth.register')} href='#' onClick={e => { e.preventDefault(); getRegisterURL().then(url => { window.location.href = url }) }} />}
+              <Button className='no-anchor-styles' label={t('auth.sign_in')} sx={{ backgroundColor: 'surface.s90', maxWidth: '100%', minWidth: '92px' }} href={`#/signin?returnTo=${encodeURIComponent(window.location.href)}`} onClick={onClose} component='a' />
+              {isSelfRegistrationEnabled() && <Link sx={{fontSize: '14px', marginLeft: '16px'}} label={t('auth.register')} href='#/signup' onClick={onClose} />}
             </div>
           }
         </div>
@@ -83,14 +83,14 @@ const UserMenu = ({ isOpen, onClose }) => {
               <ListItemIcon sx={{minWidth: 'auto', paddingRight: '14px'}}>
                 <LanguageIcon />
               </ListItemIcon>
-              <ListItemText primary={selectedLanguage.name} secondary={t('common.language')} />
+              <ListItemText primary={selectedLanguage?.name || i18n.language} secondary={t('common.language')} />
               {languageOpen ? <ExpandLess /> : <ExpandMore />}
             </ListItemButton>
             <Collapse in={languageOpen} timeout="auto" unmountOnExit>
               <List component="div" disablePadding>
                 {
                   LANGUAGES.map(lang => (
-                    <ListItemButton  sx={{ pl: 5.75, borderRadius: '100px' }} selected={lang.locale === selectedLanguage.locale} key={lang.locale} onClick={() => onLanguageSelect(lang.locale)}>
+                    <ListItemButton  sx={{ pl: 5.75, borderRadius: '100px' }} selected={lang.locale === selectedLanguage?.locale} key={lang.locale} onClick={() => onLanguageSelect(lang.locale)}>
                       <ListItemText primary={lang.locale.toUpperCase()} secondary={lang.name} />
                     </ListItemButton>
                   ))
