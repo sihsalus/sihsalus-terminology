@@ -326,7 +326,7 @@ def verify(mailbox):
     require(len(created) == 1 and created[0]['emailVerified'] is False,
             'New account must await email verification.')
     require(not parse_qs(urlparse(result.url).query).get('code'), 'Unverified registration issued a code.')
-    page = browser.request(mailbox.link(address, 0, expected_subject='Verifica tu correo electrónico'))
+    page = browser.request(mailbox.link(address, 0, expected_subject='SIHSALUS: confirma tu correo'))
     require(users(username)[0]['emailVerified'] is True, 'Verification link did not confirm email.')
     result = browser.submit(page, 'kc-passwd-update-form', {
         'password-new': PASSWORD, 'password-confirm': PASSWORD,
@@ -357,13 +357,77 @@ def verify(mailbox):
     verify_theme(browser, page)
     require('Recuperar contraseña' in page.text, 'Spanish password recovery title missing.')
     browser.submit(page, 'kc-reset-password-form', {'username': username})
-    page = browser.request(mailbox.link(address, before, expected_subject='Recupera tu contraseña'))
+    page = browser.request(mailbox.link(address, before, expected_subject='SIHSALUS: recupera el acceso a tu cuenta'))
     browser.submit(page, 'kc-passwd-update-form', {
         'password-new': NEW_PASSWORD, 'password-confirm': NEW_PASSWORD,
     })
     login(username, NEW_PASSWORD)
     login(username, PASSWORD, allowed=False)
     print('PASS: native password recovery sends captured mail and replaces the synthetic password.')
+
+    # Reproduce an abandoned signup: its verification link expires before a password exists.
+    pending_username, pending_address = 'pending-researcher', 'pending-researcher@pucp.edu.pe'
+    pending_browser = Browser()
+    page, _ = authorization(pending_browser, register=True)
+    pending_browser.submit(page, 'kc-register-form', {
+        'username': pending_username, 'email': pending_address,
+        'firstName': 'Synthetic', 'lastName': 'Pending',
+    })
+    pending = users(pending_username)
+    require(len(pending) == 1 and pending[0]['emailVerified'] is False,
+            'Pending signup must retain one unverified identity.')
+    pending_id = pending[0]['id']
+    before = len(mailbox.messages)
+    resend_url = BASE + '/admin/realms/ocl/users/' + pending_id + '/send-verify-email?' + urlencode({
+        'lifespan': 1, 'client_id': 'ocl-web', 'redirect_uri': CALLBACK,
+    })
+    request = Request(resend_url, method='PUT', headers={
+        'Authorization': 'Bearer ' + token['access_token'],
+    })
+    with admin.opener.open(request, timeout=20) as response:
+        require(response.status == 204, 'Synthetic verification resend failed.')
+    expired_link = mailbox.link(pending_address, before, expected_subject='SIHSALUS: confirma tu correo')
+    time.sleep(2)
+    expired = Browser().request(expired_link)
+    require('El enlace ha caducado' in expired.text, 'Expected native expired-link response.')
+    require(not users(pending_username)[0]['emailVerified'],
+            'Expired verification must not confirm the email.')
+    require('kc-passwd-update-form' not in expired.forms
+            and not parse_qs(urlparse(expired.url).query).get('code'),
+            'Expired verification must not grant access or password setup.')
+
+    before = len(mailbox.messages)
+    recovery = Browser()
+    page, _ = authorization(recovery)
+    recovery_link = next((link for link in page.links if '/login-actions/reset-credentials' in link), None)
+    require(recovery_link, 'Pending signup needs the native recovery link.')
+    page = recovery.request(recovery_link)
+    recovery.submit(page, 'kc-reset-password-form', {'username': pending_address})
+    reset_url = mailbox.link(
+        pending_address, before, expected_subject='SIHSALUS: recupera el acceso a tu cuenta')
+    before_verification = len(mailbox.messages)
+    page = recovery.request(reset_url)
+    print('Pending recovery challenge:', {
+        'status': page.status, 'path': urlparse(page.url).path, 'forms': sorted(page.forms),
+        'emailVerified': users(pending_username)[0]['emailVerified'],
+        'requiredActions': users(pending_username)[0].get('requiredActions'),
+        'newMessages': len(mailbox.messages) - before_verification,
+    })
+    require(not users(pending_username)[0]['emailVerified'],
+            'Recovery must retain email verification for the unfinished signup.')
+    page = recovery.request(mailbox.link(
+        pending_address, before_verification, expected_subject='SIHSALUS: confirma tu correo'))
+    require(users(pending_username)[0]['emailVerified'],
+            'Fresh confirmation must verify the pending signup.')
+    recovery.submit(page, 'kc-passwd-update-form', {
+        'password-new': PASSWORD, 'password-confirm': PASSWORD,
+    })
+    final_pending = users(pending_username)
+    require(len(final_pending) == 1 and final_pending[0]['id'] == pending_id,
+            'Recovery must preserve the pending identity without duplicating it.')
+    login(pending_username, PASSWORD)
+    print('PASS: expired signup link is rejected; native recovery completes the same pending account.')
+
     print('PASS: inherited SIHSALUS CSS and Spanish messages; both email formats use one duration unit.')
 
 

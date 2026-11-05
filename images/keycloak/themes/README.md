@@ -71,3 +71,22 @@ Los recursos upstream se heredan de la imagen oficial, sin copiar ni modificar
 sus plantillas. Consultar la [guía oficial de temas](https://www.keycloak.org/ui-customization/themes)
 y la [plantilla 26.8.1](https://github.com/keycloak/keycloak/blob/26.8.1/themes/src/main/resources/theme/keycloak.v2/login/template.ftl)
 al actualizar la versión.
+
+## Registro incompleto y enlaces vencidos
+
+Los asuntos incluyen SIHSALUS para poder reconocer y buscar el mensaje.
+La verificación explica el orden correo → contraseña y que editar catálogos
+requiere una membresía otorgada por el equipo. Los errores de correo existente
+y enlace vencido orientan al inicio de sesión y a la recuperación nativa usando
+el mismo correo; el mensaje genérico de recuperación conserva la respuesta
+indistinguible para cuentas existentes e inexistentes.
+
+La prueba nativa de CI registra una identidad sintética sin contraseña,
+genera un enlace de verificación de un segundo y comprueba que caducado no
+verifica ni inicia sesión. Después usa «¿Olvidaste tu contraseña?», sigue la nueva confirmación de correo
+y completa esa misma identidad antes de comprobar el login, sin crear duplicados ni conceder grupos.
+
+Estas mejoras de texto no cambian la vigencia configurada, las políticas de
+registro, los permisos ni las plantillas nativas. No garantizan que el filtro
+del destinatario deje de clasificar mensajes como spam. La aplicación requiere
+construir y revisar una imagen nueva; esta rama no modifica el servicio instalado.
