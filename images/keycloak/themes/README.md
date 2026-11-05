@@ -83,8 +83,8 @@ indistinguible para cuentas existentes e inexistentes.
 
 La prueba nativa de CI registra una identidad sintética sin contraseña,
 genera un enlace de verificación de un segundo y comprueba que caducado no
-verifica ni inicia sesión. Después usa «¿Olvidaste tu contraseña?» para completar
-esa misma identidad y comprueba el login, sin crear duplicados ni conceder grupos.
+verifica ni inicia sesión. Después usa «¿Olvidaste tu contraseña?», sigue la nueva confirmación de correo
+y completa esa misma identidad antes de comprobar el login, sin crear duplicados ni conceder grupos.
 
 Estas mejoras de texto no cambian la vigencia configurada, las políticas de
 registro, los permisos ni las plantillas nativas. No garantizan que el filtro

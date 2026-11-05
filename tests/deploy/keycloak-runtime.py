@@ -403,8 +403,22 @@ def verify(mailbox):
     require(recovery_link, 'Pending signup needs the native recovery link.')
     page = recovery.request(recovery_link)
     recovery.submit(page, 'kc-reset-password-form', {'username': pending_address})
+    reset_url = mailbox.link(
+        pending_address, before, expected_subject='SIHSALUS: recupera el acceso a tu cuenta')
+    before_verification = len(mailbox.messages)
+    page = recovery.request(reset_url)
+    print('Pending recovery challenge:', {
+        'status': page.status, 'path': urlparse(page.url).path, 'forms': sorted(page.forms),
+        'emailVerified': users(pending_username)[0]['emailVerified'],
+        'requiredActions': users(pending_username)[0].get('requiredActions'),
+        'newMessages': len(mailbox.messages) - before_verification,
+    })
+    require(not users(pending_username)[0]['emailVerified'],
+            'Recovery must retain email verification for the unfinished signup.')
     page = recovery.request(mailbox.link(
-        pending_address, before, expected_subject='SIHSALUS: recupera el acceso a tu cuenta'))
+        pending_address, before_verification, expected_subject='SIHSALUS: confirma tu correo'))
+    require(users(pending_username)[0]['emailVerified'],
+            'Fresh confirmation must verify the pending signup.')
     recovery.submit(page, 'kc-passwd-update-form', {
         'password-new': PASSWORD, 'password-confirm': PASSWORD,
     })
