@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import tempfile
 from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
@@ -40,7 +41,10 @@ class MonitorTest(unittest.TestCase):
     def test_transient_failure_recovers_without_incident(self):
         check = MagicMock(side_effect=[TimeoutError(), None])
         with patch.object(monitor.time, "sleep"):
-            self.assertEqual(monitor.retry("web", check), {"check": "web", "status": "ok"})
+            result = monitor.retry("web", check)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["check"], "web")
+            self.assertGreaterEqual(result["duration_ms"], 0)
         self.assertEqual(check.call_count, 2)
 
     def test_retries_are_bounded_and_server_messages_redacted(self):
@@ -111,6 +115,45 @@ class MonitorTest(unittest.TestCase):
                 "group@example.org": (550, b"Rejected")}
             with self.assertRaises(RuntimeError):
                 monitor.notify()
+
+
+    def test_report_is_exported_for_failed_job_and_human_summary(self):
+        report = {"checks": [{"check": "redis", "status": "failed",
+                              "duration_ms": 21400, "error": "HTTP 503"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            output, summary = Path(directory) / "output", Path(directory) / "summary"
+            with patch.dict(os.environ, {"GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(summary)}), \
+                    patch("builtins.print"):
+                monitor.publish_report(report)
+            key, payload = output.read_text().strip().split("=", 1)
+            self.assertEqual(key, "report")
+            self.assertEqual(json.loads(payload), report)
+            self.assertIn("redis: FALLO (21400 ms): HTTP 503", summary.read_text())
+
+    @patch.dict(os.environ, {
+        "TERMINOLOGY_EMAIL_HOST_USER": "sender@example.org",
+        "TERMINOLOGY_MONITOR_RECIPIENT": "group@example.org",
+        "TERMINOLOGY_HOST": "example.org",
+        "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "12",
+        "PROBE_REPORT": '{"checks":[{"check":"redis","status":"failed","duration_ms":21400,"error":"HTTP 503"}]}',
+    })
+    def test_incident_email_names_failed_component_and_duration(self):
+        message = monitor.notice_message("failure")
+        self.assertIn("INCIDENCIA", str(message["Subject"]))
+        self.assertIn("redis: FALLO (21400 ms): HTTP 503", message.get_content())
+
+    @patch.dict(os.environ, {
+        "TERMINOLOGY_EMAIL_HOST_USER": "sender@example.org",
+        "TERMINOLOGY_MONITOR_RECIPIENT": "group@example.org",
+        "TERMINOLOGY_HOST": "example.org",
+        "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "12",
+        "PROBE_REPORT": "incomplete report",
+    })
+    def test_incomplete_probe_report_does_not_prevent_incident_email(self):
+        message = monitor.notice_message("failure")
+        self.assertIn("INCIDENCIA", str(message["Subject"]))
+        self.assertIn("No se pudo leer el detalle", message.get_content())
+        self.assertIn("/actions/runs/12", message.get_content())
 
 
 if __name__ == "__main__":

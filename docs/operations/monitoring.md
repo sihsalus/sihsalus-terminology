@@ -32,7 +32,9 @@ de ejecuciones y sus jobs conserva el estado; no se añaden bases de datos,
 issues ni cachés de estado.
 
 Ejemplo de asunto: [SIHSALUS Terminología] INCIDENCIA.
-El cuerpo contiene el portal, las comprobaciones y el enlace a la ejecución.
+El cuerpo identifica cada comprobación, su resultado y duración total con
+reintentos, además del portal y el enlace a la ejecución. El mismo detalle
+queda visible en el resumen nativo de GitHub Actions.
 No incluye destinatarios de registros, trazas SMTP ni cuerpos de la API.
 
 ## Verificación y activación

@@ -94,10 +94,12 @@ def smtp_check():
 
 
 def retry(name, check):
+    started = time.monotonic()
     for attempt in range(3):
         try:
             check()
-            return {"check": name, "status": "ok"}
+            return {"check": name, "status": "ok",
+                    "duration_ms": round((time.monotonic() - started) * 1000)}
         except Exception as error:  # Remote bodies and SMTP replies may contain private data.
             diagnostic = ("HTTP " + str(error.code) if isinstance(error, HTTPError)
                           else type(error).__name__)
@@ -107,7 +109,33 @@ def retry(name, check):
                 error.close()
             if attempt < 2:
                 time.sleep(10)
-    return {"check": name, "status": "failed", "error": diagnostic}
+    return {"check": name, "status": "failed", "error": diagnostic,
+            "duration_ms": round((time.monotonic() - started) * 1000)}
+
+
+def report_checks(report):
+    """Format only the bounded diagnostics produced by our probes."""
+    rows = report.get("checks", []) if isinstance(report, dict) else []
+    if not rows:
+        return "No se obtuvo el detalle de las comprobaciones; revisa la ejecución."
+    lines = []
+    for row in rows:
+        state = "OK" if row["status"] == "ok" else "FALLO"
+        line = f"- {row['check']}: {state} ({row['duration_ms']} ms)"
+        if row.get("error"):
+            line += ": " + row["error"]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def publish_report(report):
+    print(json.dumps(report, indent=2))
+    if path := os.environ.get("GITHUB_OUTPUT"):
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write("report=" + json.dumps(report) + "\n")
+    if path := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write("## SIHSALUS Terminología\n\n" + report_checks(report) + "\n")
 
 
 def probe(skip_smtp=False):
@@ -131,8 +159,8 @@ def probe(skip_smtp=False):
         checks.append(("smtp-authentication", smtp_check))
     with ThreadPoolExecutor(max_workers=len(checks)) as pool:
         results = list(pool.map(lambda item: retry(*item), checks))
-    print(json.dumps({"time": datetime.now(timezone.utc).isoformat(),
-                      "smtp_checked": not skip_smtp, "checks": results}, indent=2))
+    publish_report({"time": datetime.now(timezone.utc).isoformat(),
+                    "smtp_checked": not skip_smtp, "checks": results})
     return 1 if any(result["status"] != "ok" for result in results) else 0
 
 
@@ -161,6 +189,11 @@ def needs_notice(current, previous, previous_notice):
 
 
 def notice_message(current):
+    try:
+        report = json.loads(os.environ.get("PROBE_REPORT") or "{}")
+        details = report_checks(report)
+    except (ValueError, KeyError, TypeError):
+        details = "No se pudo leer el detalle; revisa la ejecución."
     state = "RECUPERADO / CORRECTO" if current == "success" else "INCIDENCIA"
     message = EmailMessage()
     message["From"] = "SIHSALUS Terminología <" + os.environ["TERMINOLOGY_EMAIL_HOST_USER"] + ">"
@@ -175,6 +208,7 @@ def notice_message(current):
         "Portal: https://" + os.environ["TERMINOLOGY_HOST"] + "/\n"
         "Comprobaciones: web, API, base de datos, búsqueda, workers, Redis, "
         "inicio de sesión, certificados y autenticación SMTP.\n"
+        "Resultado de las comprobaciones (incluye reintentos):\n" + details + "\n\n"
         "Detalle de esta ejecución: " + run_url + "\n\n"
         "Un resultado correcto no acredita la entrega en bandeja de entrada "
         "ni valida una importación clínica.\n"
